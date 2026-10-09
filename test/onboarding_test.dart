@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:open_chat/main.dart';
 import 'package:open_chat/src/chat_store.dart';
 import 'package:open_chat/src/local_profile.dart';
+import 'package:open_chat/src/push/push_service.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 Future<void> pumpApp(WidgetTester tester) async {
@@ -14,6 +15,7 @@ Future<void> pumpApp(WidgetTester tester) async {
       profile: LocalProfile(preferences),
       preferences: preferences,
       onboardingComplete: false,
+      push: PushService(),
     ),
   );
   await tester.pumpAndSettle();
@@ -65,6 +67,7 @@ void main() {
         profile: LocalProfile(preferences),
         preferences: preferences,
         onboardingComplete: true,
+        push: PushService(),
       ),
     );
     await tester.pumpAndSettle();

@@ -15,6 +15,8 @@ First launch routes through onboarding (welcome → account → profile setup) e
 
 Password recovery sends a Supabase reset email with a `dev.openchat.openchat://auth-callback` redirect, caught by the Android intent filter and iOS URL scheme; the app exchanges the link for a recovery session and sets the new password. Email delivery itself depends on the project's SMTP configuration.
 
+Push registration: on Android, `PushService` initializes Firebase, requests notification permission, and uploads the FCM token through the `register_push_token` RPC (one live token per user). Token rows are self-only under RLS. The server will send generic new-message nudges only — content and keys never travel through push. Push initialization never blocks startup and degrades to disabled without native setup.
+
 Implemented contact RPCs: `save_profile`, `send_contact_invite`, `respond_contact_invite`, `block_contact`, `unblock_contact`, and `list_my_contacts`. Security-definer functions pin the search path, require an authenticated subject, and expose only related contact names/usernames. Clients cannot directly write contact tables. A unique unordered account pair prevents duplicate/crossed requests, pair-scoped transaction locks serialize invite/response/block operations, and an atomic per-account counter includes failed discovery attempts. Own profiles remain RLS-private; contact names are returned through the scoped RPC. Signing out or changing identity discards the account-scoped contacts widget.
 
 ## Target secure system

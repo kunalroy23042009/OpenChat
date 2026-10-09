@@ -57,6 +57,14 @@ Needed before background message notifications can be built:
 iOS push additionally needs an Apple Developer membership and an APNs key;
 that is a separate paid step and is out of scope for the Android pilot.
 
+## Status: Firebase connected
+
+`android/app/google-services.json` is installed (gitignored) for
+`dev.openchat.open_chat`. The app registers its FCM token to the
+`push_tokens` table on sign-in (one device per user). Generic server-sent
+message alerts will use these tokens once messaging lands. No further
+console action is needed for the pilot.
+
 ## What stays in Supabase
 
 - Email/password accounts with instant confirmation for the pilot

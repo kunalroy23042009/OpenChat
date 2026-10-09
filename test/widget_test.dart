@@ -4,6 +4,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:open_chat/main.dart';
 import 'package:open_chat/src/chat_store.dart';
 import 'package:open_chat/src/local_profile.dart';
+import 'package:open_chat/src/push/push_service.dart';
 
 void main() {
   testWidgets('wide layout opens chat alongside searchable list', (
@@ -22,6 +23,7 @@ void main() {
         profile: LocalProfile(preferences),
         preferences: preferences,
         onboardingComplete: true,
+        push: PushService(),
       ),
     );
     await tester.tap(find.text('Maya Chen'));
@@ -51,6 +53,7 @@ void main() {
         profile: LocalProfile(preferences),
         preferences: preferences,
         onboardingComplete: true,
+        push: PushService(),
       ),
     );
     await tester.tap(find.byTooltip('New conversation'));
@@ -83,6 +86,7 @@ void main() {
         profile: LocalProfile(preferences),
         preferences: preferences,
         onboardingComplete: true,
+        push: PushService(),
       ),
     );
     await tester.tap(find.text('Maya Chen'));

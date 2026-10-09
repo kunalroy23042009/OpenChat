@@ -3,6 +3,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'chat_store.dart';
 import 'local_profile.dart';
+import 'push/push_service.dart';
 import 'settings.dart';
 
 class ChatHome extends StatefulWidget {
@@ -10,11 +11,13 @@ class ChatHome extends StatefulWidget {
     super.key,
     required this.store,
     required this.profile,
+    required this.push,
     this.client,
     this.startupError,
   });
   final ChatStore store;
   final LocalProfile profile;
+  final PushService push;
   final SupabaseClient? client;
   final String? startupError;
   @override
@@ -100,6 +103,7 @@ class _ChatHomeState extends State<ChatHome> {
                         builder: (_) => SettingsPage(
                           store: widget.store,
                           profile: widget.profile,
+                          push: widget.push,
                           client: widget.client,
                           startupError: widget.startupError,
                         ),

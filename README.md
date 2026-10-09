@@ -13,6 +13,7 @@ Flutter + Dart messaging application, developed in phases against a free-tier ba
 - Conversation search, unread filter, new demo conversations, send text, local persistence, reset.
 - Optional Supabase email/password registration, sign-in, sign-out, and session restoration. Pilot projects confirm instantly; production should use SMTP plus required confirmation.
 - Continue with Google button (needs the one-time Google Cloud setup in `docs/GOOGLE_SETUP.md`; the button explains what is missing until then).
+- Push notification registration (Android, Firebase): device tokens upload to your account on sign-in; one device per user for the pilot. Server-sent message alerts arrive with the messaging milestone.
 - Owner-only profile/device SQL foundation with row-level security (RLS).
 - Live People & profile screen: save a unique username, send invitations, accept/decline, block/unblock, and refresh contacts. Contact about lines are visible to connected contacts only.
 - Server-enforced 20 invitation attempts per UTC day; exact-username discovery without a public user directory.
@@ -39,7 +40,8 @@ For Android, start an emulator or connect a USB-debugging device, run `flutter d
    - `supabase/migrations/202610090001_foundation.sql`
    - `supabase/migrations/202610090002_contacts.sql`
    - `supabase/migrations/202610090003_profile_about.sql`
-   The first migration creates profiles for both new and existing Auth users. The second adds usernames and the contact RPCs; the third adds about lines. Do not execute `supabase/tests/local_auth_stub.sql` on your hosted project; it is a local test fixture.
+   - `supabase/migrations/202610090004_push_tokens.sql`
+   The first migration creates profiles for both new and existing Auth users. The second adds usernames and the contact RPCs; the third adds about lines; the fourth adds push-token registration. Do not execute `supabase/tests/local_auth_stub.sql` on your hosted project; it is a local test fixture.
 3. Enable email/password Auth. For a private development project, create confirmed test users in the dashboard. Supabase's built-in mail sender has delivery restrictions and rate limits; public registration requires a configured SMTP provider with an appropriate free allowance. Do not assume unrestricted free email delivery.
 4. Create `config.json` based on `config.example.json`. Set the project URL and **publishable/anon** client key. This file is ignored by Git. Never put a service-role key, database password, SMTP secret, or R2 credential in Flutter defines: client configuration is extractable.
 5. Set the Auth Site URL to your development web origin, for example `http://localhost:7357`. Confirmation is completed in the browser; return to the app and sign in with the confirmed account. Native automatic deep-link sign-in and password recovery are phase 2 follow-ups.
@@ -76,6 +78,7 @@ lib/src/settings.dart         Cloud account and local demo settings
 lib/src/onboarding.dart       First-launch landing, account, and profile setup
 lib/src/profile_page.dart     WhatsApp-style profile (photo, name, about)
 lib/src/google_sign_in.dart    Continue-with-Google button and callback URL
+lib/src/push/push_service.dart Push registration and token lifecycle
 lib/src/recovery_page.dart    Password recovery over email deep link
 lib/src/local_profile.dart    Device-local name/about/photo store
 lib/src/contacts_page.dart    Live profile, invitations, and contacts UI
@@ -87,6 +90,7 @@ docs/ARCHITECTURE.md          Data flows and security boundaries
 docs/FREE_TIER_BUDGET.md      Verified allowances and planned limits
 test/widget_test.dart        User-flow and persistence checks
 test/google_sign_in_test.dart Auth error mapping checks
+test/push_service_test.dart Push degrades to disabled without native setup
 test/contacts_page_test.dart Contact UI success/failure checks
 supabase/tests/              PostgreSQL authorization and lifecycle tests
 ```
@@ -102,6 +106,6 @@ docker run --name openchat-phase2-db --detach --rm -e POSTGRES_PASSWORD=openchat
 # Wait until this reports accepting connections:
 docker exec openchat-phase2-db pg_isready -U postgres
 docker cp supabase openchat-phase2-db:/tmp/openchat-supabase
-docker exec openchat-phase2-db psql -U postgres -v ON_ERROR_STOP=1 -f /tmp/openchat-supabase/tests/local_auth_stub.sql -f /tmp/openchat-supabase/migrations/202610090001_foundation.sql -f /tmp/openchat-supabase/migrations/202610090002_contacts.sql -f /tmp/openchat-supabase/tests/contacts_security.sql
+docker exec openchat-phase2-db psql -U postgres -v ON_ERROR_STOP=1 -f /tmp/openchat-supabase/tests/local_auth_stub.sql -f /tmp/openchat-supabase/migrations/202610090001_foundation.sql -f /tmp/openchat-supabase/migrations/202610090002_contacts.sql -f /tmp/openchat-supabase/migrations/202610090003_profile_about.sql -f /tmp/openchat-supabase/migrations/202610090004_push_tokens.sql -f /tmp/openchat-supabase/tests/contacts_security.sql -f /tmp/openchat-supabase/tests/push_tokens.sql
 docker stop openchat-phase2-db
 ```

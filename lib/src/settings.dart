@@ -9,6 +9,7 @@ import 'contacts_repository.dart';
 import 'google_sign_in.dart';
 import 'local_profile.dart';
 import 'profile_page.dart';
+import 'push/push_service.dart';
 import 'recovery_page.dart';
 import 'security/security_page.dart';
 
@@ -17,11 +18,13 @@ class SettingsPage extends StatefulWidget {
     super.key,
     required this.store,
     required this.profile,
+    required this.push,
     this.client,
     this.startupError,
   });
   final ChatStore store;
   final LocalProfile profile;
+  final PushService push;
   final SupabaseClient? client;
   final String? startupError;
   @override
@@ -40,6 +43,10 @@ class _SettingsPageState extends State<SettingsPage> {
     authSubscription = widget.client?.auth.onAuthStateChange.listen(
       (_) {
         if (mounted) setState(() {});
+        final client = widget.client;
+        if (client?.auth.currentUser != null) {
+          widget.push.syncAccount(client!);
+        }
       },
       onError: (Object _) {
         if (mounted) {
@@ -154,6 +161,25 @@ class _SettingsPageState extends State<SettingsPage> {
                   ),
                 ),
               ),
+            ),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.notifications_outlined),
+              title: const Text('Notifications'),
+              subtitle: Text(switch (widget.push.state) {
+                PushState.ready =>
+                  widget.client?.auth.currentUser == null
+                      ? 'Ready. Sign in to register this device.'
+                      : 'This device is registered for message alerts.',
+                PushState.denied => 'Notifications are blocked. Allow them in the system settings.',
+                PushState.disabled =>
+                  'Off. Push setup or permission is incomplete.',
+              }),
+              trailing: const Icon(Icons.refresh),
+              onTap: () async {
+                await widget.push.initialize(widget.client);
+                if (mounted) setState(() {});
+              },
             ),
             ListTile(
               contentPadding: EdgeInsets.zero,

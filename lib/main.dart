@@ -6,6 +6,7 @@ import 'src/chat_store.dart';
 import 'src/home.dart';
 import 'src/local_profile.dart';
 import 'src/onboarding.dart';
+import 'src/push/push_service.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -26,16 +27,20 @@ Future<void> main() async {
   final preferences = store.preferences;
   final profile = LocalProfile(preferences);
   final onboarded = preferences.getBool('openchat.onboarding.v1') ?? false;
+  final push = PushService();
   runApp(
     OpenChatApp(
       store: store,
       profile: profile,
       preferences: preferences,
       onboardingComplete: onboarded,
+      push: push,
       client: client,
       startupError: startupError,
     ),
   );
+  // Push registration must never block or break startup.
+  push.initialize(client);
 }
 
 class OpenChatApp extends StatefulWidget {
@@ -45,6 +50,7 @@ class OpenChatApp extends StatefulWidget {
     required this.profile,
     required this.preferences,
     required this.onboardingComplete,
+    required this.push,
     this.client,
     this.startupError,
   });
@@ -52,6 +58,7 @@ class OpenChatApp extends StatefulWidget {
   final LocalProfile profile;
   final SharedPreferences preferences;
   final bool onboardingComplete;
+  final PushService push;
   final SupabaseClient? client;
   final String? startupError;
   @override
@@ -86,6 +93,7 @@ class _OpenChatAppState extends State<OpenChatApp> {
         ? ChatHome(
             store: widget.store,
             profile: widget.profile,
+            push: widget.push,
             client: widget.client,
             startupError: widget.startupError,
           )

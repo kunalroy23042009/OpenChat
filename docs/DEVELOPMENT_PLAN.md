@@ -24,7 +24,7 @@ Acceptance: launch without credentials; send a message and retain it across rest
 Remaining:
 1. Two-account acceptance testing on the live project, plus anonymous access re-verification.
 2. Google OAuth: app button, deep-link callback, and redirect allow-list are implemented; the provider is off server-side until the Google Cloud client ID/secret are supplied (see `docs/GOOGLE_SETUP.md`).
-3. FCM: Firebase project setup and `google-services.json` are pending user action (see `docs/GOOGLE_SETUP.md`); messaging-side token handling follows.
+3. FCM: Firebase project and `google-services.json` are configured; token registration RPC (`register_push_token`, one device per user), foreground/background handlers, and a settings status row are implemented. Server-sent message alerts and notification navigation land with messaging.
 4. Live verification of the recovery email round trip (needs a real mailbox; production needs SMTP).
 5. Select a free SMTP allowance or OAuth provider for public onboarding. Pilot email sign-up is instant (`mailer_autoconfirm=true`, reversible); switch to SMTP plus required confirmation for production.
 6. Add pending invitation cancellation and reviewed re-invitation rules. Contact refresh is manual/on-resume for now.
