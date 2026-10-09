@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
@@ -5,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'contacts_repository.dart';
+import 'google_sign_in.dart';
 import 'local_profile.dart';
 import 'recovery_page.dart';
 
@@ -147,11 +150,22 @@ class _AccountStep extends StatefulWidget {
 class _AccountStepState extends State<_AccountStep> {
   final email = TextEditingController();
   final password = TextEditingController();
+  StreamSubscription<AuthState>? authSubscription;
   bool busy = false;
   String? feedback;
 
   @override
+  void initState() {
+    super.initState();
+    // Google sign-in completes in the browser; advance when its session lands.
+    authSubscription = widget.client?.auth.onAuthStateChange.listen((state) {
+      if (state.session?.user != null && mounted) widget.onDone();
+    });
+  }
+
+  @override
   void dispose() {
+    authSubscription?.cancel();
     email.dispose();
     password.dispose();
     super.dispose();
@@ -176,13 +190,24 @@ class _AccountStepState extends State<_AccountStep> {
           password: password.text,
         );
         if (!mounted) return;
-        if (result.session == null) {
-          setState(
-            () => feedback =
-                'Check your email to confirm your account, then sign in here.',
-          );
-        } else {
+        if (result.session != null) {
           widget.onDone();
+        } else {
+          try {
+            await widget.client!.auth.signInWithPassword(
+              email: email.text.trim(),
+              password: password.text,
+            );
+            if (mounted) widget.onDone();
+          } on AuthException catch (signInError) {
+            if (mounted) {
+              setState(
+                () => feedback = signInError.message.contains('confirmed')
+                    ? 'Check your email to confirm your account, then sign in here.'
+                    : signInError.message,
+              );
+            }
+          }
         }
       } else {
         await widget.client!.auth.signInWithPassword(
@@ -281,6 +306,13 @@ class _AccountStepState extends State<_AccountStep> {
             TextButton(
               onPressed: busy ? null : () => authenticate(true),
               child: const Text('Create account'),
+            ),
+            const SizedBox(height: 8),
+            GoogleSignInButton(
+              client: widget.client!,
+              onMessage: (message) {
+                if (mounted) setState(() => feedback = message);
+              },
             ),
             TextButton(
               onPressed: busy ? null : widget.onSkip,

@@ -49,6 +49,10 @@ app.*.map.json
 .widget_preview/
 # Local provider configuration
 config.json
+google-services.json
+**/google-services.json
+GoogleService-Info.plist
+**/GoogleService-Info.plist
 .env
 .env.*
 !.env.example

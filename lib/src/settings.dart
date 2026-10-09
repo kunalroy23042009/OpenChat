@@ -6,6 +6,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'chat_store.dart';
 import 'contacts_page.dart';
 import 'contacts_repository.dart';
+import 'google_sign_in.dart';
 import 'local_profile.dart';
 import 'profile_page.dart';
 import 'recovery_page.dart';
@@ -76,9 +77,23 @@ class _SettingsPageState extends State<SettingsPage> {
           email: email.text.trim(),
           password: password.text,
         );
-        feedback = result.session == null
-            ? 'Check your email to confirm your account, then sign in.'
-            : 'Account created.';
+        if (result.session != null) {
+          feedback = 'Account created and signed in.';
+        } else {
+          // Projects without email confirmation sign in immediately;
+          // projects with confirmation required fall back to the email step.
+          try {
+            await widget.client!.auth.signInWithPassword(
+              email: email.text.trim(),
+              password: password.text,
+            );
+            feedback = 'Account created and signed in.';
+          } on AuthException catch (signInError) {
+            feedback = signInError.message.contains('confirmed')
+                ? 'Check your email to confirm your account, then sign in.'
+                : signInError.message;
+          }
+        }
       } else {
         await widget.client!.auth.signInWithPassword(
           email: email.text.trim(),
@@ -226,6 +241,13 @@ class _SettingsPageState extends State<SettingsPage> {
                 TextButton(
                   onPressed: busy ? null : () => authenticate(true),
                   child: const Text('Create account'),
+                ),
+                const SizedBox(height: 8),
+                GoogleSignInButton(
+                  client: widget.client!,
+                  onMessage: (message) {
+                    if (mounted) setState(() => feedback = message);
+                  },
                 ),
                 Align(
                   alignment: Alignment.centerLeft,

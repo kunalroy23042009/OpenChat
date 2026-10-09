@@ -23,10 +23,12 @@ Acceptance: launch without credentials; send a message and retain it across rest
 
 Remaining:
 1. Two-account acceptance testing on the live project, plus anonymous access re-verification.
-2. Live verification of the recovery email round trip (needs a real mailbox; production needs SMTP).
-3. Select a free SMTP allowance or OAuth provider for public onboarding; keep confirmed dashboard test accounts for private development.
-4. Add pending invitation cancellation and reviewed re-invitation rules. Contact refresh is manual/on-resume for now.
-5. Implement device registration RPC capped at one active device; account/device revocation; account deletion.
+2. Google OAuth: app button, deep-link callback, and redirect allow-list are implemented; the provider is off server-side until the Google Cloud client ID/secret are supplied (see `docs/GOOGLE_SETUP.md`).
+3. FCM: Firebase project setup and `google-services.json` are pending user action (see `docs/GOOGLE_SETUP.md`); messaging-side token handling follows.
+4. Live verification of the recovery email round trip (needs a real mailbox; production needs SMTP).
+5. Select a free SMTP allowance or OAuth provider for public onboarding. Pilot email sign-up is instant (`mailer_autoconfirm=true`, reversible); switch to SMTP plus required confirmation for production.
+6. Add pending invitation cancellation and reviewed re-invitation rules. Contact refresh is manual/on-resume for now.
+7. Implement device registration RPC capped at one active device; account/device revocation; account deletion.
 
 Acceptance: user A cannot read or mutate user B's private profile/device rows; anonymous access is denied; sign-in survives restart; sign-out clears production session-dependent state; limits cannot be bypassed through direct REST calls.
 

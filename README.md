@@ -11,7 +11,8 @@ Flutter + Dart messaging application, developed in phases against a free-tier ba
 - Password recovery over email with an app deep-link callback (`dev.openchat.openchat://auth-callback`).
 - Responsive mobile chat screens and desktop/tablet split view.
 - Conversation search, unread filter, new demo conversations, send text, local persistence, reset.
-- Optional Supabase email/password registration, sign-in, sign-out, and session restoration.
+- Optional Supabase email/password registration, sign-in, sign-out, and session restoration. Pilot projects confirm instantly; production should use SMTP plus required confirmation.
+- Continue with Google button (needs the one-time Google Cloud setup in `docs/GOOGLE_SETUP.md`; the button explains what is missing until then).
 - Owner-only profile/device SQL foundation with row-level security (RLS).
 - Live People & profile screen: save a unique username, send invitations, accept/decline, block/unblock, and refresh contacts. Contact about lines are visible to connected contacts only.
 - Server-enforced 20 invitation attempts per UTC day; exact-username discovery without a public user directory.
@@ -74,15 +75,18 @@ lib/src/home.dart             Responsive chat UI and composer
 lib/src/settings.dart         Cloud account and local demo settings
 lib/src/onboarding.dart       First-launch landing, account, and profile setup
 lib/src/profile_page.dart     WhatsApp-style profile (photo, name, about)
+lib/src/google_sign_in.dart    Continue-with-Google button and callback URL
 lib/src/recovery_page.dart    Password recovery over email deep link
 lib/src/local_profile.dart    Device-local name/about/photo store
 lib/src/contacts_page.dart    Live profile, invitations, and contacts UI
 lib/src/contacts_repository.dart  Typed Supabase RPC adapter
 supabase/migrations/          Database foundation and RLS
 docs/DEVELOPMENT_PLAN.md      Phases, deliverables, acceptance criteria
+docs/GOOGLE_SETUP.md          Google Cloud OAuth and Firebase/FCM setup steps
 docs/ARCHITECTURE.md          Data flows and security boundaries
 docs/FREE_TIER_BUDGET.md      Verified allowances and planned limits
 test/widget_test.dart        User-flow and persistence checks
+test/google_sign_in_test.dart Auth error mapping checks
 test/contacts_page_test.dart Contact UI success/failure checks
 supabase/tests/              PostgreSQL authorization and lifecycle tests
 ```
