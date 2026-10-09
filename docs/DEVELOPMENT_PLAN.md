@@ -32,13 +32,24 @@ Acceptance: user A cannot read or mutate user B's private profile/device rows; a
 
 ## Phase 3 — Signal and encrypted local persistence
 
-**Status: planned; prerequisite for network messaging.**
+**Status: in progress (Android foundation implemented and device-verified).**
 
-1. Time-box an SDK compatibility spike: evaluate maintained libsignal native bindings, Android/iOS build integration, license obligations, supported protocol versions, and upstream test vectors. Do not invent a Dart replacement protocol.
-2. Generate private identity/session keys on device; protect their wrapping key using Android Keystore / iOS Keychain. Choose and validate encrypted SQLite integration for local history; shared preferences remains demo-only.
-3. Publish authenticated public bundles: identity key, signed prekey, signature, and one-time prekeys. Implement atomic single-consumer prekey claiming and replenishment.
-4. Establish sessions, ratchet messages, handle out-of-order delivery, bound skipped keys, and persist ratchet state transactionally with the outbox.
-5. Safety-number/QR verification and identity-change warnings. Session reset does not silently preserve trust.
+Implemented on Android (libsignal 0.105.0, pinned; AGPLv3 — see `docs/ARCHITECTURE.md`):
+
+1. Native Kotlin bridge (`status` / `initialize` / `selfTest`) over a `dev.openchat/security` method channel. Private keys never cross into Flutter.
+2. Account-scoped device identity: Signal identity key generated on device, sealed with an Android Keystore AES-256-GCM key, written atomically, stored outside backups. Tampered state fails closed and is never silently replaced. Fingerprint (SHA-256 of public identity) is displayable.
+3. On-device diagnostics (ephemeral test identities, not user data): two-way encrypt/decrypt round trip, one-time prekey consumption, out-of-order delivery, replay rejection, tamper rejection, unexpected-identity-change rejection.
+4. Flutter Device security screen: identity creation, fingerprint display, on-demand encryption checks.
+
+Verified: `flutter analyze` clean; all 10 Flutter tests pass; Gradle JVM unit test passes; both on-device instrumented tests pass on a physical Samsung M30s (Android 11) — including Keystore persistence and tamper-fails-closed behavior.
+
+Still pending before network messaging:
+
+1. Prekey bundle upload/claim/replenishment RPCs (server-side, atomic single-consumer claims).
+2. Persistent ratchet sessions bound to accepted contacts; crash/out-of-order/replay coverage against real stored state.
+3. Encrypted local message database replacing demo shared-preferences storage.
+4. Safety-number/QR contact verification and identity-change warnings in the UI.
+5. iOS and web native bindings (currently Android-only).
 
 Acceptance: two real devices exchange SDK-validated ciphertext; corrupted payloads fail; a DB export contains no plaintext message bodies or private keys; crash/replay/out-of-order tests pass; key change and lost-device behavior are documented. Forward secrecy and recovery claims must match the actual protocol and conditions.
 

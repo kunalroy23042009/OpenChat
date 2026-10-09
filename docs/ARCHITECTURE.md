@@ -27,6 +27,14 @@ Flutter UI
 Backend event → FCM / APNs → generic wake-up notification → cursor sync
 ```
 
+### Signal library decision (Phase 3, Android)
+
+Native libsignal 0.105.0 (`org.signal:libsignal-android` + `libsignal-client`, Signal's Maven repository), used directly through a Kotlin bridge covering `status`, `initialize`, and `selfTest`. Signal marks third-party use as unsupported and licenses the library under **AGPLv3** — this project's releases carry that obligation. Version is pinned in `android/app/build.gradle.kts`; do not float it without re-running the protocol checks.
+
+`IdentityVault` (Kotlin): per-account identity, Keystore-wrapped AES-256-GCM envelope with account-bound AAD, atomic file writes, `noBackupFilesDir` storage, `allowBackup=false`. Only a fingerprint and status flags leave the native layer.
+
+`SignalDiagnostics` (Kotlin): ephemeral in-memory stores only; never touches user key material or messages. Asserts round-trip decryption in both directions, one-time prekey consumption, out-of-order delivery, duplicate-message rejection, ciphertext tamper rejection, and rejection of sessions built from an unexpected identity.
+
 ### Trust model
 
 Message content and attachment/call keys stay client-side. Servers necessarily see some routing metadata, account identifiers, timestamps, IP addresses, and public keys. E2EE does not hide all metadata or protect an already-compromised unlocked endpoint. Authenticating the server alone does not stop malicious public-key substitution; identity verification and key-change handling are required.

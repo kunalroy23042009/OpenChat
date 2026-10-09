@@ -6,6 +6,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'chat_store.dart';
 import 'contacts_page.dart';
 import 'contacts_repository.dart';
+import 'security/security_page.dart';
 
 class SettingsPage extends StatefulWidget {
   const SettingsPage({
@@ -116,12 +117,19 @@ class _SettingsPageState extends State<SettingsPage> {
                 'Unencrypted sample data. Use fictional messages only.',
               ),
             ),
-            const ListTile(
+            ListTile(
               contentPadding: EdgeInsets.zero,
-              leading: Icon(Icons.lock_outline),
-              title: Text('Encryption: planned'),
-              subtitle: Text(
-                'Signal sessions and encrypted local storage are phase 3.',
+              leading: const Icon(Icons.lock_outline),
+              title: const Text('Device security'),
+              subtitle: const Text(
+                'Create a local identity and run Signal encryption checks.',
+              ),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () => Navigator.push(
+                context,
+                MaterialPageRoute<void>(
+                  builder: (_) => _SecurityRoute(client: widget.client),
+                ),
               ),
             ),
             const Divider(height: 40),
@@ -239,6 +247,19 @@ class _SettingsPageState extends State<SettingsPage> {
         ),
       ),
     ),
+  );
+}
+
+class _SecurityRoute extends StatelessWidget {
+  const _SecurityRoute({this.client});
+  final SupabaseClient? client;
+  @override
+  Widget build(BuildContext context) => StreamBuilder<AuthState>(
+    stream: client?.auth.onAuthStateChange,
+    builder: (context, _) {
+      final id = client?.auth.currentUser?.id;
+      return SecurityPage(key: ValueKey(id), accountId: id);
+    },
   );
 }
 

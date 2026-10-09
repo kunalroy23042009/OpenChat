@@ -4,7 +4,7 @@ Flutter + Dart messaging application, developed in phases against a free-tier ba
 
 ## Current implementation
 
-**Phase 1 is implemented; phase 2 now includes accounts, editable profiles, usernames, invitations, and contact blocking.**
+**Phase 1 and phase 2 are implemented; phase 3 (Android encryption foundation) is in progress.**
 
 - Responsive mobile chat screens and desktop/tablet split view.
 - Conversation search, unread filter, new demo conversations, send text, local persistence, reset.
@@ -12,9 +12,10 @@ Flutter + Dart messaging application, developed in phases against a free-tier ba
 - Owner-only profile/device SQL foundation with row-level security (RLS).
 - Live People & profile screen: save a unique username, send invitations, accept/decline, block/unblock, and refresh contacts.
 - Server-enforced 20 invitation attempts per UTC day; exact-username discovery without a public user directory.
+- Android device security screen: Keystore-wrapped Signal identity, public-key fingerprint, and on-device encryption checks (libsignal 0.105.0, AGPLv3). iOS/web bindings are pending.
 - Android, iOS, and web project scaffolds.
 
-The chat workspace is a **local demo**, even when signed in. It does not send messages to another person. Demo data is plaintext in shared preferences. Signal E2EE, encrypted local storage, realtime message delivery, attachments, push, and calls are pending phases. Do not use demo storage for private communications.
+The chat workspace is a **local demo**, even when signed in. It does not send messages to another person. Demo data is plaintext in shared preferences. Network messaging, encrypted local storage, prekey exchange, attachments, push, and calls are pending. Do not use demo storage for private communications.
 
 ## Run immediately
 
