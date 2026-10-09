@@ -6,16 +6,21 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'chat_store.dart';
 import 'contacts_page.dart';
 import 'contacts_repository.dart';
+import 'local_profile.dart';
+import 'profile_page.dart';
+import 'recovery_page.dart';
 import 'security/security_page.dart';
 
 class SettingsPage extends StatefulWidget {
   const SettingsPage({
     super.key,
     required this.store,
+    required this.profile,
     this.client,
     this.startupError,
   });
   final ChatStore store;
+  final LocalProfile profile;
   final SupabaseClient? client;
   final String? startupError;
   @override
@@ -119,6 +124,24 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
             ListTile(
               contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.account_circle_outlined),
+              title: const Text('My profile'),
+              subtitle: const Text(
+                'Photo, name, and about — the way contacts see you.',
+              ),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () => Navigator.push(
+                context,
+                MaterialPageRoute<void>(
+                  builder: (_) => ProfilePage(
+                    profile: widget.profile,
+                    client: widget.client,
+                  ),
+                ),
+              ),
+            ),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
               leading: const Icon(Icons.lock_outline),
               title: const Text('Device security'),
               subtitle: const Text(
@@ -203,6 +226,21 @@ class _SettingsPageState extends State<SettingsPage> {
                 TextButton(
                   onPressed: busy ? null : () => authenticate(true),
                   child: const Text('Create account'),
+                ),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: TextButton(
+                    onPressed: busy
+                        ? null
+                        : () => Navigator.push(
+                            context,
+                            MaterialPageRoute<void>(
+                              builder: (_) =>
+                                  RecoveryPage(client: widget.client!),
+                            ),
+                          ),
+                    child: const Text('Forgot password?'),
+                  ),
                 ),
               ],
             ],

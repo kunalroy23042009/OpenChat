@@ -2,16 +2,19 @@ import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'chat_store.dart';
+import 'local_profile.dart';
 import 'settings.dart';
 
 class ChatHome extends StatefulWidget {
   const ChatHome({
     super.key,
     required this.store,
+    required this.profile,
     this.client,
     this.startupError,
   });
   final ChatStore store;
+  final LocalProfile profile;
   final SupabaseClient? client;
   final String? startupError;
   @override
@@ -96,6 +99,7 @@ class _ChatHomeState extends State<ChatHome> {
                       MaterialPageRoute<void>(
                         builder: (_) => SettingsPage(
                           store: widget.store,
+                          profile: widget.profile,
                           client: widget.client,
                           startupError: widget.startupError,
                         ),

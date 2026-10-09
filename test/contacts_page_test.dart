@@ -4,13 +4,18 @@ import 'package:open_chat/src/contacts_page.dart';
 import 'package:open_chat/src/contacts_repository.dart';
 
 class FakeContactsRepository implements ContactsRepository {
-  AccountProfile account = const AccountProfile(name: 'Me', username: 'myname');
+  AccountProfile account = const AccountProfile(
+    name: 'Me',
+    username: 'myname',
+    about: 'Hey there!',
+  );
   List<CloudContact> rows = [
     const CloudContact(
       userId: 'friend',
       requestId: 'request',
       name: 'Taylor',
       username: 'taylor',
+      about: 'Coffee first.',
       status: 'pending',
       incoming: true,
     ),
@@ -25,8 +30,8 @@ class FakeContactsRepository implements ContactsRepository {
   @override
   Future<List<CloudContact>> contacts() async => rows;
   @override
-  Future<void> saveProfile(String name, String username) async {
-    account = AccountProfile(name: name, username: username);
+  Future<void> saveProfile(String name, String username, String about) async {
+    account = AccountProfile(name: name, username: username, about: about);
   }
 
   @override
@@ -39,6 +44,7 @@ class FakeContactsRepository implements ContactsRepository {
         requestId: requestId,
         name: 'Taylor',
         username: 'taylor',
+        about: 'Coffee first.',
         status: accept ? 'accepted' : 'declined',
         incoming: true,
       ),
@@ -60,11 +66,12 @@ void main() {
       MaterialApp(home: ContactsPage(repository: repository)),
     );
     await tester.pumpAndSettle();
-    await tester.scrollUntilVisible(
+    await tester.dragUntilVisible(
       find.text('Accept'),
-      250,
-      scrollable: find.byType(Scrollable).first,
+      find.byType(ListView),
+      const Offset(0, -300),
     );
+    await tester.pumpAndSettle();
     await tester.tap(find.text('Accept'));
     await tester.pumpAndSettle();
     expect(repository.rows.single.status, 'accepted');
@@ -113,5 +120,41 @@ void main() {
       find.text('Daily invitation limit reached. Try again tomorrow (UTC).'),
       findsOneWidget,
     );
+  });
+  testWidgets('contact about lines render and profile about saves', (
+    tester,
+  ) async {
+    final repository = FakeContactsRepository();
+    await tester.pumpWidget(
+      MaterialApp(home: ContactsPage(repository: repository)),
+    );
+    await tester.pumpAndSettle();
+    await tester.dragUntilVisible(
+      find.text('Coffee first.'),
+      find.byType(ListView),
+      const Offset(0, -300),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('Coffee first.'), findsOneWidget);
+    await tester.dragUntilVisible(
+      find.widgetWithText(TextFormField, 'About'),
+      find.byType(ListView),
+      const Offset(0, 300),
+    );
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find.widgetWithText(TextFormField, 'About'),
+      'Updated about line',
+    );
+    await tester.pumpAndSettle();
+    await Scrollable.ensureVisible(
+      tester.element(find.text('Save profile')),
+      alignment: 0.5,
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Save profile'));
+    await tester.pumpAndSettle();
+    expect(repository.account.about, 'Updated about line');
+    expect(tester.takeException(), isNull);
   });
 }

@@ -1,9 +1,10 @@
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 class AccountProfile {
-  const AccountProfile({required this.name, this.username});
+  const AccountProfile({required this.name, this.username, this.about});
   final String name;
   final String? username;
+  final String? about;
 }
 
 class CloudContact {
@@ -12,6 +13,7 @@ class CloudContact {
     this.requestId,
     required this.name,
     required this.username,
+    this.about,
     required this.status,
     required this.incoming,
   });
@@ -19,6 +21,7 @@ class CloudContact {
   final String? requestId;
   final String name;
   final String username;
+  final String? about;
   final String status;
   final bool incoming;
   factory CloudContact.fromJson(Map<String, dynamic> json) => CloudContact(
@@ -26,6 +29,7 @@ class CloudContact {
     requestId: json['request_id'] as String?,
     name: json['display_name'] as String,
     username: json['username'] as String? ?? '',
+    about: json['about'] as String?,
     status: json['status'] as String,
     incoming: json['incoming'] as bool,
   );
@@ -33,7 +37,7 @@ class CloudContact {
 
 abstract class ContactsRepository {
   Future<AccountProfile> profile();
-  Future<void> saveProfile(String name, String username);
+  Future<void> saveProfile(String name, String username, String about);
   Future<List<CloudContact>> contacts();
   Future<String> invite(String username);
   Future<void> respond(String requestId, bool accept);
@@ -50,22 +54,24 @@ class SupabaseContactsRepository implements ContactsRepository {
     if (id == null) throw const AuthException('Sign in to load your profile.');
     final row = await client
         .from('profiles')
-        .select('display_name, username')
+        .select('display_name, username, about')
         .eq('id', id)
         .single();
     return AccountProfile(
       name: row['display_name'] as String,
       username: row['username'] as String?,
+      about: row['about'] as String?,
     );
   }
 
   @override
-  Future<void> saveProfile(String name, String username) async {
+  Future<void> saveProfile(String name, String username, String about) async {
     await client.rpc(
       'save_profile',
       params: {
         'p_display_name': name.trim(),
         'p_username': username.trim().toLowerCase(),
+        'p_about': about.trim(),
       },
     );
   }
@@ -117,7 +123,7 @@ String cloudError(Object error) {
       'PGRST202',
       'PGRST205',
     ].contains(error.code)) {
-      return 'The backend needs its database migrations. Run both SQL files in supabase/migrations, then retry.';
+      return 'The backend needs its database migrations. Run all three SQL files in supabase/migrations, then retry.';
     }
     if (error.code == 'P0001') return error.message;
     if (error.code == '42501' || error.code == 'PGRST301') {

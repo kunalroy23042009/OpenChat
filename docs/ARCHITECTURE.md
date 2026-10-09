@@ -11,6 +11,10 @@ Flutter People & profile → authenticated profile/contact RPCs → PostgreSQL
 
 Cloud authentication and the local demo are independent. A signed-in user does not upload demo history. Auth tokens use the SDK's default persistence in this prototype; native secure token persistence is part of production hardening.
 
+First launch routes through onboarding (welcome → account → profile setup) exactly once; returning users go straight to chat. `LocalProfile` keeps display name, about line, and a photo copy in private app storage. The photo never leaves the device. Name/about sync to Supabase via the `save_profile` RPC when signed in; contacts read each other's about lines through the scoped `list_my_contacts` RPC only.
+
+Password recovery sends a Supabase reset email with a `dev.openchat.openchat://auth-callback` redirect, caught by the Android intent filter and iOS URL scheme; the app exchanges the link for a recovery session and sets the new password. Email delivery itself depends on the project's SMTP configuration.
+
 Implemented contact RPCs: `save_profile`, `send_contact_invite`, `respond_contact_invite`, `block_contact`, `unblock_contact`, and `list_my_contacts`. Security-definer functions pin the search path, require an authenticated subject, and expose only related contact names/usernames. Clients cannot directly write contact tables. A unique unordered account pair prevents duplicate/crossed requests, pair-scoped transaction locks serialize invite/response/block operations, and an atomic per-account counter includes failed discovery attempts. Own profiles remain RLS-private; contact names are returned through the scoped RPC. Signing out or changing identity discards the account-scoped contacts widget.
 
 ## Target secure system

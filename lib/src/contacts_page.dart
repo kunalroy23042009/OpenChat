@@ -13,6 +13,7 @@ class _ContactsPageState extends State<ContactsPage>
     with WidgetsBindingObserver {
   final name = TextEditingController();
   final username = TextEditingController();
+  final about = TextEditingController();
   final inviteName = TextEditingController();
   final profileForm = GlobalKey<FormState>();
   List<CloudContact> contacts = [];
@@ -33,6 +34,7 @@ class _ContactsPageState extends State<ContactsPage>
     WidgetsBinding.instance.removeObserver(this);
     name.dispose();
     username.dispose();
+    about.dispose();
     inviteName.dispose();
     super.dispose();
   }
@@ -55,6 +57,7 @@ class _ContactsPageState extends State<ContactsPage>
         if (!loaded) {
           name.text = profile.name;
           username.text = profile.username ?? '';
+          about.text = profile.about ?? '';
         }
         loaded = true;
         contacts = rows;
@@ -194,6 +197,22 @@ class _ContactsPageState extends State<ContactsPage>
                             : 'Choose a valid username.',
                       ),
                       const SizedBox(height: 12),
+                      TextFormField(
+                        controller: about,
+                        enabled: !disabled,
+                        maxLength: 140,
+                        decoration: const InputDecoration(
+                          labelText: 'About',
+                          counterText: '',
+                          helperText: 'Shown to your contacts.',
+                        ),
+                        validator: (v) =>
+                            (v ?? '').trim().isNotEmpty &&
+                                (v ?? '').trim().length <= 140
+                            ? null
+                            : 'Write a short about line (up to 140 characters).',
+                      ),
+                      const SizedBox(height: 12),
                       FilledButton(
                         onPressed: disabled
                             ? null
@@ -203,6 +222,7 @@ class _ContactsPageState extends State<ContactsPage>
                                     await widget.repository.saveProfile(
                                       name.text,
                                       username.text,
+                                      about.text,
                                     );
                                     return 'Profile saved. Share your username to connect.';
                                   });
@@ -334,6 +354,14 @@ class _ContactsPageState extends State<ContactsPage>
                   style: const TextStyle(fontWeight: FontWeight.w700),
                 ),
                 Text('@${contact.username}'),
+                if (contact.about != null && contact.about!.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 2),
+                    child: Text(
+                      contact.about!,
+                      style: const TextStyle(color: Color(0xFF66748A)),
+                    ),
+                  ),
                 const SizedBox(height: 8),
                 Wrap(
                   spacing: 8,

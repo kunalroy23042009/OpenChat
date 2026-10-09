@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:open_chat/main.dart';
 import 'package:open_chat/src/chat_store.dart';
+import 'package:open_chat/src/local_profile.dart';
 
 void main() {
   testWidgets('wide layout opens chat alongside searchable list', (
@@ -13,8 +14,16 @@ void main() {
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
     SharedPreferences.setMockInitialValues({});
-    final store = ChatStore(await SharedPreferences.getInstance());
-    await tester.pumpWidget(OpenChatApp(store: store));
+    final preferences = await SharedPreferences.getInstance();
+    final store = ChatStore(preferences);
+    await tester.pumpWidget(
+      OpenChatApp(
+        store: store,
+        profile: LocalProfile(preferences),
+        preferences: preferences,
+        onboardingComplete: true,
+      ),
+    );
     await tester.tap(find.text('Maya Chen'));
     await tester.pumpAndSettle();
     expect(find.text('Maya Chen'), findsNWidgets(2));
@@ -34,8 +43,16 @@ void main() {
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
     SharedPreferences.setMockInitialValues({});
-    final store = ChatStore(await SharedPreferences.getInstance());
-    await tester.pumpWidget(OpenChatApp(store: store));
+    final preferences = await SharedPreferences.getInstance();
+    final store = ChatStore(preferences);
+    await tester.pumpWidget(
+      OpenChatApp(
+        store: store,
+        profile: LocalProfile(preferences),
+        preferences: preferences,
+        onboardingComplete: true,
+      ),
+    );
     await tester.tap(find.byTooltip('New conversation'));
     await tester.pumpAndSettle();
     await tester.enterText(
@@ -60,7 +77,14 @@ void main() {
     SharedPreferences.setMockInitialValues({});
     final preferences = await SharedPreferences.getInstance();
     final store = ChatStore(preferences);
-    await tester.pumpWidget(OpenChatApp(store: store));
+    await tester.pumpWidget(
+      OpenChatApp(
+        store: store,
+        profile: LocalProfile(preferences),
+        preferences: preferences,
+        onboardingComplete: true,
+      ),
+    );
     await tester.tap(find.text('Maya Chen'));
     await tester.pumpAndSettle();
     await tester.enterText(
@@ -81,7 +105,8 @@ void main() {
     'blank messages are ignored and corrupt data recovers visibly',
     () async {
       SharedPreferences.setMockInitialValues({ChatStore.storageKey: 'broken'});
-      final store = ChatStore(await SharedPreferences.getInstance());
+      final preferences = await SharedPreferences.getInstance();
+      final store = ChatStore(preferences);
       expect(store.storageWarning, isNotNull);
       final chat = store.conversations.first;
       final count = chat.messages.length;

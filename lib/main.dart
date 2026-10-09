@@ -4,6 +4,8 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'src/chat_store.dart';
 import 'src/home.dart';
+import 'src/local_profile.dart';
+import 'src/onboarding.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -21,19 +23,43 @@ Future<void> main() async {
     }
   }
   final store = ChatStore(await SharedPreferences.getInstance());
-  runApp(OpenChatApp(store: store, client: client, startupError: startupError));
+  final preferences = store.preferences;
+  final profile = LocalProfile(preferences);
+  final onboarded = preferences.getBool('openchat.onboarding.v1') ?? false;
+  runApp(
+    OpenChatApp(
+      store: store,
+      profile: profile,
+      preferences: preferences,
+      onboardingComplete: onboarded,
+      client: client,
+      startupError: startupError,
+    ),
+  );
 }
 
-class OpenChatApp extends StatelessWidget {
+class OpenChatApp extends StatefulWidget {
   const OpenChatApp({
     super.key,
     required this.store,
+    required this.profile,
+    required this.preferences,
+    required this.onboardingComplete,
     this.client,
     this.startupError,
   });
   final ChatStore store;
+  final LocalProfile profile;
+  final SharedPreferences preferences;
+  final bool onboardingComplete;
   final SupabaseClient? client;
   final String? startupError;
+  @override
+  State<OpenChatApp> createState() => _OpenChatAppState();
+}
+
+class _OpenChatAppState extends State<OpenChatApp> {
+  late bool entered = widget.onboardingComplete;
   @override
   Widget build(BuildContext context) => MaterialApp(
     title: 'Open Chat',
@@ -56,6 +82,19 @@ class OpenChatApp extends StatelessWidget {
         ),
       ),
     ),
-    home: ChatHome(store: store, client: client, startupError: startupError),
+    home: entered
+        ? ChatHome(
+            store: widget.store,
+            profile: widget.profile,
+            client: widget.client,
+            startupError: widget.startupError,
+          )
+        : OnboardingFlow(
+            profile: widget.profile,
+            preferences: widget.preferences,
+            client: widget.client,
+            startupError: widget.startupError,
+            onDone: () => setState(() => entered = true),
+          ),
   );
 }

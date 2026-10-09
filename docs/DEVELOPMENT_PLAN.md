@@ -19,14 +19,14 @@ Acceptance: launch without credentials; send a message and retain it across rest
 
 ## Phase 2 — Accounts, profiles, backend access
 
-**Status: in progress.** Email/password UI, session-reactive settings and contact routing, editable profiles, unique usernames, invitations, accept/decline, block/unblock, a 20-attempt/day server cap, profile trigger, owner-only RLS, and device metadata migration are implemented. PostgreSQL authorization/lifecycle tests pass locally. Hosted migrations and two-account acceptance testing remain pending.
+**Status: in progress.** Email/password UI, password recovery with app deep-link callback, first-launch onboarding (welcome → account → profile setup), WhatsApp-style profile (device photo, synced name/about), session-reactive settings and contact routing, editable profiles, unique usernames, invitations, accept/decline, block/unblock, a 20-attempt/day server cap, profile trigger, owner-only RLS, and device metadata migration are implemented. All three migrations are applied to the live project and verified. PostgreSQL authorization/lifecycle tests and 18 Flutter tests pass.
 
 Remaining:
-1. Provision development project and run migration; test with two users plus anonymous access.
-2. Add password recovery, native auth redirects, and account deletion.
+1. Two-account acceptance testing on the live project, plus anonymous access re-verification.
+2. Live verification of the recovery email round trip (needs a real mailbox; production needs SMTP).
 3. Select a free SMTP allowance or OAuth provider for public onboarding; keep confirmed dashboard test accounts for private development.
-4. Validate the implemented username/invitation/block flows on two real accounts; add pending invitation cancellation and reviewed re-invitation rules. Contact refresh is manual/on-resume for now.
-5. Implement device registration RPC capped at one active device; account/device revocation.
+4. Add pending invitation cancellation and reviewed re-invitation rules. Contact refresh is manual/on-resume for now.
+5. Implement device registration RPC capped at one active device; account/device revocation; account deletion.
 
 Acceptance: user A cannot read or mutate user B's private profile/device rows; anonymous access is denied; sign-in survives restart; sign-out clears production session-dependent state; limits cannot be bypassed through direct REST calls.
 
