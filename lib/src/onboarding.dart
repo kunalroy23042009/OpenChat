@@ -7,6 +7,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'contacts_repository.dart';
+import 'auth/password_auth.dart';
+import 'auth/password_field.dart';
 import 'google_sign_in.dart';
 import 'local_profile.dart';
 import 'recovery_page.dart';
@@ -158,9 +160,23 @@ class _AccountStepState extends State<_AccountStep> {
   void initState() {
     super.initState();
     // Google sign-in completes in the browser; advance when its session lands.
-    authSubscription = widget.client?.auth.onAuthStateChange.listen((state) {
-      if (state.session?.user != null && mounted) widget.onDone();
-    });
+    authSubscription = widget.client?.auth.onAuthStateChange.listen(
+      (state) {
+        if (state.event == AuthChangeEvent.signedIn &&
+            state.session != null &&
+            mounted) {
+          widget.onDone();
+        }
+      },
+      onError: (Object _) {
+        if (mounted) {
+          setState(
+            () => feedback =
+                'Could not refresh your session. Please try signing in again.',
+          );
+        }
+      },
+    );
   }
 
   @override
@@ -172,11 +188,14 @@ class _AccountStepState extends State<_AccountStep> {
   }
 
   Future<void> authenticate(bool register) async {
-    if (!email.text.contains('@') || password.text.length < 8) {
-      setState(
-        () => feedback =
-            'Enter an email address and a password of at least 8 characters.',
-      );
+    if (busy) return;
+    final validation = credentialsValidation(
+      email.text,
+      password.text,
+      register: register,
+    );
+    if (validation != null) {
+      setState(() => feedback = validation);
       return;
     }
     setState(() {
@@ -184,40 +203,19 @@ class _AccountStepState extends State<_AccountStep> {
       feedback = null;
     });
     try {
-      if (register) {
-        final result = await widget.client!.auth.signUp(
-          email: email.text.trim(),
-          password: password.text,
-        );
-        if (!mounted) return;
-        if (result.session != null) {
-          widget.onDone();
-        } else {
-          try {
-            await widget.client!.auth.signInWithPassword(
-              email: email.text.trim(),
-              password: password.text,
-            );
-            if (mounted) widget.onDone();
-          } on AuthException catch (signInError) {
-            if (mounted) {
-              setState(
-                () => feedback = signInError.message.contains('confirmed')
-                    ? 'Check your email to confirm your account, then sign in here.'
-                    : signInError.message,
-              );
-            }
-          }
-        }
+      final signedIn = await PasswordAuth(widget.client!)
+          .authenticate(email.text, password.text, register: register);
+      if (!mounted) return;
+      if (signedIn) {
+        widget.onDone();
       } else {
-        await widget.client!.auth.signInWithPassword(
-          email: email.text.trim(),
-          password: password.text,
+        setState(
+          () => feedback =
+              'Check your email to confirm your account, then sign in here.',
         );
-        if (mounted) widget.onDone();
       }
     } on AuthException catch (e) {
-      if (mounted) setState(() => feedback = e.message);
+      if (mounted) setState(() => feedback = passwordAuthError(e));
     } catch (_) {
       if (mounted) {
         setState(
@@ -269,17 +267,24 @@ class _AccountStepState extends State<_AccountStep> {
           ] else ...[
             TextField(
               controller: email,
+              enabled: !busy,
+              autocorrect: false,
               keyboardType: TextInputType.emailAddress,
               autofillHints: const [AutofillHints.email],
               decoration: const InputDecoration(labelText: 'Email'),
             ),
             const SizedBox(height: 12),
-            TextField(
+            PasswordField(
               controller: password,
-              obscureText: true,
-              autofillHints: const [AutofillHints.password],
-              decoration: const InputDecoration(labelText: 'Password'),
+              enabled: !busy,
               onSubmitted: (_) => authenticate(false),
+            ),
+            const Padding(
+              padding: EdgeInsets.only(top: 8),
+              child: Text(
+                'Use your Open Chat password here. Google passwords work only on Google’s sign-in page.',
+                style: TextStyle(fontSize: 12),
+              ),
             ),
             Align(
               alignment: Alignment.centerRight,

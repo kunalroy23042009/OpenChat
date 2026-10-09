@@ -36,6 +36,8 @@
                 <category android:name="android.intent.category.BROWSABLE"/>
                 <data android:scheme="dev.openchat.openchat" android:host="auth-callback"/>
             </intent-filter>
+            <!-- app_links/Supabase owns authentication URLs, not Flutter routes. -->
+            <meta-data android:name="flutter_deeplinking_enabled" android:value="false" />
         </activity>
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->

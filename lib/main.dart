@@ -3,6 +3,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'src/chat_store.dart';
+import 'src/auth/password_page.dart';
+import 'src/auth/recovery_controller.dart';
 import 'src/home.dart';
 import 'src/local_profile.dart';
 import 'src/onboarding.dart';
@@ -23,6 +25,9 @@ Future<void> main() async {
           'Backend connection failed. Check your Supabase configuration.';
     }
   }
+  final recovery = client == null
+      ? null
+      : RecoveryController(client.auth.onAuthStateChange);
   final store = ChatStore(await SharedPreferences.getInstance());
   final preferences = store.preferences;
   final profile = LocalProfile(preferences);
@@ -36,6 +41,7 @@ Future<void> main() async {
       onboardingComplete: onboarded,
       push: push,
       client: client,
+      recovery: recovery,
       startupError: startupError,
     ),
   );
@@ -52,6 +58,7 @@ class OpenChatApp extends StatefulWidget {
     required this.onboardingComplete,
     required this.push,
     this.client,
+    this.recovery,
     this.startupError,
   });
   final ChatStore store;
@@ -60,6 +67,7 @@ class OpenChatApp extends StatefulWidget {
   final bool onboardingComplete;
   final PushService push;
   final SupabaseClient? client;
+  final RecoveryController? recovery;
   final String? startupError;
   @override
   State<OpenChatApp> createState() => _OpenChatAppState();
@@ -67,8 +75,53 @@ class OpenChatApp extends StatefulWidget {
 
 class _OpenChatAppState extends State<OpenChatApp> {
   late bool entered = widget.onboardingComplete;
+  final navigator = GlobalKey<NavigatorState>();
+  RecoveryController? recovery;
+  bool recoveryOpen = false;
+  @override
+  void initState() {
+    super.initState();
+    recovery =
+        widget.recovery ??
+        (widget.client == null
+            ? null
+            : RecoveryController(widget.client!.auth.onAuthStateChange));
+    recovery?.addListener(openRecovery);
+    openRecovery();
+  }
+
+  void openRecovery() {
+    if (recoveryOpen || recovery?.accountId == null || widget.client == null) {
+      return;
+    }
+    recoveryOpen = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      final accountId = recovery?.accountId;
+      recovery?.consume();
+      if (accountId != null &&
+          widget.client!.auth.currentUser?.id == accountId) {
+        await navigator.currentState!.push(
+          MaterialPageRoute<void>(
+            builder: (_) =>
+                PasswordPage(client: widget.client!, recovery: true),
+          ),
+        );
+      }
+      recoveryOpen = false;
+    });
+  }
+
+  @override
+  void dispose() {
+    recovery?.removeListener(openRecovery);
+    recovery?.dispose();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) => MaterialApp(
+    navigatorKey: navigator,
     title: 'Open Chat',
     debugShowCheckedModeBanner: false,
     theme: ThemeData(

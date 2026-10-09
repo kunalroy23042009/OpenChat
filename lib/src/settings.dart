@@ -4,6 +4,9 @@ import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'chat_store.dart';
+import 'auth/password_auth.dart';
+import 'auth/password_field.dart';
+import 'auth/password_page.dart';
 import 'contacts_page.dart';
 import 'contacts_repository.dart';
 import 'google_sign_in.dart';
@@ -67,11 +70,14 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 
   Future<void> authenticate(bool register) async {
-    if (!email.text.contains('@') || password.text.length < 8) {
-      setState(
-        () => feedback =
-            'Enter an email address and a password of at least 8 characters.',
-      );
+    if (busy) return;
+    final validation = credentialsValidation(
+      email.text,
+      password.text,
+      register: register,
+    );
+    if (validation != null) {
+      setState(() => feedback = validation);
       return;
     }
     setState(() {
@@ -79,38 +85,15 @@ class _SettingsPageState extends State<SettingsPage> {
       feedback = null;
     });
     try {
-      if (register) {
-        final result = await widget.client!.auth.signUp(
-          email: email.text.trim(),
-          password: password.text,
-        );
-        if (result.session != null) {
-          feedback = 'Account created and signed in.';
-        } else {
-          // Projects without email confirmation sign in immediately;
-          // projects with confirmation required fall back to the email step.
-          try {
-            await widget.client!.auth.signInWithPassword(
-              email: email.text.trim(),
-              password: password.text,
-            );
-            feedback = 'Account created and signed in.';
-          } on AuthException catch (signInError) {
-            feedback = signInError.message.contains('confirmed')
-                ? 'Check your email to confirm your account, then sign in.'
-                : signInError.message;
-          }
-        }
-      } else {
-        await widget.client!.auth.signInWithPassword(
-          email: email.text.trim(),
-          password: password.text,
-        );
-        feedback = 'Signed in. Open People & profile to set your username and invite contacts.';
-      }
-      if (mounted) password.clear();
+      final signedIn = await PasswordAuth(widget.client!)
+          .authenticate(email.text, password.text, register: register);
+      if (!mounted) return;
+      feedback = signedIn
+          ? 'Signed in. Open People & profile to set your username and invite contacts.'
+          : 'Check your email to confirm your account, then sign in.';
+      if (signedIn) password.clear();
     } on AuthException catch (e) {
-      feedback = e.message;
+      feedback = passwordAuthError(e);
     } catch (_) {
       feedback = 'Could not connect. Check your connection and try again.';
     } finally {
@@ -229,6 +212,19 @@ class _SettingsPageState extends State<SettingsPage> {
                   icon: const Icon(Icons.people_outline),
                   label: const Text('People & profile'),
                 ),
+                OutlinedButton.icon(
+                  onPressed: busy
+                      ? null
+                      : () => Navigator.push(
+                          context,
+                          MaterialPageRoute<void>(
+                            builder: (_) =>
+                                PasswordPage(client: widget.client!),
+                          ),
+                        ),
+                  icon: const Icon(Icons.password),
+                  label: const Text('Set / change Open Chat password'),
+                ),
                 TextButton(
                   onPressed: busy
                       ? null
@@ -248,16 +244,24 @@ class _SettingsPageState extends State<SettingsPage> {
               ] else ...[
                 TextField(
                   controller: email,
+                  enabled: !busy,
+                  autocorrect: false,
                   keyboardType: TextInputType.emailAddress,
                   autofillHints: const [AutofillHints.email],
                   decoration: const InputDecoration(labelText: 'Email'),
                 ),
                 const SizedBox(height: 12),
-                TextField(
+                PasswordField(
                   controller: password,
-                  obscureText: true,
-                  autofillHints: const [AutofillHints.password],
-                  decoration: const InputDecoration(labelText: 'Password'),
+                  enabled: !busy,
+                  onSubmitted: (_) => authenticate(false),
+                ),
+                const Padding(
+                  padding: EdgeInsets.only(top: 8),
+                  child: Text(
+                    'Use your Open Chat password here. For a Google-only account, choose Continue with Google.',
+                    style: TextStyle(fontSize: 12),
+                  ),
                 ),
                 const SizedBox(height: 16),
                 FilledButton(

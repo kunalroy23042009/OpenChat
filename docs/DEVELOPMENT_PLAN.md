@@ -19,11 +19,12 @@ Acceptance: launch without credentials; send a message and retain it across rest
 
 ## Phase 2 — Accounts, profiles, backend access
 
-**Status: in progress.** Email/password UI, password recovery with app deep-link callback, first-launch onboarding (welcome → account → profile setup), WhatsApp-style profile (device photo, synced name/about), session-reactive settings and contact routing, editable profiles, unique usernames, invitations, accept/decline, block/unblock, a 20-attempt/day server cap, profile trigger, owner-only RLS, and device metadata migration are implemented. All three migrations are applied to the live project and verified. PostgreSQL authorization/lifecycle tests and 18 Flutter tests pass.
+**Status: in progress.** Email/password UI with exact server error mapping, password recovery with app deep-link callback and verified-session password reset, first-launch onboarding (welcome → account → profile setup), Google sign-in with setup guidance, WhatsApp-style profile (device photo, synced name/about), session-reactive settings and contact routing, editable profiles, unique usernames, invitations, accept/decline, block/unblock, a 20-attempt/day server cap, profile trigger, owner-only RLS, and device metadata migration are implemented. All three migrations are applied to the live project and verified. PostgreSQL authorization/lifecycle tests and 18 Flutter tests pass.
 
 Remaining:
 1. Two-account acceptance testing on the live project, plus anonymous access re-verification.
-2. Google OAuth: app button, deep-link callback, and redirect allow-list are implemented; the provider is off server-side until the Google Cloud client ID/secret are supplied (see `docs/GOOGLE_SETUP.md`).
+2. Password recovery email delivery still depends on project SMTP, which is unconfigured; Google-linked accounts can set an Open Chat password from Settings without email.
+3. Google OAuth: app button, deep-link callback, redirect allow-list, and server provider are enabled and verified with a live Google identity; open sign-up depends on the Google Cloud publishing status (see `docs/GOOGLE_SETUP.md`).
 3. FCM: Firebase project and `google-services.json` are configured; token registration RPC (`register_push_token`, one device per user), foreground/background handlers, and a settings status row are implemented. Server-sent message alerts and notification navigation land with messaging.
 4. Live verification of the recovery email round trip (needs a real mailbox; production needs SMTP).
 5. Select a free SMTP allowance or OAuth provider for public onboarding. Pilot email sign-up is instant (`mailer_autoconfirm=true`, reversible); switch to SMTP plus required confirmation for production.
