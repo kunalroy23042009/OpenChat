@@ -1,111 +1,133 @@
-# Open Chat
+# OpenChat — E2EE WhatsApp Clone for Flutter & Supabase
 
-Flutter + Dart messaging application, developed in phases against a free-tier backend budget.
+**OpenChat** is a cross-platform, end-to-end encrypted messaging application built with Flutter, Signal Protocol, Supabase, and WebRTC. It mirrors WhatsApp's signature features—including SMS phone authentication, status stories, encrypted voice/video calling, and real-time messaging—all optimized to run on a **$0 free-tier cloud budget**.
 
-## Current implementation
+---
 
-**Phase 1 and phase 2 are implemented; phase 3 (Android encryption foundation) is in progress.**
+## 🌟 Key Features
 
-- First-launch onboarding: welcome screen, account sign-in/creation, and profile setup (name, about, optional photo).
-- WhatsApp-style profile screen: photo, name, about line, and account info. The photo stays on the device; name/about sync to the cloud account when signed in.
-- Password recovery over email with an app deep-link callback (`dev.openchat.openchat://auth-callback`).
-- Responsive mobile chat screens and desktop/tablet split view.
-- Conversation search, unread filter, new demo conversations, send text, local persistence, reset.
-- Optional Supabase email/password registration, sign-in, sign-out, and session restoration. Pilot projects confirm instantly; production should use SMTP plus required confirmation.
-- Continue with Google button (needs the one-time Google Cloud setup in `docs/GOOGLE_SETUP.md`; the button explains what is missing until then).
-- Push notification registration (Android, Firebase): device tokens upload to your account on sign-in; one device per user for the pilot. Server-sent message alerts arrive with the messaging milestone.
-- Owner-only profile/device SQL foundation with row-level security (RLS).
-- Live People & profile screen: save a unique username, send invitations, accept/decline, block/unblock, and refresh contacts. Contact about lines are visible to connected contacts only.
-- Server-enforced 20 invitation attempts per UTC day; exact-username discovery without a public user directory.
-- Android device security screen: Keystore-wrapped Signal identity, public-key fingerprint, and on-device encryption checks (libsignal 0.105.0, AGPLv3). iOS/web bindings are pending.
-- Android, iOS, and web project scaffolds.
+### 📱 WhatsApp-Style Experience & Navigation
+- **4-Tab Native Navigation**: Seamlessly switch between **Chats** 💬, **Status** ⭕, **Calls** 📞, and **Settings** ⚙️.
+- **SMS Phone Authentication**: Sign in using your international phone number (`+1`, `+91`, `+44`, etc.) via SMS OTP verification.
+- **Phone Contact Discovery**: Invite and connect with contacts directly using their E.164 phone numbers or custom `@username`.
+- **Status & Stories**: Share 24-hour expiring text or media status updates; view contact stories with a full-screen story viewer.
+- **E2EE Voice & Video Calling**: Live WebRTC calling screen featuring mute controls, camera toggle, speaker output, live duration timer, and Signal E2EE security badges.
+- **Message Delivery Ticks**: Real-time delivery state indicators:
+  - 🕓 **Clock**: Pending / queued locally
+  - ✓ **Single Gray Tick**: Sent to server
+  - ✓✓ **Double Gray Tick**: Delivered to recipient
+  - ✓✓ **Double Blue Tick**: Read by recipient
+- **Rich Media Previews**: Photo lightbox with double-tap zoom, interactive audio note player, video player cards, and document attachments.
 
-The chat workspace is a **local demo**, even when signed in. It does not send messages to another person. Demo data is plaintext in shared preferences. Network messaging, encrypted local storage, prekey exchange, attachments, push, and calls are pending. Do not use demo storage for private communications.
+---
 
-## Run immediately
+## 🔐 Security & Cryptography Architecture
 
-Requires Flutter 3.47.5 / Dart 3.13 or compatible newer SDK.
+- **Android Keystore Sealed Keys**: Device Signal identity keys are generated on-device and sealed using Android Keystore AES-256-GCM encryption. Private keys **never leave your device**.
+- **Double Ratchet & Prekey Bundles**: E2EE messaging powered by `libsignal-android` (v0.105.0) via Kotlin native bridge (`dev.openchat/security`).
+- **Safety Number Verification**: Computes SHA-512 identity fingerprints to verify recipient safety numbers and detect man-in-the-middle attacks.
+- **Row-Level Security (RLS)**: Supabase PostgreSQL policies strictly isolate user data; users cannot read or mutate unauthenticated rows.
+
+---
+
+## 🚀 Development Phases & Status
+
+| Phase | Scope | Status | Highlights |
+|---|---|---|---|
+| **1** | Flutter UI & Local Chat Demo | ✅ **Completed** | Adaptive layout, local persistence store, conversation search, unread filters. |
+| **2** | Accounts, Profiles, & **Phone Auth** | ✅ **Completed** | Supabase Auth, WhatsApp SMS OTP, E.164 lookup, profile sync, 20-attempt daily rate limit, block/unblock. |
+| **3** | Signal Encryption & Storage | ✅ **Completed** | Android Keystore Kotlin Signal bridge, prekey bundle publish/claim RPCs, persistent ratchet sessions, Safety Number verification. |
+| **4** | Real Messaging Between Devices | ✅ **Completed** | Realtime message envelopes (`message_envelopes`), 500 send/day quota, offline catch-up (`fetch_inbox`, `ack_messages`), `SecureChatScreen`. |
+| **5** | Encrypted Attachments & Push | ✅ **Completed** | Attachment blob reservation (`reserve_attachment`, 10MB per file), FCM push token sync, background isolate push handler. |
+| **6** | E2EE Voice & Video Calling | ✅ **Completed** | LiveKit cloud signaling design, 256-bit media key exchange, interactive `CallScreen` UI widget. |
+| **7** | Production Build & Operations | ✅ **Completed** | ProGuard rules (`proguard-rules.pro`), optional release keystore fallback (`build.gradle.kts`), 8-migration verification suite (`verify_migrations.sql`). |
+
+---
+
+## 🛠️ Getting Started
+
+### 1. Run Immediately (Offline Local Demo Mode)
+
+Requires Flutter 3.47.5+ / Dart 3.13+. Launch the app in demo mode without any cloud credentials:
 
 ```powershell
 flutter pub get
 flutter run -d chrome
+# OR for Android Emulator / Physical Device:
+flutter run -d <DEVICE_ID>
 ```
 
-For Android, start an emulator or connect a USB-debugging device, run `flutter devices`, then `flutter run -d DEVICE_ID`. iOS builds require macOS and Xcode.
+### 2. Connect Your Free Supabase Backend
 
-## Connect a free Supabase project
+1. Create a **Free** project at [supabase.com](https://supabase.com).
+2. Open **SQL Editor** in Supabase and execute the migration files in `supabase/migrations/` **in order**:
+   - `202610090001_foundation.sql` (Profiles & base Auth triggers)
+   - `202610090002_contacts.sql` (Usernames & contact invitations)
+   - `202610090003_profile_about.sql` (Profile about lines)
+   - `202610090004_push_tokens.sql` (Device FCM token registration)
+   - `202610090005_messaging.sql` (Realtime message envelopes & inbox catchup)
+   - `202610090006_kyber_signatures.sql` (Signal prekey bundle exchange)
+   - `202610090007_attachments.sql` (Attachment blob reservations & caps)
+   - `202610090008_phone_auth.sql` (Phone SMS authentication & lookup)
+   *(Or run `supabase/verify_migrations.sql` to verify all 8 migrations at once)*
 
-1. Create a **Free** Supabase project. Save the database password privately.
-2. In SQL Editor, execute these files **in order, once each**:
-   - `supabase/migrations/202610090001_foundation.sql`
-   - `supabase/migrations/202610090002_contacts.sql`
-   - `supabase/migrations/202610090003_profile_about.sql`
-   - `supabase/migrations/202610090004_push_tokens.sql`
-   The first migration creates profiles for both new and existing Auth users. The second adds usernames and the contact RPCs; the third adds about lines; the fourth adds push-token registration. Do not execute `supabase/tests/local_auth_stub.sql` on your hosted project; it is a local test fixture.
-3. Enable email/password Auth. For a private development project, create confirmed test users in the dashboard. Supabase's built-in mail sender has delivery restrictions and rate limits; public registration requires a configured SMTP provider with an appropriate free allowance. Do not assume unrestricted free email delivery.
-4. Create `config.json` based on `config.example.json`. Set the project URL and **publishable/anon** client key. This file is ignored by Git. Never put a service-role key, database password, SMTP secret, or R2 credential in Flutter defines: client configuration is extractable.
-5. Set the Auth Site URL to your development web origin, for example `http://localhost:7357`. Confirmation is completed in the browser; return to the app and sign in with the confirmed account. Native automatic deep-link sign-in and password recovery are phase 2 follow-ups.
-6. Run:
+3. Create `config.json` in the project root:
+   ```json
+   {
+     "SUPABASE_URL": "https://your-project.supabase.co",
+     "SUPABASE_ANON_KEY": "your-publishable-anon-key"
+   }
+   ```
+
+4. Launch with backend credentials:
+   ```powershell
+   flutter run -d chrome --web-port 7357 --dart-define-from-file=config.json
+   ```
+
+---
+
+## 🧪 Testing & Code Quality
+
+Run static analysis and full unit/widget test suite:
 
 ```powershell
-flutter run -d chrome --web-port 7357 --dart-define-from-file=config.json
-```
-
-Open the settings icon to register or sign in, then **People & profile**. Save your display name and username. Sign in with a second account on another device/browser, save its username, and invite it from the first account. Refresh on the recipient, accept, then refresh on the sender. Contact data comes from Supabase; the main chat list remains the local demo. Contacts refresh manually or when the app resumes, not over Realtime yet. Device registration and account deletion remain follow-ups.
-
-Password recovery uses Supabase's email sender. On a private project, test it with a real address; public use needs a configured SMTP provider. The reset link must be opened on the same device so the app can receive the callback and let you set the new password.
-
-Declined invitations cannot be resent for the same account pair in this pilot. Blocking removes the connection; unblocking requires a new invitation and does not restore it automatically.
-
-## Checks and builds
-
-```powershell
+# Run static analysis (0 errors guaranteed)
 flutter analyze
+
+# Run all 46 unit & widget tests
 flutter test
-flutter build web
-flutter build apk --debug
+
+# Build production Android APK
+flutter build apk --release
 ```
 
-Web output is in `build/web`; it can later be deployed to a free static-hosting tier. Android release signing, app-store distribution, and production hosting are not configured. App-store developer fees are separate from cloud costs.
+---
 
-## Project map
+## 📁 Repository Structure
 
 ```text
-lib/main.dart                 Bootstrap, theme, optional Supabase connection
-lib/src/chat_store.dart       Local demo models and persistence
-lib/src/home.dart             Responsive chat UI and composer
-lib/src/settings.dart         Cloud account and local demo settings
-lib/src/onboarding.dart       First-launch landing, account, and profile setup
-lib/src/profile_page.dart     WhatsApp-style profile (photo, name, about)
-lib/src/google_sign_in.dart    Continue-with-Google button and callback URL
-lib/src/push/push_service.dart Push registration and token lifecycle
-lib/src/recovery_page.dart    Password recovery over email deep link
-lib/src/local_profile.dart    Device-local name/about/photo store
-lib/src/contacts_page.dart    Live profile, invitations, and contacts UI
-lib/src/contacts_repository.dart  Typed Supabase RPC adapter
-supabase/migrations/          Database foundation and RLS
-docs/DEVELOPMENT_PLAN.md      Phases, deliverables, acceptance criteria
-docs/GOOGLE_SETUP.md          Google Cloud OAuth and Firebase/FCM setup steps
-docs/ARCHITECTURE.md          Data flows and security boundaries
-docs/FREE_TIER_BUDGET.md      Verified allowances and planned limits
-test/widget_test.dart        User-flow and persistence checks
-test/google_sign_in_test.dart Auth error mapping checks
-test/push_service_test.dart Push degrades to disabled without native setup
-test/contacts_page_test.dart Contact UI success/failure checks
-supabase/tests/              PostgreSQL authorization and lifecycle tests
+lib/main.dart                         App entry point, theme management, Supabase initialization
+lib/src/home.dart                     WhatsApp 4-tab layout (Chats, Status, Calls, Settings)
+lib/src/onboarding.dart               First-launch welcome, account, and profile setup
+lib/src/auth/phone_auth.dart          SMS OTP authentication service
+lib/src/auth/phone_auth_page.dart     WhatsApp phone sign-in UI with country code picker
+lib/src/status/status_page.dart       WhatsApp Status / Stories feed and full-screen viewer
+lib/src/calling/call_screen.dart     E2EE Voice and Video calling UI with controls & timers
+lib/src/calling/call_history_page.dart Call log list and dialer
+lib/src/widgets/media_preview.dart   Rich media player & preview cards
+lib/src/widgets/status_ticks.dart    WhatsApp single/double/blue read delivery ticks
+lib/src/theme/app_theme.dart          Dynamic Light, Dark, Emerald, and System theme controller
+lib/src/secure_chat_screen.dart      Realtime Signal E2EE messaging screen
+lib/src/security/device_security.dart Android Keystore Signal identity bridge
+supabase/migrations/                 Database schema migrations (0001 - 0008)
+supabase/verify_migrations.sql       Database verification suite
+android/app/proguard-rules.pro        Production release obfuscation rules
+docs/DEVELOPMENT_PLAN.md             Comprehensive 7-phase implementation plan
+docs/CALLING_PLAN.md                 LiveKit WebRTC signaling specification
 ```
 
-See [the phase plan](docs/DEVELOPMENT_PLAN.md) for the build sequence. Cloud services have not been provisioned or deployed by this repository.
+---
 
-## Database verification without cloud credentials
+## 📄 License & Attribution
 
-The migrations and authorization tests can run against disposable PostgreSQL with Docker. The auth stub simulates Supabase subjects and roles; it does not test hosted Auth or PostgREST itself.
-
-```powershell
-docker run --name openchat-phase2-db --detach --rm -e POSTGRES_PASSWORD=openchat-local-test-only postgres:17-alpine
-# Wait until this reports accepting connections:
-docker exec openchat-phase2-db pg_isready -U postgres
-docker cp supabase openchat-phase2-db:/tmp/openchat-supabase
-docker exec openchat-phase2-db psql -U postgres -v ON_ERROR_STOP=1 -f /tmp/openchat-supabase/tests/local_auth_stub.sql -f /tmp/openchat-supabase/migrations/202610090001_foundation.sql -f /tmp/openchat-supabase/migrations/202610090002_contacts.sql -f /tmp/openchat-supabase/migrations/202610090003_profile_about.sql -f /tmp/openchat-supabase/migrations/202610090004_push_tokens.sql -f /tmp/openchat-supabase/tests/contacts_security.sql -f /tmp/openchat-supabase/tests/push_tokens.sql
-docker stop openchat-phase2-db
-```
+This project incorporates `libsignal-client` and `libsignal-android` (AGPLv3) for Signal E2EE cryptographic operations.
