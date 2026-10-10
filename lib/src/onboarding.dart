@@ -9,6 +9,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'contacts_repository.dart';
 import 'auth/password_auth.dart';
 import 'auth/password_field.dart';
+import 'auth/phone_auth_page.dart';
 import 'google_sign_in.dart';
 import 'local_profile.dart';
 import 'recovery_page.dart';
@@ -318,6 +319,22 @@ class _AccountStepState extends State<_AccountStep> {
               onMessage: (message) {
                 if (mounted) setState(() => feedback = message);
               },
+            ),
+            const SizedBox(height: 8),
+            OutlinedButton.icon(
+              onPressed: busy
+                  ? null
+                  : () => Navigator.push(
+                      context,
+                      MaterialPageRoute<void>(
+                        builder: (_) => PhoneAuthPage(
+                          client: widget.client!,
+                          onSuccess: widget.onDone,
+                        ),
+                      ),
+                    ),
+              icon: const Icon(Icons.phone_android),
+              label: const Text('Continue with Phone Number'),
             ),
             TextButton(
               onPressed: busy ? null : widget.onSkip,

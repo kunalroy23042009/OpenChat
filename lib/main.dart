@@ -8,10 +8,14 @@ import 'src/auth/recovery_controller.dart';
 import 'src/home.dart';
 import 'src/local_profile.dart';
 import 'src/onboarding.dart';
+import 'src/ops/error_report.dart';
 import 'src/push/push_service.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // Content-free crash breadcrumbs for pilot ops. No message bodies,
+  // ciphertext, or key material ever leaves the device through this path.
+  ErrorReport.install();
   const url = String.fromEnvironment('SUPABASE_URL');
   const key = String.fromEnvironment('SUPABASE_ANON_KEY');
   String? startupError;

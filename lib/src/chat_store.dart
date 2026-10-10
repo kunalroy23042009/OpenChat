@@ -20,6 +20,23 @@ class ChatMessage {
   );
 }
 
+class SecureMessage {
+  SecureMessage({required this.text, required this.mine, required this.at});
+  final String text;
+  final bool mine;
+  final DateTime at;
+  Map<String, dynamic> toJson() => {
+    'text': text,
+    'mine': mine,
+    'at': at.toIso8601String(),
+  };
+  factory SecureMessage.fromJson(Map<String, dynamic> json) => SecureMessage(
+    text: json['text'] as String,
+    mine: json['mine'] as bool,
+    at: DateTime.parse(json['at'] as String),
+  );
+}
+
 class Conversation {
   Conversation({
     required this.id,
@@ -129,6 +146,121 @@ class ChatStore extends ChangeNotifier {
     conversations = _seed();
     storageWarning = null;
     await _save();
+  }
+
+  // ==== Secure (encrypted) conversation storage ====
+  // Separate namespace to avoid mixing with demo data.
+
+  static const _securePrefix = 'openchat.secure.v1.';
+
+  Future<void> loadSecureConversation(String accountId, String peerId) async {
+    final key = _secureKey(accountId, peerId);
+    final saved = preferences.getString(key);
+    if (saved == null) return;
+    try {
+      final data = jsonDecode(saved) as Map<String, dynamic>;
+      final list = (data['messages'] as List)
+          .map(
+            (m) => SecureMessage.fromJson(Map<String, dynamic>.from(m as Map)),
+          )
+          .toList();
+      // Find or create the secure conversation
+      final existing = conversations.indexWhere(
+        (c) => c.id == _secureId(accountId, peerId),
+      );
+      if (existing >= 0) {
+        conversations[existing] = Conversation(
+          id: conversations[existing].id,
+          name: conversations[existing].name,
+          color: conversations[existing].color,
+          messages: list.cast<ChatMessage>(),
+          unread: conversations[existing].unread,
+        );
+      }
+    } catch (_) {
+      // Corrupt or missing secure data; ignore.
+    }
+  }
+
+  static String _secureId(String accountId, String peerId) =>
+      '_secure_$accountId-$peerId';
+
+  static String _secureKey(String accountId, String peerId) =>
+      '$_securePrefix$accountId-$peerId';
+
+  DateTime? lastSecureMessageTime(String accountId, String peerId) {
+    final key = _secureKey(accountId, peerId);
+    final saved = preferences.getString(key);
+    if (saved == null) return null;
+    try {
+      final data = jsonDecode(saved) as Map<String, dynamic>;
+      final list = (data['messages'] as List);
+      if (list.isEmpty) return null;
+      return DateTime.parse((list.last as Map)['at'] as String);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> addSecureMessage(
+    String accountId,
+    String peerId,
+    String text, {
+    required bool mine,
+  }) async {
+    final key = _secureKey(accountId, peerId);
+    final saved = preferences.getString(key);
+    List<SecureMessage> messages;
+    if (saved == null) {
+      messages = [];
+    } else {
+      try {
+        messages = (jsonDecode(saved) as Map)['messages']
+            .map((m) => SecureMessage.fromJson(Map<String, dynamic>.from(m)))
+            .toList();
+      } catch (_) {
+        messages = [];
+      }
+    }
+    messages.add(SecureMessage(text: text, mine: mine, at: DateTime.now()));
+    // Keep only last 1000 messages per conversation
+    if (messages.length > 1000) {
+      messages = messages.sublist(messages.length - 1000);
+    }
+    final ok = await preferences.setString(
+      key,
+      jsonEncode({'messages': messages.map((m) => m.toJson()).toList()}),
+    );
+    if (!ok) throw StateError('Secure save failed');
+    // Also update the in-memory Conversation if it exists
+    final secureId = _secureId(accountId, peerId);
+    final idx = conversations.indexWhere((c) => c.id == secureId);
+    if (idx >= 0) {
+      conversations[idx] = Conversation(
+        id: conversations[idx].id,
+        name: conversations[idx].name,
+        color: conversations[idx].color,
+        messages: messages
+            .map((m) => ChatMessage(text: m.text, mine: m.mine, at: m.at))
+            .toList(),
+        unread: conversations[idx].unread,
+      );
+    }
+    notifyListeners();
+  }
+
+  List<ChatMessage> getSecureConversation(String accountId, String peerId) {
+    final key = _secureKey(accountId, peerId);
+    final saved = preferences.getString(key);
+    if (saved == null) return [];
+    try {
+      final list = (jsonDecode(saved) as Map)['messages'] as List;
+      return list
+          .map((m) => ChatMessage.fromJson(Map<String, dynamic>.from(m)))
+          .toList();
+    } catch (_) {
+      return [];
+    }
   }
 
   static List<Conversation> _seed() {

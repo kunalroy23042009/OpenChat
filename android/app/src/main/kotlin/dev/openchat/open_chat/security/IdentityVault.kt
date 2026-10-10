@@ -28,8 +28,32 @@ class IdentityVault(context: Context, accountId: String) {
     private val aad = "openchat.identity.v1:$account".toByteArray(Charsets.UTF_8)
 
     private fun keyStore() = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-    private fun existingKey(): SecretKey = keyStore().getKey(alias, null) as? SecretKey
+    fun wrappingKey(): SecretKey = keyStore().getKey(alias, null) as? SecretKey
         ?: throw IllegalStateException("Wrapping key unavailable")
+
+    /** Decrypted identity for native protocol use only. Never cross the method channel. */
+    fun identityPair(): Pair<IdentityKeyPair, Int> {
+        val (identity, registrationId, _) = unlocked()
+        return Pair(identity, registrationId)
+    }
+
+    private fun unlocked(): Triple<IdentityKeyPair, Int, SecretKey> {
+        check(file.exists()) { "Identity not initialized" }
+        val bytes = atomicFile.readFully()
+        check(bytes.size in 30..8192 && bytes[0] == 1.toByte()) { "Invalid identity file" }
+        val key = wrappingKey()
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, bytes.copyOfRange(1, 13)))
+        cipher.updateAAD(aad)
+        val clear = cipher.doFinal(bytes.copyOfRange(13, bytes.size))
+        try {
+            val state = JSONObject(String(clear, Charsets.UTF_8))
+            check(state.getInt("version") == 1 && state.getString("account") == account) { "Identity mismatch" }
+            val privateBytes = Base64.decode(state.getString("identity"), Base64.NO_WRAP)
+            val identity = try { IdentityKeyPair(privateBytes) } finally { privateBytes.fill(0) }
+            return Triple(identity, state.getInt("registrationId"), key)
+        } finally { clear.fill(0) }
+    }
 
     fun initialize(): Map<String, Any> {
         if (file.exists()) return status()
@@ -74,27 +98,15 @@ class IdentityVault(context: Context, accountId: String) {
             check(!keyStore().containsAlias(alias)) { "Identity file missing" }
             return mapOf("initialized" to false, "libraryVersion" to "0.105.0")
         }
-        val bytes = atomicFile.readFully()
-        check(bytes.size in 30..8192 && bytes[0] == 1.toByte()) { "Invalid identity file" }
-        val key = existingKey()
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, bytes.copyOfRange(1, 13)))
-        cipher.updateAAD(aad)
-        val clear = cipher.doFinal(bytes.copyOfRange(13, bytes.size))
-        try {
-            val state = JSONObject(String(clear, Charsets.UTF_8))
-            check(state.getInt("version") == 1 && state.getString("account") == account)
-            val privateBytes = Base64.decode(state.getString("identity"), Base64.NO_WRAP)
-            val identity = try { IdentityKeyPair(privateBytes) } finally { privateBytes.fill(0) }
-            val fingerprint = MessageDigest.getInstance("SHA-256").digest(identity.publicKey.serialize())
-                .joinToString("") { "%02x".format(it.toInt() and 0xff) }
-            val keyInfo = SecretKeyFactory.getInstance(key.algorithm, "AndroidKeyStore")
-                .getKeySpec(key, KeyInfo::class.java) as KeyInfo
-            @Suppress("DEPRECATION")
-            val hardware = keyInfo.isInsideSecureHardware
-            return mapOf("initialized" to true, "libraryVersion" to "0.105.0",
-                "fingerprint" to fingerprint, "hardwareBacked" to hardware,
-                "registrationId" to state.getInt("registrationId"))
-        } finally { clear.fill(0) }
+        val (identity, registrationId, key) = unlocked()
+        val fingerprint = MessageDigest.getInstance("SHA-256").digest(identity.publicKey.serialize())
+            .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        val keyInfo = SecretKeyFactory.getInstance(key.algorithm, "AndroidKeyStore")
+            .getKeySpec(key, KeyInfo::class.java) as KeyInfo
+        @Suppress("DEPRECATION")
+        val hardware = keyInfo.isInsideSecureHardware
+        return mapOf("initialized" to true, "libraryVersion" to "0.105.0",
+            "fingerprint" to fingerprint, "hardwareBacked" to hardware,
+            "registrationId" to registrationId)
     }
 }

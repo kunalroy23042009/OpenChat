@@ -92,6 +92,16 @@ do $$ begin
     if public.send_contact_invite('missing_person') <> 'unavailable' then raise exception 'Unexpected budget cutoff'; end if;
   end loop;
   if public.send_contact_invite('alice') <> 'rate_limited' then raise exception 'Rate cap bypass'; end if;
+-- Test invitation cancellation and account deletion
+select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000003', true);
+do $$ declare req_id uuid; begin
+  perform public.save_profile('Eve', 'eve_test', 'Short stay.');
+  if public.send_contact_invite('alice') <> 'sent' then raise exception 'Eve invite failed'; end if;
+  select id into req_id from public.contact_requests where sender_id = auth.uid();
+  perform public.cancel_contact_invite(req_id);
+  if exists(select 1 from public.contact_requests where id = req_id) then raise exception 'Cancel invite failed'; end if;
+  perform public.delete_account();
+  if exists(select 1 from public.profiles where id = '00000000-0000-0000-0000-000000000003') then raise exception 'Delete account profile failed'; end if;
 end $$;
 
 reset role;
@@ -109,4 +119,4 @@ do $$ begin
 end $$;
 reset role;
 rollback;
-select 'Contact authorization, lifecycle, and rate-limit tests passed' as result;
+select 'Contact authorization, lifecycle, rate-limit, cancel, and deletion tests passed' as result;

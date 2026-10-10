@@ -49,6 +49,10 @@ app.*.map.json
 .widget_preview/
 # Local provider configuration
 config.json
+# Android release signing (pilot upload key, generated locally)
+*.jks
+*.keystore
+android/key.properties
 google-services.json
 **/google-services.json
 GoogleService-Info.plist

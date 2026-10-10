@@ -37,6 +37,8 @@ class FakeContactsRepository implements ContactsRepository {
   @override
   Future<String> invite(String username) async => 'rate_limited';
   @override
+  Future<String> inviteByPhone(String phone) async => 'rate_limited';
+  @override
   Future<void> respond(String requestId, bool accept) async {
     rows = [
       CloudContact(
@@ -55,6 +57,15 @@ class FakeContactsRepository implements ContactsRepository {
   Future<void> block(String userId) async {}
   @override
   Future<void> unblock(String userId) async {}
+  @override
+  Future<void> cancelInvite(String requestId) async {
+    rows.removeWhere((r) => r.requestId == requestId);
+  }
+
+  @override
+  Future<void> deleteAccount() async {
+    rows.clear();
+  }
 }
 
 void main() {

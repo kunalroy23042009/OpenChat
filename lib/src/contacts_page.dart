@@ -1,10 +1,26 @@
 import 'package:flutter/material.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
+import 'chat_store.dart';
 import 'contacts_repository.dart';
+import 'local_profile.dart';
+import 'push/push_service.dart';
+import 'secure_chat_screen.dart';
 
 class ContactsPage extends StatefulWidget {
-  const ContactsPage({super.key, required this.repository});
+  const ContactsPage({
+    super.key,
+    required this.repository,
+    this.client,
+    this.store,
+    this.push,
+    this.profile,
+  });
   final ContactsRepository repository;
+  final SupabaseClient? client;
+  final ChatStore? store;
+  final PushService? push;
+  final LocalProfile? profile;
   @override
   State<ContactsPage> createState() => _ContactsPageState();
 }
@@ -15,6 +31,7 @@ class _ContactsPageState extends State<ContactsPage>
   final username = TextEditingController();
   final about = TextEditingController();
   final inviteName = TextEditingController();
+  final invitePhone = TextEditingController();
   final profileForm = GlobalKey<FormState>();
   List<CloudContact> contacts = [];
   bool loading = true;
@@ -36,6 +53,7 @@ class _ContactsPageState extends State<ContactsPage>
     username.dispose();
     about.dispose();
     inviteName.dispose();
+    invitePhone.dispose();
     super.dispose();
   }
 
@@ -281,9 +299,40 @@ class _ContactsPageState extends State<ContactsPage>
                   icon: const Icon(Icons.person_add_alt_1),
                   label: const Text('Send invitation'),
                 ),
+                const SizedBox(height: 16),
+                TextField(
+                  controller: invitePhone,
+                  enabled: !disabled,
+                  keyboardType: TextInputType.phone,
+                  decoration: const InputDecoration(
+                    labelText: 'Or invite by phone number (WhatsApp-style)',
+                    hintText: '+14155552671',
+                    prefixIcon: Icon(Icons.phone),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  onPressed: disabled
+                      ? null
+                      : () {
+                          if (invitePhone.text.trim().isEmpty) {
+                            setState(() => error = 'Enter a valid phone number (e.g. +14155552671).');
+                            return;
+                          }
+                          perform(() async {
+                            final message = await widget.repository.inviteByPhone(
+                              invitePhone.text,
+                            );
+                            if (mounted) invitePhone.clear();
+                            return message;
+                          });
+                        },
+                  icon: const Icon(Icons.send_to_mobile),
+                  label: const Text('Invite by phone number'),
+                ),
                 const SizedBox(height: 6),
                 const Text(
-                  'Up to 20 invitation attempts per day. No address book upload.',
+                  'Up to 20 invitation attempts per day. Fast phone contact discovery.',
                   style: TextStyle(fontSize: 12),
                 ),
                 const Divider(height: 48),
@@ -366,6 +415,32 @@ class _ContactsPageState extends State<ContactsPage>
                 Wrap(
                   spacing: 8,
                   children: [
+                    if (contact.status == 'accepted' &&
+                        widget.client != null &&
+                        widget.store != null &&
+                        widget.push != null &&
+                        widget.profile != null) ...[
+                      FilledButton.icon(
+                        onPressed: disabled
+                            ? null
+                            : () => Navigator.push(
+                                  context,
+                                  MaterialPageRoute<void>(
+                                    builder: (_) => SecureChatScreen(
+                                      profile: widget.profile!,
+                                      store: widget.store!,
+                                      push: widget.push!,
+                                      client: widget.client!,
+                                      peerId: contact.userId,
+                                      peerName: contact.name,
+                                      peerUsername: contact.username,
+                                    ),
+                                  ),
+                                ),
+                        icon: const Icon(Icons.lock_outline, size: 18),
+                        label: const Text('Encrypted chat'),
+                      ),
+                    ],
                     if (contact.status == 'pending' && contact.incoming) ...[
                       FilledButton(
                         onPressed: disabled
@@ -390,6 +465,18 @@ class _ContactsPageState extends State<ContactsPage>
                                 return 'Invitation declined.';
                               }),
                         child: const Text('Decline'),
+                      ),
+                    ] else if (contact.status == 'pending' && !contact.incoming) ...[
+                      OutlinedButton(
+                        onPressed: disabled
+                            ? null
+                            : () => perform(() async {
+                                await widget.repository.cancelInvite(
+                                  contact.requestId!,
+                                );
+                                return 'Invitation cancelled.';
+                              }),
+                        child: const Text('Cancel invitation'),
                       ),
                     ],
                     if (contact.status == 'blocked')

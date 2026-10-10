@@ -5,6 +5,8 @@ import 'chat_store.dart';
 import 'local_profile.dart';
 import 'push/push_service.dart';
 import 'settings.dart';
+import 'status/status_page.dart';
+import 'calling/call_history_page.dart';
 
 class ChatHome extends StatefulWidget {
   const ChatHome({
@@ -28,6 +30,7 @@ class _ChatHomeState extends State<ChatHome> {
   Conversation? selected;
   String query = '';
   bool unreadOnly = false;
+  int activeTab = 0;
   void open(Conversation chat, bool wide) {
     widget.store.markRead(chat);
     if (wide) {
@@ -263,6 +266,19 @@ class _ChatHomeState extends State<ChatHome> {
             ),
           ],
         );
+        final currentBody = switch (activeTab) {
+          1 => const StatusPage(),
+          2 => const CallHistoryPage(),
+          3 => SettingsPage(
+              store: widget.store,
+              profile: widget.profile,
+              push: widget.push,
+              client: widget.client,
+              startupError: widget.startupError,
+            ),
+          _ => list,
+        };
+
         return Scaffold(
           body: SafeArea(
             child: wide
@@ -283,7 +299,35 @@ class _ChatHomeState extends State<ChatHome> {
                       ),
                     ],
                   )
-                : list,
+                : currentBody,
+          ),
+          bottomNavigationBar: NavigationBar(
+            selectedIndex: activeTab,
+            onDestinationSelected: (index) {
+              setState(() => activeTab = index);
+            },
+            destinations: const [
+              NavigationDestination(
+                icon: Icon(Icons.chat_outlined),
+                selectedIcon: Icon(Icons.chat),
+                label: 'Chats',
+              ),
+              NavigationDestination(
+                icon: Icon(Icons.donut_large_outlined),
+                selectedIcon: Icon(Icons.donut_large),
+                label: 'Status',
+              ),
+              NavigationDestination(
+                icon: Icon(Icons.call_outlined),
+                selectedIcon: Icon(Icons.call),
+                label: 'Calls',
+              ),
+              NavigationDestination(
+                icon: Icon(Icons.settings_outlined),
+                selectedIcon: Icon(Icons.settings),
+                label: 'Settings',
+              ),
+            ],
           ),
         );
       },

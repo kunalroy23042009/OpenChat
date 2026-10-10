@@ -7,6 +7,7 @@ import 'chat_store.dart';
 import 'auth/password_auth.dart';
 import 'auth/password_field.dart';
 import 'auth/password_page.dart';
+import 'auth/phone_auth_page.dart';
 import 'contacts_page.dart';
 import 'contacts_repository.dart';
 import 'google_sign_in.dart';
@@ -205,8 +206,12 @@ class _SettingsPageState extends State<SettingsPage> {
                       : () => Navigator.push(
                           context,
                           MaterialPageRoute<void>(
-                            builder: (_) =>
-                                _AccountContactsRoute(client: widget.client!),
+                            builder: (_) => _AccountContactsRoute(
+                              client: widget.client!,
+                              store: widget.store,
+                              push: widget.push,
+                              profile: widget.profile,
+                            ),
                           ),
                         ),
                   icon: const Icon(Icons.people_outline),
@@ -240,6 +245,55 @@ class _SettingsPageState extends State<SettingsPage> {
                           }
                         },
                   child: const Text('Sign out'),
+                ),
+                TextButton(
+                  onPressed: busy
+                      ? null
+                      : () async {
+                          final confirmed = await showDialog<bool>(
+                            context: context,
+                            builder: (ctx) => AlertDialog(
+                              title: const Text('Delete Open Chat account?'),
+                              content: const Text(
+                                'This will permanently delete your profile, contacts, and cloud account data. This action cannot be undone.',
+                              ),
+                              actions: [
+                                TextButton(
+                                  onPressed: () => Navigator.pop(ctx, false),
+                                  child: const Text('Cancel'),
+                                ),
+                                FilledButton(
+                                  style: FilledButton.styleFrom(
+                                    backgroundColor:
+                                        Theme.of(ctx).colorScheme.error,
+                                  ),
+                                  onPressed: () => Navigator.pop(ctx, true),
+                                  child: const Text('Delete account'),
+                                ),
+                              ],
+                            ),
+                          );
+                          if (confirmed == true && mounted) {
+                            setState(() => busy = true);
+                            try {
+                              final repo = SupabaseContactsRepository(
+                                widget.client!,
+                              );
+                              await repo.deleteAccount();
+                              feedback = 'Account deleted.';
+                            } catch (e) {
+                              feedback = cloudError(e);
+                            } finally {
+                              if (mounted) setState(() => busy = false);
+                            }
+                          }
+                        },
+                  child: Text(
+                    'Delete account',
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
+                    ),
+                  ),
                 ),
               ] else ...[
                 TextField(
@@ -278,6 +332,21 @@ class _SettingsPageState extends State<SettingsPage> {
                   onMessage: (message) {
                     if (mounted) setState(() => feedback = message);
                   },
+                ),
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  onPressed: busy
+                      ? null
+                      : () => Navigator.push(
+                          context,
+                          MaterialPageRoute<void>(
+                            builder: (_) => PhoneAuthPage(
+                              client: widget.client!,
+                            ),
+                          ),
+                        ),
+                  icon: const Icon(Icons.phone_android),
+                  label: const Text('Sign in with Phone Number'),
                 ),
                 Align(
                   alignment: Alignment.centerLeft,
@@ -355,8 +424,16 @@ class _SecurityRoute extends StatelessWidget {
 
 /// Discard account-scoped data immediately when the active identity changes.
 class _AccountContactsRoute extends StatelessWidget {
-  const _AccountContactsRoute({required this.client});
+  const _AccountContactsRoute({
+    required this.client,
+    required this.store,
+    required this.push,
+    required this.profile,
+  });
   final SupabaseClient client;
+  final ChatStore store;
+  final PushService push;
+  final LocalProfile profile;
   @override
   Widget build(BuildContext context) => StreamBuilder<AuthState>(
     stream: client.auth.onAuthStateChange,
@@ -378,6 +455,10 @@ class _AccountContactsRoute extends StatelessWidget {
       return ContactsPage(
         key: ValueKey(user.id),
         repository: SupabaseContactsRepository(client),
+        client: client,
+        store: store,
+        push: push,
+        profile: profile,
       );
     },
   );

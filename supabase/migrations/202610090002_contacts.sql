@@ -145,16 +145,40 @@ begin
 end;
 $$;
 
+create function public.cancel_contact_invite(p_request_id uuid)
+returns void language plpgsql security definer set search_path = '' as $$
+declare me uuid := auth.uid();
+begin
+  if me is null then raise exception 'Sign in required'; end if;
+  delete from public.contact_requests where id = p_request_id and sender_id = me and status = 'pending';
+  if not found then raise exception 'Invitation unavailable or already handled'; end if;
+end;
+$$;
+
+create function public.delete_account()
+returns void language plpgsql security definer set search_path = '' as $$
+declare me uuid := auth.uid();
+begin
+  if me is null then raise exception 'Sign in required'; end if;
+  delete from public.profiles where id = me;
+  delete from auth.users where id = me;
+end;
+$$;
+
 revoke all on function public.save_profile(text,text) from public, anon, authenticated;
 revoke all on function public.send_contact_invite(text) from public, anon, authenticated;
 revoke all on function public.respond_contact_invite(uuid,boolean) from public, anon, authenticated;
+revoke all on function public.cancel_contact_invite(uuid) from public, anon, authenticated;
 revoke all on function public.block_contact(uuid) from public, anon, authenticated;
 revoke all on function public.unblock_contact(uuid) from public, anon, authenticated;
 revoke all on function public.list_my_contacts() from public, anon, authenticated;
+revoke all on function public.delete_account() from public, anon, authenticated;
 grant execute on function public.save_profile(text,text) to authenticated;
 grant execute on function public.send_contact_invite(text) to authenticated;
 grant execute on function public.respond_contact_invite(uuid,boolean) to authenticated;
+grant execute on function public.cancel_contact_invite(uuid) to authenticated;
 grant execute on function public.block_contact(uuid) to authenticated;
 grant execute on function public.unblock_contact(uuid) to authenticated;
 grant execute on function public.list_my_contacts() to authenticated;
+grant execute on function public.delete_account() to authenticated;
 commit;

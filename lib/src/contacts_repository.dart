@@ -40,9 +40,12 @@ abstract class ContactsRepository {
   Future<void> saveProfile(String name, String username, String about);
   Future<List<CloudContact>> contacts();
   Future<String> invite(String username);
+  Future<String> inviteByPhone(String phone);
   Future<void> respond(String requestId, bool accept);
+  Future<void> cancelInvite(String requestId);
   Future<void> block(String userId);
   Future<void> unblock(String userId);
+  Future<void> deleteAccount();
 }
 
 class SupabaseContactsRepository implements ContactsRepository {
@@ -91,11 +94,26 @@ class SupabaseContactsRepository implements ContactsRepository {
     'send_contact_invite',
     params: {'p_username': username.trim().toLowerCase()},
   ) as String;
+
+  @override
+  Future<String> inviteByPhone(String phone) async => await client.rpc(
+    'send_invite_by_phone',
+    params: {'p_phone': phone.trim()},
+  ) as String;
+
   @override
   Future<void> respond(String requestId, bool accept) async {
     await client.rpc(
       'respond_contact_invite',
       params: {'p_request_id': requestId, 'p_accept': accept},
+    );
+  }
+
+  @override
+  Future<void> cancelInvite(String requestId) async {
+    await client.rpc(
+      'cancel_contact_invite',
+      params: {'p_request_id': requestId},
     );
   }
 
@@ -107,6 +125,12 @@ class SupabaseContactsRepository implements ContactsRepository {
   @override
   Future<void> unblock(String userId) async {
     await client.rpc('unblock_contact', params: {'p_user_id': userId});
+  }
+
+  @override
+  Future<void> deleteAccount() async {
+    await client.rpc('delete_account');
+    await client.auth.signOut();
   }
 }
 
