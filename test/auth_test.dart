@@ -39,7 +39,7 @@ void main() {
     test('blank passwords are rejected before any network call', () {
       expect(
         credentialsValidation('sam@example.com', '', register: false),
-        'Enter your Open Chat password.',
+        'Enter your OpenChat password.',
       );
     });
 

@@ -1,4 +1,7 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
 
 class StatusItem {
   const StatusItem({
@@ -9,6 +12,7 @@ class StatusItem {
     this.isMe = false,
     this.isViewed = false,
     this.backgroundColor = const Color(0xFF245CDB),
+    this.imagePath,
   });
 
   final String id;
@@ -18,6 +22,9 @@ class StatusItem {
   final bool isMe;
   final bool isViewed;
   final Color backgroundColor;
+
+  /// Local gallery photo attached to this status (this-device demo for now).
+  final String? imagePath;
 }
 
 class StatusPage extends StatefulWidget {
@@ -32,7 +39,7 @@ class _StatusPageState extends State<StatusPage> {
     StatusItem(
       id: 'my_status_1',
       authorName: 'My Status',
-      content: 'Available on Open Chat!',
+      content: 'Available on OpenChat!',
       timestamp: DateTime.now().subtract(const Duration(hours: 2)),
       isMe: true,
       isViewed: true,
@@ -55,7 +62,33 @@ class _StatusPageState extends State<StatusPage> {
     ),
   ];
 
-  void _addStatus() async {
+  Future<void> _addStatus() async {
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.text_fields_outlined),
+              title: const Text('Text status'),
+              onTap: () => Navigator.pop(ctx, 'text'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.photo_library_outlined),
+              title: const Text('Photo status'),
+              onTap: () => Navigator.pop(ctx, 'photo'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (choice == null || !mounted) return;
+    if (choice == 'photo') {
+      await _addPhotoStatus();
+      return;
+    }
     final text = await showDialog<String>(
       context: context,
       builder: (ctx) {
@@ -99,6 +132,35 @@ class _StatusPageState extends State<StatusPage> {
         );
       });
     }
+  }
+
+  Future<void> _addPhotoStatus() async {
+    XFile? picked;
+    try {
+      picked = await ImagePicker().pickImage(
+        source: ImageSource.gallery,
+        maxWidth: 1600,
+        imageQuality: 85,
+      );
+    } on Exception catch (_) {
+      return;
+    }
+    if (picked == null || !mounted) return;
+    setState(() {
+      _statuses.insert(
+        0,
+        StatusItem(
+          id: DateTime.now().toIso8601String(),
+          authorName: 'My Status',
+          content: 'Photo',
+          timestamp: DateTime.now(),
+          isMe: true,
+          isViewed: true,
+          backgroundColor: const Color(0xFF0F172A),
+          imagePath: picked!.path,
+        ),
+      );
+    });
   }
 
   void _viewStatus(StatusItem status) {
@@ -145,18 +207,49 @@ class _StatusPageState extends State<StatusPage> {
                 ),
               ),
               Center(
-                child: Padding(
-                  padding: const EdgeInsets.all(32),
-                  child: Text(
-                    status.content,
-                    textAlign: TextAlign.center,
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 28,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                ),
+                child: status.imagePath != null
+                    ? Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Flexible(
+                            child: Padding(
+                              padding: const EdgeInsets.all(16),
+                              child: ClipRRect(
+                                borderRadius: BorderRadius.circular(16),
+                                child: Image.file(
+                                  File(status.imagePath!),
+                                  fit: BoxFit.contain,
+                                ),
+                              ),
+                            ),
+                          ),
+                          if (status.content != 'Photo')
+                            Padding(
+                              padding: const EdgeInsets.all(16),
+                              child: Text(
+                                status.content,
+                                textAlign: TextAlign.center,
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 20,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                            ),
+                        ],
+                      )
+                    : Padding(
+                        padding: const EdgeInsets.all(32),
+                        child: Text(
+                          status.content,
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 28,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
               ),
             ],
           ),

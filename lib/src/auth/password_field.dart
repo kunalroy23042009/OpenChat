@@ -4,7 +4,7 @@ class PasswordField extends StatefulWidget {
   const PasswordField({
     super.key,
     required this.controller,
-    this.label = 'Open Chat password',
+    this.label = 'OpenChat password',
     this.newPassword = false,
     this.enabled = true,
     this.onSubmitted,

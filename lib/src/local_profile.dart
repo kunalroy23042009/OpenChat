@@ -21,7 +21,7 @@ class LocalProfile extends ChangeNotifier {
   static const nameKey = 'openchat.profile.name';
   static const aboutKey = 'openchat.profile.about';
   static const avatarKey = 'openchat.profile.avatar';
-  static const defaultAbout = 'Hey there! I am using Open Chat.';
+  static const defaultAbout = 'Hey there! I am using OpenChat.';
   static const maxAboutLength = 140;
 
   final SharedPreferences preferences;

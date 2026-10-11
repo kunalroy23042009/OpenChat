@@ -116,7 +116,7 @@ class _PhoneAuthPageState extends State<PhoneAuthPage> {
                 ),
                 const SizedBox(height: 8),
                 const Text(
-                  'Open Chat will send an SMS message to verify your phone number.',
+                  'OpenChat will send an SMS message to verify your phone number.',
                   textAlign: TextAlign.center,
                   style: TextStyle(color: Colors.grey),
                 ),

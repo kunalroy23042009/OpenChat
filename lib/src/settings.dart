@@ -7,6 +7,7 @@ import 'chat_store.dart';
 import 'auth/password_auth.dart';
 import 'auth/password_field.dart';
 import 'auth/password_page.dart';
+import 'auth/phone_auth.dart';
 import 'auth/phone_auth_page.dart';
 import 'contacts_page.dart';
 import 'contacts_repository.dart';
@@ -16,6 +17,8 @@ import 'profile_page.dart';
 import 'push/push_service.dart';
 import 'recovery_page.dart';
 import 'security/security_page.dart';
+import 'theme/app_theme.dart';
+import 'ai/ai_settings_page.dart';
 
 class SettingsPage extends StatefulWidget {
   const SettingsPage({
@@ -25,12 +28,14 @@ class SettingsPage extends StatefulWidget {
     required this.push,
     this.client,
     this.startupError,
+    this.theme,
   });
   final ChatStore store;
   final LocalProfile profile;
   final PushService push;
   final SupabaseClient? client;
   final String? startupError;
+  final AppThemeController? theme;
   @override
   State<SettingsPage> createState() => _SettingsPageState();
 }
@@ -41,9 +46,11 @@ class _SettingsPageState extends State<SettingsPage> {
   bool busy = false;
   String? feedback;
   StreamSubscription<AuthState>? authSubscription;
+  late AppThemeController theme;
   @override
   void initState() {
     super.initState();
+    theme = widget.theme ?? AppThemeController(widget.store.preferences);
     authSubscription = widget.client?.auth.onAuthStateChange.listen(
       (_) {
         if (mounted) setState(() {});
@@ -180,6 +187,61 @@ class _SettingsPageState extends State<SettingsPage> {
                 ),
               ),
             ),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.auto_awesome_outlined),
+              title: const Text('AI Assistants (ChatGPT, Claude, Gemini)'),
+              subtitle: const Text(
+                'Configure API keys and add LLMs directly to your WhatsApp chats.',
+              ),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () => Navigator.push(
+                context,
+                MaterialPageRoute<void>(
+                  builder: (_) => AiSettingsPage(store: widget.store),
+                ),
+              ),
+            ),
+            const Divider(height: 40),
+            const Text(
+              'Appearance',
+              style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 12),
+            ValueListenableBuilder<AppThemeMode>(
+              valueListenable: theme,
+              builder: (context, mode, _) => SegmentedButton<AppThemeMode>(
+                segments: const [
+                  ButtonSegment(
+                    value: AppThemeMode.system,
+                    label: Text('Auto'),
+                    icon: Icon(Icons.brightness_auto_outlined),
+                  ),
+                  ButtonSegment(
+                    value: AppThemeMode.light,
+                    label: Text('Light'),
+                    icon: Icon(Icons.light_mode_outlined),
+                  ),
+                  ButtonSegment(
+                    value: AppThemeMode.dark,
+                    label: Text('Dark'),
+                    icon: Icon(Icons.dark_mode_outlined),
+                  ),
+                ],
+                selected: {
+                  mode == AppThemeMode.emerald
+                      ? AppThemeMode.dark
+                      : mode,
+                },
+                onSelectionChanged: (selected) =>
+                    theme.setTheme(selected.first),
+              ),
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              'Auto follows this device\u2019s dark mode setting.',
+              style: TextStyle(fontSize: 12, color: Color(0xFF66748A)),
+            ),
             const Divider(height: 40),
             if (widget.startupError != null) Text(widget.startupError!),
             if (widget.client == null) ...[
@@ -228,7 +290,7 @@ class _SettingsPageState extends State<SettingsPage> {
                           ),
                         ),
                   icon: const Icon(Icons.password),
-                  label: const Text('Set / change Open Chat password'),
+                  label: const Text('Set / change OpenChat password'),
                 ),
                 TextButton(
                   onPressed: busy
@@ -253,7 +315,7 @@ class _SettingsPageState extends State<SettingsPage> {
                           final confirmed = await showDialog<bool>(
                             context: context,
                             builder: (ctx) => AlertDialog(
-                              title: const Text('Delete Open Chat account?'),
+                              title: const Text('Delete OpenChat account?'),
                               content: const Text(
                                 'This will permanently delete your profile, contacts, and cloud account data. This action cannot be undone.',
                               ),
@@ -313,7 +375,7 @@ class _SettingsPageState extends State<SettingsPage> {
                 const Padding(
                   padding: EdgeInsets.only(top: 8),
                   child: Text(
-                    'Use your Open Chat password here. For a Google-only account, choose Continue with Google.',
+                    'Use your OpenChat password here. For a Google-only account, choose Continue with Google.',
                     style: TextStyle(fontSize: 12),
                   ),
                 ),
@@ -334,20 +396,23 @@ class _SettingsPageState extends State<SettingsPage> {
                   },
                 ),
                 const SizedBox(height: 8),
-                OutlinedButton.icon(
-                  onPressed: busy
-                      ? null
-                      : () => Navigator.push(
-                          context,
-                          MaterialPageRoute<void>(
-                            builder: (_) => PhoneAuthPage(
-                              client: widget.client!,
+                if (kPhoneAuthEnabled) ...[
+                  const SizedBox(height: 8),
+                  OutlinedButton.icon(
+                    onPressed: busy
+                        ? null
+                        : () => Navigator.push(
+                            context,
+                            MaterialPageRoute<void>(
+                              builder: (_) => PhoneAuthPage(
+                                client: widget.client!,
+                              ),
                             ),
                           ),
-                        ),
-                  icon: const Icon(Icons.phone_android),
-                  label: const Text('Sign in with Phone Number'),
-                ),
+                    icon: const Icon(Icons.phone_android),
+                    label: const Text('Sign in with Phone Number'),
+                  ),
+                ],
                 Align(
                   alignment: Alignment.centerLeft,
                   child: TextButton(

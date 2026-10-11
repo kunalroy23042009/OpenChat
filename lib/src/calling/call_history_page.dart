@@ -104,7 +104,7 @@ class _CallHistoryPageState extends State<CallHistoryPage> {
               child: Icon(Icons.link, color: theme.colorScheme.primary),
             ),
             title: const Text('Create call link', style: TextStyle(fontWeight: FontWeight.bold)),
-            subtitle: const Text('Share a link for your Open Chat call'),
+            subtitle: const Text('Share a link for your OpenChat call'),
             onTap: () {
               ScaffoldMessenger.of(context).showSnackBar(
                 const SnackBar(content: Text('E2EE call link copied to clipboard')),

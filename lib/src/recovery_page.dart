@@ -78,7 +78,7 @@ class _RecoveryPageState extends State<RecoveryPage> {
             ),
             const SizedBox(height: 12),
             const Text(
-              'Request a link to reset your Open Chat password. Keep this app installed and open the email link on this device.',
+              'Request a link to reset your OpenChat password. Keep this app installed and open the email link on this device.',
             ),
             const SizedBox(height: 24),
             TextField(
@@ -107,7 +107,7 @@ class _RecoveryPageState extends State<RecoveryPage> {
               ),
             const SizedBox(height: 24),
             const Text(
-              'If you can sign in with Google for this exact email, use Settings → Set / change Open Chat password instead. It does not need an email.',
+              'If you can sign in with Google for this exact email, use Settings → Set / change OpenChat password instead. It does not need an email.',
             ),
             const SizedBox(height: 12),
             const Text(

@@ -13,7 +13,7 @@ String? credentialsValidation(
   }
   // Existing passwords must reach the server unchanged, regardless of a newer
   // client-side sign-up policy. Do not trim or otherwise transform passwords.
-  if (password.isEmpty) return 'Enter your Open Chat password.';
+  if (password.isEmpty) return 'Enter your OpenChat password.';
   if (register && password.length < 8) {
     return 'Choose a password of at least 8 characters.';
   }
@@ -23,8 +23,8 @@ String? credentialsValidation(
 String passwordAuthError(AuthException error) {
   switch (error.code) {
     case 'invalid_credentials':
-      return 'Email or Open Chat password was not accepted. Your Google password is different. '
-          'Use Forgot password, or sign in with Google for the same email and set an Open Chat password in Settings.';
+      return 'Email or OpenChat password was not accepted. Your Google password is different. '
+          'Use Forgot password, or sign in with Google for the same email and set an OpenChat password in Settings.';
     case 'email_not_confirmed':
       return 'Confirm your email before signing in.';
     case 'over_email_send_rate_limit':
@@ -86,7 +86,7 @@ class PasswordAuth {
   }) async {
     if (password.length < 8) {
       throw ArgumentError(
-        'Use at least 8 characters for your new Open Chat password.',
+        'Use at least 8 characters for your new OpenChat password.',
       );
     }
     if (password != confirmation) {

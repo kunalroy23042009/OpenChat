@@ -9,6 +9,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'contacts_repository.dart';
 import 'auth/password_auth.dart';
 import 'auth/password_field.dart';
+import 'auth/phone_auth.dart';
 import 'auth/phone_auth_page.dart';
 import 'google_sign_in.dart';
 import 'local_profile.dart';
@@ -83,21 +84,21 @@ class _WelcomeStep extends StatelessWidget {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Container(
-              padding: const EdgeInsets.all(28),
-              decoration: const BoxDecoration(
-                color: Color(0xFFE4EBFF),
-                shape: BoxShape.circle,
-              ),
-              child: const Icon(
-                Icons.forum_rounded,
-                size: 64,
-                color: Color(0xFF245CDB),
+            Semantics(
+              label: 'OpenChat logo',
+              image: true,
+              child: Image.asset(
+                Theme.of(context).brightness == Brightness.dark
+                    ? 'assets/logos/openchat_dove_white.png'
+                    : 'assets/logos/openchat_dove.png',
+                width: 112,
+                height: 112,
+                fit: BoxFit.contain,
               ),
             ),
             const SizedBox(height: 36),
             const Text(
-              'Welcome to\nopen chat',
+              'Welcome to\nOpenChat',
               textAlign: TextAlign.center,
               style: TextStyle(
                 fontSize: 44,
@@ -283,7 +284,7 @@ class _AccountStepState extends State<_AccountStep> {
             const Padding(
               padding: EdgeInsets.only(top: 8),
               child: Text(
-                'Use your Open Chat password here. Google passwords work only on Google’s sign-in page.',
+                'Use your OpenChat password here. Google passwords work only on Google’s sign-in page.',
                 style: TextStyle(fontSize: 12),
               ),
             ),
@@ -321,21 +322,24 @@ class _AccountStepState extends State<_AccountStep> {
               },
             ),
             const SizedBox(height: 8),
-            OutlinedButton.icon(
-              onPressed: busy
-                  ? null
-                  : () => Navigator.push(
-                      context,
-                      MaterialPageRoute<void>(
-                        builder: (_) => PhoneAuthPage(
-                          client: widget.client!,
-                          onSuccess: widget.onDone,
+            if (kPhoneAuthEnabled) ...[
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                onPressed: busy
+                    ? null
+                    : () => Navigator.push(
+                        context,
+                        MaterialPageRoute<void>(
+                          builder: (_) => PhoneAuthPage(
+                            client: widget.client!,
+                            onSuccess: widget.onDone,
+                          ),
                         ),
                       ),
-                    ),
-              icon: const Icon(Icons.phone_android),
-              label: const Text('Continue with Phone Number'),
-            ),
+                icon: const Icon(Icons.phone_android),
+                label: const Text('Continue with Phone Number'),
+              ),
+            ],
             TextButton(
               onPressed: busy ? null : widget.onSkip,
               child: const Text('Skip for now'),

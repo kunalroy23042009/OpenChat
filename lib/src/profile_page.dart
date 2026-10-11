@@ -308,7 +308,10 @@ class _ProfileRow extends StatelessWidget {
         padding: const EdgeInsets.only(top: 4),
         child: Text(
           value,
-          style: const TextStyle(fontSize: 17, color: Color(0xFF22334E)),
+          style: TextStyle(
+            fontSize: 17,
+            color: Theme.of(context).colorScheme.onSurface,
+          ),
         ),
       ),
       trailing: onEdit == null

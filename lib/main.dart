@@ -10,6 +10,7 @@ import 'src/local_profile.dart';
 import 'src/onboarding.dart';
 import 'src/ops/error_report.dart';
 import 'src/push/push_service.dart';
+import 'src/theme/app_theme.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -35,6 +36,7 @@ Future<void> main() async {
   final store = ChatStore(await SharedPreferences.getInstance());
   final preferences = store.preferences;
   final profile = LocalProfile(preferences);
+  final theme = AppThemeController(preferences);
   final onboarded = preferences.getBool('openchat.onboarding.v1') ?? false;
   final push = PushService();
   runApp(
@@ -47,6 +49,7 @@ Future<void> main() async {
       client: client,
       recovery: recovery,
       startupError: startupError,
+      theme: theme,
     ),
   );
   // Push registration must never block or break startup.
@@ -64,6 +67,7 @@ class OpenChatApp extends StatefulWidget {
     this.client,
     this.recovery,
     this.startupError,
+    this.theme,
   });
   final ChatStore store;
   final LocalProfile profile;
@@ -73,18 +77,21 @@ class OpenChatApp extends StatefulWidget {
   final SupabaseClient? client;
   final RecoveryController? recovery;
   final String? startupError;
+  final AppThemeController? theme;
   @override
   State<OpenChatApp> createState() => _OpenChatAppState();
 }
 
 class _OpenChatAppState extends State<OpenChatApp> {
   late bool entered = widget.onboardingComplete;
+  late AppThemeController theme;
   final navigator = GlobalKey<NavigatorState>();
   RecoveryController? recovery;
   bool recoveryOpen = false;
   @override
   void initState() {
     super.initState();
+    theme = widget.theme ?? AppThemeController(widget.preferences);
     recovery =
         widget.recovery ??
         (widget.client == null
@@ -124,42 +131,33 @@ class _OpenChatAppState extends State<OpenChatApp> {
   }
 
   @override
-  Widget build(BuildContext context) => MaterialApp(
-    navigatorKey: navigator,
-    title: 'Open Chat',
-    debugShowCheckedModeBanner: false,
-    theme: ThemeData(
-      useMaterial3: true,
-      colorScheme: ColorScheme.fromSeed(
-        seedColor: const Color(0xFF245CDB),
-        primary: const Color(0xFF245CDB),
-        surface: const Color(0xFFF8FAFD),
-      ),
-      scaffoldBackgroundColor: const Color(0xFFF8FAFD),
-      appBarTheme: const AppBarTheme(backgroundColor: Color(0xFFF8FAFD)),
-      inputDecorationTheme: InputDecorationTheme(
-        filled: true,
-        fillColor: const Color(0xFFEDF1F7),
-        border: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(16),
-          borderSide: BorderSide.none,
-        ),
-      ),
+  Widget build(BuildContext context) => ValueListenableBuilder<AppThemeMode>(
+    valueListenable: theme,
+    builder: (context, mode, _) => MaterialApp(
+      navigatorKey: navigator,
+      title: 'OpenChat',
+      debugShowCheckedModeBanner: false,
+      theme: theme.lightTheme,
+      darkTheme: mode == AppThemeMode.emerald
+          ? theme.emeraldTheme
+          : theme.darkTheme,
+      themeMode: theme.themeMode,
+      home: entered
+          ? ChatHome(
+              store: widget.store,
+              profile: widget.profile,
+              push: widget.push,
+              client: widget.client,
+              startupError: widget.startupError,
+              theme: theme,
+            )
+          : OnboardingFlow(
+              profile: widget.profile,
+              preferences: widget.preferences,
+              client: widget.client,
+              startupError: widget.startupError,
+              onDone: () => setState(() => entered = true),
+            ),
     ),
-    home: entered
-        ? ChatHome(
-            store: widget.store,
-            profile: widget.profile,
-            push: widget.push,
-            client: widget.client,
-            startupError: widget.startupError,
-          )
-        : OnboardingFlow(
-            profile: widget.profile,
-            preferences: widget.preferences,
-            client: widget.client,
-            startupError: widget.startupError,
-            onDone: () => setState(() => entered = true),
-          ),
   );
 }

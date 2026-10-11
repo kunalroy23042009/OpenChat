@@ -1,6 +1,6 @@
 {
-    "name": "open_chat",
-    "short_name": "open_chat",
+    "name": "OpenChat",
+    "short_name": "OpenChat",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",

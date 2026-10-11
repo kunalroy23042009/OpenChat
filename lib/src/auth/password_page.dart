@@ -73,7 +73,7 @@ class _PasswordPageState extends State<PasswordPage> {
       setState(() {
         saved = true;
         feedback =
-            'Open Chat password saved for $accountEmail. You can now sign in with that email and this password.';
+            'OpenChat password saved for $accountEmail. You can now sign in with that email and this password.';
       });
     } on ArgumentError catch (e) {
       if (mounted) setState(() => feedback = e.message.toString());
@@ -95,7 +95,7 @@ class _PasswordPageState extends State<PasswordPage> {
   Widget build(BuildContext context) => Scaffold(
     appBar: AppBar(
       title: Text(
-        widget.recovery ? 'Reset Open Chat password' : 'Set Open Chat password',
+        widget.recovery ? 'Reset OpenChat password' : 'Set OpenChat password',
       ),
     ),
     body: Center(
@@ -118,13 +118,13 @@ class _PasswordPageState extends State<PasswordPage> {
               ),
               const SizedBox(height: 12),
               const Text(
-                'This is an Open Chat password, separate from your Google password. Only the account shown above will be changed.',
+                'This is an OpenChat password, separate from your Google password. Only the account shown above will be changed.',
               ),
               const SizedBox(height: 24),
               if (!saved) ...[
                 PasswordField(
                   controller: password,
-                  label: 'New Open Chat password',
+                  label: 'New OpenChat password',
                   newPassword: true,
                   enabled: !busy,
                 ),

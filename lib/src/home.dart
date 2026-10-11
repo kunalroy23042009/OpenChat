@@ -2,11 +2,15 @@ import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'chat_store.dart';
+import 'contacts_repository.dart';
 import 'local_profile.dart';
 import 'push/push_service.dart';
+import 'secure_chat_screen.dart';
 import 'settings.dart';
+import 'theme/app_theme.dart';
 import 'status/status_page.dart';
 import 'calling/call_history_page.dart';
+import 'ai/ai_settings_page.dart';
 
 class ChatHome extends StatefulWidget {
   const ChatHome({
@@ -16,12 +20,14 @@ class ChatHome extends StatefulWidget {
     required this.push,
     this.client,
     this.startupError,
+    this.theme,
   });
   final ChatStore store;
   final LocalProfile profile;
   final PushService push;
   final SupabaseClient? client;
   final String? startupError;
+  final AppThemeController? theme;
   @override
   State<ChatHome> createState() => _ChatHomeState();
 }
@@ -82,20 +88,46 @@ class _ChatHomeState extends State<ChatHome> {
               padding: const EdgeInsets.fromLTRB(24, 24, 16, 12),
               child: Row(
                 children: [
-                  const Icon(
-                    Icons.forum_rounded,
-                    color: Color(0xFF245CDB),
-                    size: 30,
+                  Semantics(
+                    label: 'OpenChat logo',
+                    image: true,
+                    child: Image.asset(
+                      Theme.of(context).brightness == Brightness.dark
+                          ? 'assets/logos/openchat_dove_white.png'
+                          : 'assets/logos/openchat_dove.png',
+                      width: 30,
+                      height: 30,
+                      fit: BoxFit.contain,
+                    ),
                   ),
                   const SizedBox(width: 12),
                   const Expanded(
                     child: Text(
-                      'open chat',
+                      'OpenChat',
                       style: TextStyle(
                         fontSize: 27,
                         fontWeight: FontWeight.w800,
                         letterSpacing: -1.2,
                       ),
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'AI Assistants (ChatGPT, Claude, Gemini)',
+                    onPressed: () => Navigator.push(
+                      context,
+                      MaterialPageRoute<void>(
+                        builder: (_) => AiSettingsPage(store: widget.store),
+                      ),
+                    ),
+                    icon: Container(
+                      padding: const EdgeInsets.all(4),
+                      decoration: const BoxDecoration(
+                        shape: BoxShape.circle,
+                        gradient: LinearGradient(
+                          colors: [Color(0xFF245CDB), Color(0xFF00C6FF), Color(0xFF9D50BB)],
+                        ),
+                      ),
+                      child: const Icon(Icons.auto_awesome, size: 18, color: Colors.white),
                     ),
                   ),
                   IconButton(
@@ -109,6 +141,7 @@ class _ChatHomeState extends State<ChatHome> {
                           push: widget.push,
                           client: widget.client,
                           startupError: widget.startupError,
+                          theme: widget.theme,
                         ),
                       ),
                     ),
@@ -159,6 +192,13 @@ class _ChatHomeState extends State<ChatHome> {
               ),
             ),
             const SizedBox(height: 16),
+            if (widget.client?.auth.currentUser != null)
+              _SecureSection(
+                client: widget.client!,
+                store: widget.store,
+                profile: widget.profile,
+                push: widget.push,
+              ),
             Expanded(
               child: chats.isEmpty
                   ? const Center(
@@ -216,6 +256,15 @@ class _ChatHomeState extends State<ChatHome> {
                                     ),
                                   ),
                                   const SizedBox(height: 6),
+                                  if (chat.muted)
+                                    const Padding(
+                                      padding: EdgeInsets.only(bottom: 4),
+                                      child: Icon(
+                                        Icons.volume_off,
+                                        size: 14,
+                                        color: Color(0xFF66748A),
+                                      ),
+                                    ),
                                   if (chat.unread > 0)
                                     CircleAvatar(
                                       radius: 10,
@@ -275,6 +324,7 @@ class _ChatHomeState extends State<ChatHome> {
               push: widget.push,
               client: widget.client,
               startupError: widget.startupError,
+              theme: widget.theme,
             ),
           _ => list,
         };
@@ -382,19 +432,160 @@ class ContactAvatar extends StatelessWidget {
   Widget build(BuildContext context) => CircleAvatar(
     radius: 25,
     backgroundColor: Color(chat.color),
-    child: Text(
-      chat.initials,
-      style: const TextStyle(
-        color: Color(0xFF23344F),
-        fontWeight: FontWeight.w700,
-        fontSize: 16,
-      ),
-    ),
+    child: chat.isAi
+        ? const Icon(Icons.auto_awesome, color: Colors.white, size: 22)
+        : Text(
+            chat.initials,
+            style: const TextStyle(
+              color: Color(0xFF23344F),
+              fontWeight: FontWeight.w700,
+              fontSize: 16,
+            ),
+          ),
   );
 }
 
 String timeLabel(DateTime at) =>
     '${at.hour.toString().padLeft(2, '0')}:${at.minute.toString().padLeft(2, '0')}';
+
+/// Cloud-backed encrypted conversations for accepted contacts. Visible only
+/// when signed in; the local demo list below stays for everyone.
+class _SecureSection extends StatefulWidget {
+  const _SecureSection({
+    required this.client,
+    required this.store,
+    required this.profile,
+    required this.push,
+  });
+  final SupabaseClient client;
+  final ChatStore store;
+  final LocalProfile profile;
+  final PushService push;
+  @override
+  State<_SecureSection> createState() => _SecureSectionState();
+}
+
+class _SecureSectionState extends State<_SecureSection> {
+  late Future<List<CloudContact>> _future;
+
+  @override
+  void initState() {
+    super.initState();
+    _future = _load();
+  }
+
+  Future<List<CloudContact>> _load() async {
+    final contacts = await SupabaseContactsRepository(widget.client).contacts();
+    return contacts.where((c) => c.status == 'accepted').toList();
+  }
+
+  void _refresh() => setState(() => _future = _load());
+
+  void _open(CloudContact contact) {
+    Navigator.push(
+      context,
+      MaterialPageRoute<void>(
+        builder: (_) => SecureChatScreen(
+          profile: widget.profile,
+          store: widget.store,
+          push: widget.push,
+          client: widget.client,
+          peerId: contact.userId,
+          peerName: contact.name,
+          peerUsername: contact.username,
+        ),
+      ),
+    ).then((_) => _refresh());
+  }
+
+  @override
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.fromLTRB(24, 0, 24, 8),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            const Icon(Icons.lock_outline, size: 16, color: Color(0xFF245CDB)),
+            const SizedBox(width: 6),
+            const Text(
+              'Encrypted chats',
+              style: TextStyle(fontSize: 13, fontWeight: FontWeight.w800, letterSpacing: 0.4),
+            ),
+            const Spacer(),
+            IconButton(
+              tooltip: 'Refresh encrypted chats',
+              visualDensity: VisualDensity.compact,
+              onPressed: _refresh,
+              icon: const Icon(Icons.refresh, size: 18),
+            ),
+          ],
+        ),
+        FutureBuilder<List<CloudContact>>(
+          future: _future,
+          builder: (context, snapshot) {
+            if (snapshot.connectionState == ConnectionState.waiting) {
+              return const Padding(
+                padding: EdgeInsets.symmetric(vertical: 8),
+                child: LinearProgressIndicator(),
+              );
+            }
+            if (snapshot.hasError) {
+              return Padding(
+                padding: const EdgeInsets.symmetric(vertical: 4),
+                child: Text(
+                  'Could not load encrypted chats. Pull to retry with the refresh button.',
+                  style: const TextStyle(fontSize: 12, color: Color(0xFF66748A)),
+                ),
+              );
+            }
+            final chats = snapshot.data ?? const <CloudContact>[];
+            if (chats.isEmpty) {
+              return const Padding(
+                padding: EdgeInsets.symmetric(vertical: 4),
+                child: Text(
+                  'No encrypted chats yet. Add someone in Settings → People & profile, then open their encrypted chat here.',
+                  style: TextStyle(fontSize: 12, color: Color(0xFF66748A)),
+                ),
+              );
+            }
+            return SizedBox(
+              height: 72.0 * chats.length.clamp(1, 3),
+              child: ListView.builder(
+                padding: EdgeInsets.zero,
+                itemCount: chats.length,
+                itemBuilder: (context, i) {
+                  final contact = chats[i];
+                  return ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: CircleAvatar(
+                      backgroundColor: const Color(0xFFE4EBFF),
+                      child: Text(
+                        contact.name.isEmpty ? '?' : contact.name[0].toUpperCase(),
+                        style: const TextStyle(
+                          color: Color(0xFF245CDB),
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                    ),
+                    title: Text(
+                      contact.name,
+                      style: const TextStyle(fontWeight: FontWeight.w700),
+                    ),
+                    subtitle: Text('@${contact.username} • end-to-end encrypted'),
+                    trailing: const Icon(Icons.chevron_right),
+                    onTap: () => _open(contact),
+                  );
+                },
+              ),
+            );
+          },
+        ),
+        const Divider(height: 16),
+      ],
+    ),
+  );
+}
 
 class _Welcome extends StatelessWidget {
   const _Welcome();
@@ -506,11 +697,31 @@ class _ChatPaneState extends State<ChatPane> {
                       fontSize: 18,
                     ),
                   ),
-                  const Text(
-                    'Demo contact',
-                    style: TextStyle(color: Color(0xFF66748A), fontSize: 12),
+                  Text(
+                    widget.chat.isAi
+                        ? (widget.chat.isTyping ? 'Thinking…' : 'AI Assistant (${widget.chat.aiProvider ?? "OpenChat"})')
+                        : 'Demo contact',
+                    style: TextStyle(
+                      color: widget.chat.isTyping ? const Color(0xFF245CDB) : const Color(0xFF66748A),
+                      fontSize: 12,
+                      fontWeight: widget.chat.isTyping ? FontWeight.w600 : FontWeight.normal,
+                    ),
                   ),
                 ],
+              ),
+            ),
+            IconButton(
+              tooltip: widget.chat.muted
+                  ? 'Unmute conversation'
+                  : 'Mute conversation',
+              onPressed: () {
+                widget.store.toggleMute(widget.chat);
+                setState(() {});
+              },
+              icon: Icon(
+                widget.chat.muted
+                    ? Icons.volume_off_outlined
+                    : Icons.notifications_outlined,
               ),
             ),
             IconButton(
@@ -539,10 +750,12 @@ class _ChatPaneState extends State<ChatPane> {
         width: double.infinity,
         color: const Color(0xFFEBF0FC),
         padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
-        child: const Text(
-          'Local demo • messages are not encrypted or delivered to other people.',
+        child: Text(
+          widget.chat.isAi
+              ? 'AI Assistant • Connected via ${widget.chat.aiProvider ?? "OpenChat"} LLM'
+              : 'Local demo • messages are not encrypted or delivered to other people.',
           textAlign: TextAlign.center,
-          style: TextStyle(fontSize: 12, color: Color(0xFF465C85)),
+          style: const TextStyle(fontSize: 12, color: Color(0xFF465C85)),
         ),
       ),
       Expanded(
@@ -550,18 +763,52 @@ class _ChatPaneState extends State<ChatPane> {
           listenable: widget.store,
           builder: (context, _) {
             final messages = widget.chat.messages.reversed.toList();
-            if (messages.isEmpty) {
+            if (messages.isEmpty && !widget.chat.isTyping) {
               return const Center(
                 child: Text('Your conversation starts here. Say hello!'),
               );
             }
+            final totalCount = messages.length + (widget.chat.isTyping ? 1 : 0);
             return ListView.builder(
               controller: scroll,
               reverse: true,
               padding: const EdgeInsets.all(24),
-              itemCount: messages.length,
+              itemCount: totalCount,
               itemBuilder: (context, i) {
-                final message = messages[i];
+                if (widget.chat.isTyping && i == 0) {
+                  return Align(
+                    alignment: Alignment.centerLeft,
+                    child: Container(
+                      margin: const EdgeInsets.only(bottom: 12),
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFE9EDF4),
+                        borderRadius: BorderRadius.circular(18),
+                      ),
+                      child: const Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          SizedBox(
+                            width: 14,
+                            height: 14,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          ),
+                          SizedBox(width: 8),
+                          Text(
+                            'Thinking…',
+                            style: TextStyle(
+                              color: Color(0xFF465C85),
+                              fontSize: 13,
+                              fontStyle: FontStyle.italic,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+                }
+                final messageIndex = widget.chat.isTyping ? i - 1 : i;
+                final message = messages[messageIndex];
                 return Align(
                   alignment: message.mine
                       ? Alignment.centerRight

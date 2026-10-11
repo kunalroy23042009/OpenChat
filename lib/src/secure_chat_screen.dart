@@ -1,12 +1,16 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'chat_store.dart';
 import 'local_profile.dart';
+import 'media/chat_media.dart';
+import 'media/media_message.dart';
 import 'push/push_service.dart';
 import 'security/envelope_codec.dart';
 import 'security/safety_number.dart';
@@ -42,10 +46,13 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
 
   StreamSubscription? _inboxPoll;
   Timer? _pollTimer;
+  Timer? _tickTimer;
   bool _loading = true;
   String? _error;
   String? _ownFingerprint;
   String? _peerIdentityKey;
+  bool _sendingMedia = false;
+  late final ChatMedia media = ChatMedia(widget.client);
 
   @override
   void initState() {
@@ -66,6 +73,9 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
       await widget.store.loadSecureConversation(accountId, widget.peerId);
       _subscribeRealtime();
       _startPolling();
+      // Catch up immediately so an already-waiting envelope does not sit
+      // until the first 30s tick.
+      await _pollInbox();
       if (mounted) setState(() => _loading = false);
     } catch (e) {
       if (mounted) {
@@ -168,8 +178,19 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
       ..subscribe();
   }
 
+  /// Maximum failed decrypts before a poison envelope is quarantined as a
+  /// visible placeholder (and only then acknowledged).
+  static const _maxEnvelopeFailures = 5;
+
   Future<void> _onEnvelope(Map<String, dynamic> record) async {
+    final id = record['id'] as String? ?? '';
     final sender = record['sender_id'] as String? ?? widget.peerId;
+    // Redelivered rows already stored locally are only missing their ack.
+    if (id.isNotEmpty &&
+        widget.store.hasSecureEnvelope(accountId, sender, id)) {
+      await _ack(id);
+      return;
+    }
     final raw = record['ciphertext'] as String? ?? '';
     final candidates = EnvelopeCodec.candidates(raw);
     String? plainText;
@@ -189,22 +210,49 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
         break;
       } catch (_) {}
     }
-    try {
-      if (plainText != null) {
-        await widget.store.addSecureMessage(
-          accountId,
-          sender,
-          plainText,
-          mine: false,
-        );
-        if (mounted) setState(() {});
+    if (plainText == null) {
+      // Never ack poison rows blindly: retry the next polls, then quarantine
+      // visibly so the user knows a message arrived but could not be opened.
+      if (id.isEmpty) return;
+      final fails = widget.store.envelopeFailCount(id) + 1;
+      await widget.store.recordEnvelopeFailure(id);
+      if (fails >= _maxEnvelopeFailures) {
+        try {
+          await widget.store.addSecureMessage(
+            accountId,
+            sender,
+            '⚠️ A message arrived but could not be decrypted.',
+            mine: false,
+            envelopeId: id,
+          );
+          if (mounted) setState(() {});
+          await _ack(id);
+        } catch (_) {}
       }
-      // Always acknowledge: undecryptable rows are dropped to avoid a
-      // poison envelope being retried on every poll forever.
+      return;
+    }
+    try {
+      await widget.store.addSecureMessage(
+        accountId,
+        sender,
+        plainText,
+        mine: false,
+        envelopeId: id.isEmpty ? null : id,
+      );
+      if (mounted) setState(() {});
+      await _ack(id);
+    } catch (_) {
+      // Storage failed: do not ack, so the envelope is retried next poll.
+    }
+  }
+
+  Future<void> _ack(String id) async {
+    if (id.isEmpty) return;
+    try {
       await widget.client.rpc(
         'ack_messages',
         params: {
-          'p_ids': [record['id']],
+          'p_ids': [id],
         },
       );
     } catch (_) {}
@@ -215,16 +263,24 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
       const Duration(seconds: 30),
       (_) => _pollInbox(),
     );
+    _tickTimer = Timer.periodic(
+      const Duration(seconds: 15),
+      (_) => _pollTicks(),
+    );
   }
 
   Future<void> _pollInbox() async {
     try {
-      final since = widget.store
-          .lastSecureMessageTime(accountId, widget.peerId)
-          ?.toIso8601String();
+      // The chat is open, so everything fetched here is being read.
+      await widget.client.rpc(
+        'mark_read',
+        params: {'p_sender_id': widget.peerId},
+      );
+      // No clock cursor: fetch every unacked envelope and dedupe by id, so
+      // an older undelivered message can never be skipped.
       final result = await widget.client.rpc(
         'fetch_inbox',
-        params: {'p_since': since, 'p_limit': 50},
+        params: {'p_since': null, 'p_limit': 50},
       ) as List<dynamic>;
       for (final record in result.cast<Map<String, dynamic>>()) {
         await _onEnvelope(record);
@@ -232,17 +288,54 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
     } catch (_) {}
   }
 
+  /// Refreshes sender-side ticks for our recent unacked messages.
+  Future<void> _pollTicks() async {
+    try {
+      final pending = widget.store
+          .getSecureConversation(accountId, widget.peerId)
+          .where((m) => m.mine && m.clientId.isNotEmpty && m.status != 'read')
+          .toList();
+      if (pending.isEmpty) return;
+      final ids = pending
+          .take(20)
+          .map((m) => m.clientId)
+          .toList();
+      final result = await widget.client.rpc(
+        'message_statuses',
+        params: {'p_ids': ids},
+      ) as List<dynamic>;
+      for (final row in result.cast<Map<String, dynamic>>()) {
+        final id = row['id'] as String? ?? '';
+        final status = row['status'] as String? ?? 'sent';
+        if (id.isEmpty) continue;
+        await widget.store.updateSecureStatus(
+          accountId,
+          widget.peerId,
+          id,
+          status,
+        );
+      }
+      if (mounted) setState(() {});
+    } catch (_) {}
+  }
+
   Future<void> _send() async {
     final text = composer.text.trim();
     if (text.isEmpty || text.length > 4000) return;
     composer.clear();
+    await _transmit(text);
+  }
+
+  /// Encrypts [plainText] (raw text or an encoded image body), enqueues it,
+  /// and stores the local copy. Shared by text and image sending.
+  Future<void> _transmit(String plainText) async {
     try {
       final localId =
           '${DateTime.now().microsecondsSinceEpoch}-${DateTime.now().millisecond}';
       final result = await channel.invokeMethod('signalEncrypt', {
         'accountId': accountId,
         'peerId': widget.peerId,
-        'plain': base64Encode(utf8.encode(text)),
+        'plain': base64Encode(utf8.encode(plainText)),
       }) as Map<dynamic, dynamic>;
       // Prefix the Signal message type; the envelope has no type column.
       final queued =
@@ -264,10 +357,11 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
           await widget.store.addSecureMessage(
             accountId,
             widget.peerId,
-            text,
+            plainText,
             mine: true,
+            clientId: localId,
           );
-          setState(() {});
+          if (mounted) setState(() {});
         case 'rate_limited':
           throw StateError('Daily send limit reached. Try again tomorrow.');
         case 'unavailable':
@@ -277,6 +371,108 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
       }
     } catch (e) {
       if (mounted) setState(() => _error = 'Send failed: $e');
+    }
+  }
+
+  Future<void> _pickAndSendImage() async {
+    if (_sendingMedia) return;
+    final source = await showModalBottomSheet<ImageSource>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.photo_library_outlined),
+              title: const Text('Choose from gallery'),
+              onTap: () => Navigator.pop(ctx, ImageSource.gallery),
+            ),
+            ListTile(
+              leading: const Icon(Icons.photo_camera_outlined),
+              title: const Text('Take a photo'),
+              onTap: () => Navigator.pop(ctx, ImageSource.camera),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (source == null || !mounted) return;
+    XFile? picked;
+    try {
+      picked = source == ImageSource.gallery
+          ? await media.pickGalleryImage()
+          : await media.pickCameraImage();
+    } on Exception catch (e) {
+      if (mounted) setState(() => _error = 'Could not open images: $e');
+      return;
+    }
+    if (picked == null || !mounted) return;
+    final caption = TextEditingController();
+    final send = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Send image'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ClipRRect(
+                borderRadius: BorderRadius.circular(12),
+                child: Image.file(
+                  File(picked!.path),
+                  height: 220,
+                  fit: BoxFit.cover,
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: caption,
+                maxLength: 200,
+                decoration: const InputDecoration(
+                  hintText: 'Add a caption…',
+                  counterText: '',
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Send'),
+          ),
+        ],
+      ),
+    );
+    if (send != true || !mounted) return;
+    setState(() {
+      _sendingMedia = true;
+      _error = null;
+    });
+    try {
+      final sealed = await media.uploadSealed(
+        File(picked.path),
+        widget.peerId,
+      );
+      await _transmit(
+        encodeImageBody(
+          sealed.path,
+          caption.text.trim(),
+          key: sealed.key,
+          nonce: sealed.nonce,
+        ),
+      );
+    } catch (e) {
+      if (mounted) {
+        setState(() => _error = 'Image failed: $e');
+      }
+    } finally {
+      if (mounted) setState(() => _sendingMedia = false);
     }
   }
 
@@ -375,6 +571,7 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
   void dispose() {
     _inboxPoll?.cancel();
     _pollTimer?.cancel();
+    _tickTimer?.cancel();
     composer.dispose();
     scroll.dispose();
     super.dispose();
@@ -412,6 +609,19 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
             },
             icon: const Icon(Icons.refresh),
           ),
+          IconButton(
+            tooltip: 'Copy invite link',
+            onPressed: () {
+              final link = 'https://open.chat/invite?account=$accountId&peer=${widget.peerId}';
+              Clipboard.setData(ClipboardData(text: link));
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Link copied to clipboard')),
+                );
+              }
+            },
+            icon: const Icon(Icons.link),
+          ),
         ],
       ),
       body: Column(
@@ -446,10 +656,24 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                         itemCount: msgs.length,
                         itemBuilder: (context, i) {
                           final msg = msgs[i];
+                          final body = parseMessageBody(msg.text);
+                          if (body.isImage && body.path != null) {
+                            return _SecureImageBubble(
+                              client: widget.client,
+                              path: body.path!,
+                              caption: body.text,
+                              imageKey: body.key,
+                              imageNonce: body.nonce,
+                              mine: msg.mine,
+                              time: msg.at,
+                              status: msg.status,
+                            );
+                          }
                           return _SecureBubble(
                             text: msg.text,
                             mine: msg.mine,
                             time: msg.at,
+                            status: msg.status,
                           );
                         },
                       );
@@ -461,6 +685,17 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.end,
               children: [
+                IconButton(
+                  tooltip: 'Send image',
+                  onPressed: _sendingMedia ? null : _pickAndSendImage,
+                  icon: _sendingMedia
+                      ? const SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.attach_file),
+                ),
                 Expanded(
                   child: TextField(
                     controller: composer,
@@ -516,15 +751,194 @@ class _FingerprintRow extends StatelessWidget {
   );
 }
 
+/// Delivery ticks for our own messages: single check sent, double
+/// delivered, blue double read. Mirrors the server receipt states.
+class _Ticks {
+  static String glyph(String status) => switch (status) {
+    'read' => ' ✓✓',
+    'delivered' => ' ✓✓',
+    _ => ' ✓',
+  };
+  static Color color(String status, bool mine) {
+    if (!mine) return const Color(0xFF66748A);
+    if (status == 'read') return const Color(0xFF7DD3FC);
+    return Colors.white70;
+  }
+}
+
+/// Image message bubble. The image bytes come from the private `chat-media`
+/// bucket over a short-lived signed URL; the path itself arrived inside the
+/// Signal-encrypted message.
+class _SecureImageBubble extends StatefulWidget {
+  const _SecureImageBubble({
+    required this.client,
+    required this.path,
+    required this.caption,
+    required this.mine,
+    required this.time,
+    this.status = 'sent',
+    this.imageKey,
+    this.imageNonce,
+  });
+  final SupabaseClient client;
+  final String path;
+  final String caption;
+  final bool mine;
+  final DateTime time;
+  final String status;
+
+  /// Base64 sealed file key/nonce. Null on legacy unsealed uploads.
+  final String? imageKey;
+  final String? imageNonce;
+  @override
+  State<_SecureImageBubble> createState() => _SecureImageBubbleState();
+}
+
+class _SecureImageBubbleState extends State<_SecureImageBubble> {
+  /// Plaintext lives only in memory: sealed downloads are decrypted after
+  /// fetch, legacy downloads are raw bytes.
+  late final Future<Uint8List> _bytes = () {
+    final media = ChatMedia(widget.client);
+    if (widget.imageKey != null && widget.imageNonce != null) {
+      return media.downloadSealed(
+        widget.path,
+        widget.imageKey!,
+        widget.imageNonce!,
+      );
+    }
+    return media.downloadRaw(widget.path);
+  }();
+
+  void _openLightbox(Uint8List bytes) {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => Dialog(
+        backgroundColor: Colors.transparent,
+        insetPadding: const EdgeInsets.all(16),
+        child: Stack(
+          alignment: Alignment.topRight,
+          children: [
+            InteractiveViewer(child: Image.memory(bytes)),
+            IconButton(
+              icon: const Icon(Icons.close, color: Colors.white, size: 28),
+              onPressed: () => Navigator.of(ctx).pop(),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) => Align(
+    alignment: widget.mine ? Alignment.centerRight : Alignment.centerLeft,
+    child: Container(
+      constraints: BoxConstraints(
+        maxWidth: MediaQuery.of(context).size.width * 0.72,
+      ),
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.all(6),
+      decoration: BoxDecoration(
+        color: widget.mine
+            ? const Color(0xFF245CDB)
+            : const Color(0xFFE9EDF4),
+        borderRadius: const BorderRadius.all(Radius.circular(18)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.end,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          FutureBuilder<Uint8List>(
+            future: _bytes,
+            builder: (context, snapshot) {
+              if (snapshot.connectionState == ConnectionState.waiting) {
+                return const SizedBox(
+                  height: 160,
+                  child: Center(
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                );
+              }
+              if (snapshot.hasError || !snapshot.hasData) {
+                return const SizedBox(
+                  height: 120,
+                  child: Center(child: Icon(Icons.broken_image_outlined)),
+                );
+              }
+              final bytes = snapshot.data!;
+              return GestureDetector(
+                onTap: () => _openLightbox(bytes),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(12),
+                  child: Image.memory(
+                    bytes,
+                    fit: BoxFit.cover,
+                    errorBuilder: (context, _, _) => const SizedBox(
+                      height: 120,
+                      child: Center(child: Icon(Icons.broken_image_outlined)),
+                    ),
+                  ),
+                ),
+              );
+            },
+          ),
+          if (widget.caption.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(10, 6, 10, 2),
+              child: SelectableText(
+                widget.caption,
+                style: TextStyle(
+                  color: widget.mine
+                      ? Colors.white
+                      : const Color(0xFF22334E),
+                  fontSize: 14,
+                ),
+              ),
+            ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(10, 2, 10, 6),
+            child: Text.rich(
+              TextSpan(
+                children: [
+                  TextSpan(
+                    text:
+                        '${widget.time.hour.toString().padLeft(2, '0')}:${widget.time.minute.toString().padLeft(2, '0')}',
+                    style: TextStyle(
+                      fontSize: 10,
+                      color: widget.mine
+                          ? Colors.white70
+                          : const Color(0xFF66748A),
+                    ),
+                  ),
+                  if (widget.mine)
+                    TextSpan(
+                      text: _Ticks.glyph(widget.status),
+                      style: TextStyle(
+                        fontSize: 10,
+                        color: _Ticks.color(widget.status, true),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
 class _SecureBubble extends StatelessWidget {
   const _SecureBubble({
     required this.text,
     required this.mine,
     required this.time,
+    this.status = 'sent',
   });
   final String text;
   final bool mine;
   final DateTime time;
+  final String status;
 
   @override
   Widget build(BuildContext context) => Align(
@@ -537,12 +951,8 @@ class _SecureBubble extends StatelessWidget {
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 10),
       decoration: BoxDecoration(
         color: mine ? const Color(0xFF245CDB) : const Color(0xFFE9EDF4),
-        borderRadius: BorderRadius.only(
-          topLeft: const Radius.circular(18),
-          topRight: const Radius.circular(18),
-          bottomLeft: Radius.circular(mine ? 18 : 4),
-          bottomRight: Radius.circular(mine ? 4 : 18),
-        ),
+        borderRadius: const BorderRadius.all(Radius.circular(18)),
+        boxShadow: mine ? [BoxShadow(color: Colors.black26, blurRadius: 2, offset: const Offset(0, 1))] : null,
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.end,
@@ -556,11 +966,28 @@ class _SecureBubble extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 6),
-          Text(
-            '${time.hour.toString().padLeft(2, "0")}:${time.minute.toString().padLeft(2, "0")}${mine ? ' \u2022 Local' : ''}',
-            style: TextStyle(
-              fontSize: 10,
-              color: mine ? Colors.white70 : const Color(0xFF66748A),
+          Text.rich(
+            TextSpan(
+              children: [
+                TextSpan(
+                  text:
+                      '${time.hour.toString().padLeft(2, "0")}:${time.minute.toString().padLeft(2, "0")}',
+                  style: TextStyle(
+                    fontSize: 10,
+                    color: mine
+                        ? Colors.white70
+                        : const Color(0xFF66748A),
+                  ),
+                ),
+                if (mine)
+                  TextSpan(
+                    text: _Ticks.glyph(status),
+                    style: TextStyle(
+                      fontSize: 10,
+                      color: _Ticks.color(status, true),
+                    ),
+                  ),
+              ],
             ),
           ),
         ],

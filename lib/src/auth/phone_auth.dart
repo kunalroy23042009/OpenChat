@@ -1,5 +1,10 @@
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+/// Kill switch for SMS phone authentication. The whole flow (service, page,
+/// entry buttons) stays in the codebase; flip this to true when an SMS
+/// provider is configured in Supabase and the feature should reappear.
+const bool kPhoneAuthEnabled = false;
+
 class PhoneAuthService {
   PhoneAuthService(this.client);
   final SupabaseClient client;

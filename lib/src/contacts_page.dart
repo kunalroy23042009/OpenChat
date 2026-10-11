@@ -365,7 +365,7 @@ class _ContactsPageState extends State<ContactsPage>
                   child: Padding(
                     padding: EdgeInsets.all(16),
                     child: Text(
-                      'Secure messaging is the next milestone. Accepted contacts cannot exchange messages until Signal encryption is connected.',
+                      'Encrypted chats live in the Chats tab. Open a contact above, or pick them under Encrypted chats on the home screen.',
                     ),
                   ),
                 ),
