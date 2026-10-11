@@ -12,6 +12,9 @@ import 'settings.dart';
 import 'theme/app_theme.dart';
 import 'status/status_page.dart';
 import 'calling/call_history_page.dart';
+import 'calling/call_repository.dart';
+import 'calling/call_service.dart';
+import 'calling/call_signaling.dart';
 import 'calling/call_screen.dart';
 import 'ai/ai_settings_page.dart';
 import 'widgets/whatsapp_bubble.dart';
@@ -42,6 +45,9 @@ class _ChatHomeState extends State<ChatHome> {
   String query = '';
   String filter = 'all';
   bool lockRevealed = false;
+  RealtimeChannel? _callWatch;
+  String? _callWatchUid;
+  bool _incomingOpen = false;
   int activeTab = 0;
   void open(Conversation chat, bool wide) {
     widget.store.markRead(chat);
@@ -62,6 +68,192 @@ class _ChatHomeState extends State<ChatHome> {
         ),
       );
     }
+  }
+
+  @override
+  void dispose() {
+    _callWatch?.unsubscribe();
+    super.dispose();
+  }
+
+  /// Foreground incoming-call ringer. While signed in, watch our invite
+  /// rows; an unanswered ring also needs the app open (background ringing
+  /// arrives with push notifications).
+  void _watchIncomingCalls(BuildContext context) {
+    final client = widget.client;
+    final uid = client?.auth.currentUser?.id;
+    if (uid == null) {
+      _callWatch?.unsubscribe();
+      _callWatch = null;
+      _callWatchUid = null;
+      return;
+    }
+    if (_callWatchUid == uid && _callWatch != null) return;
+    _callWatch?.unsubscribe();
+    _callWatchUid = uid;
+    _callWatch =
+        client!.channel('calls:$uid')
+          ..onPostgresChanges(
+            event: PostgresChangeEvent.insert,
+            schema: 'public',
+            table: 'call_invites',
+            filter: PostgresChangeFilter(
+              type: PostgresChangeFilterType.eq,
+              column: 'callee_id',
+              value: uid,
+            ),
+            callback: (payload) => _onIncomingInvite(payload.newRecord),
+          )
+          ..subscribe();
+  }
+
+  Future<void> _onIncomingInvite(Map<String, dynamic> record) async {
+    if (!mounted || _incomingOpen) return;
+    if (record['status'] != 'ringing') return;
+    final created = DateTime.tryParse(record['created_at'] as String? ?? '');
+    if (created != null &&
+        DateTime.now().difference(created) > const Duration(seconds: 75)) {
+      return;
+    }
+    final inviteId = record['id'] as String? ?? '';
+    final callerId = record['caller_id'] as String? ?? '';
+    final callType = record['call_type'] as String? ?? 'voice';
+    if (inviteId.isEmpty || callerId.isEmpty) return;
+    final client = widget.client!;
+    final messenger = ScaffoldMessenger.of(context);
+    final navigator = Navigator.of(context);
+    String peerName = 'Unknown caller';
+    try {
+      final contacts = await SupabaseContactsRepository(client).contacts();
+      for (final c in contacts) {
+        if (c.userId == callerId) {
+          peerName = c.name;
+          break;
+        }
+      }
+    } catch (_) {}
+    if (!mounted || _incomingOpen) return;
+    _incomingOpen = true;
+    final accept = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: Text('Incoming ${callType == 'video' ? 'video' : 'voice'} call'),
+        content: Text(peerName),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Decline'),
+          ),
+          FilledButton.icon(
+            onPressed: () => Navigator.pop(ctx, true),
+            icon: const Icon(Icons.call),
+            label: const Text('Accept'),
+          ),
+        ],
+      ),
+    );
+    _incomingOpen = false;
+    if (!mounted) return;
+    if (accept != true) {
+      try {
+        await CallSignaling.answer(
+          client,
+          inviteId: inviteId,
+          accept: false,
+        );
+        await CallRepository(client).add(
+          peerLabel: peerName,
+          peerId: callerId,
+          callType: callType,
+          outcome: 'declined',
+          startedAt: DateTime.now(),
+          durationSeconds: 0,
+          direction: 'incoming',
+        );
+      } catch (_) {}
+      return;
+    }
+    final service = CallService();
+    if (!await service.ensurePermissions(
+      video: callType == 'video',
+    )) {
+      messenger.showSnackBar(
+        SnackBar(content: Text(service.error ?? 'Permission denied.')),
+      );
+      service.dispose();
+      try {
+        await CallSignaling.answer(client, inviteId: inviteId, accept: false);
+      } catch (_) {}
+      return;
+    }
+    late final String url;
+    late final String token;
+    try {
+      final creds = await CallSignaling.token(
+        client,
+        room: record['room'] as String? ?? '',
+        name: peerName,
+      );
+      url = creds.url;
+      token = creds.token;
+      await CallSignaling.answer(client, inviteId: inviteId, accept: true);
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+      service.dispose();
+      return;
+    }
+    if (!await service.join(
+      url: url,
+      token: token,
+      video: callType == 'video',
+    )) {
+      messenger.showSnackBar(
+        SnackBar(content: Text(service.error ?? 'Could not join the call.')),
+      );
+      try {
+        await CallSignaling.finish(client, inviteId: inviteId);
+      } catch (_) {}
+      service.dispose();
+      return;
+    }
+    final session = ActiveCallSession(
+      callId: inviteId,
+      peerUsername: peerName,
+      peerDisplayName: peerName,
+      type: callType == 'video' ? CallType.video : CallType.voice,
+      initialState: CallState.connected,
+    );
+    final startedAt = DateTime.now();
+    await navigator.push(
+      MaterialPageRoute<void>(
+        builder: (_) => CallScreen(
+          session: session,
+          service: service,
+          onEndCall: () async {
+            try {
+              await CallSignaling.finish(client, inviteId: inviteId);
+            } catch (_) {}
+            await service.hangUp();
+            try {
+              await CallRepository(client).add(
+                peerLabel: peerName,
+                peerId: callerId,
+                callType: callType,
+                outcome: session.durationSeconds > 0 ? 'completed' : 'failed',
+                startedAt: startedAt,
+                durationSeconds: session.durationSeconds,
+                direction: 'incoming',
+              );
+            } catch (_) {}
+            service.dispose();
+            try {
+              navigator.pop();
+            } catch (_) {}
+          },
+        ),
+      ),
+    );
   }
 
   Future<void> newChat(bool wide) async {
@@ -181,6 +373,7 @@ class _ChatHomeState extends State<ChatHome> {
     listenable: widget.store,
     builder: (context, _) => LayoutBuilder(
       builder: (context, constraints) {
+        _watchIncomingCalls(context);
         final wide = constraints.maxWidth >= 850;
         final viewingArchived = filter == 'archived';
         final base = widget.store.conversations.where((c) {

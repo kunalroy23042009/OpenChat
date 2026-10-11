@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import 'call_flow.dart';
 import 'call_screen.dart';
 import 'call_repository.dart';
 
@@ -14,6 +15,7 @@ class CallLogItem {
     required this.type,
     required this.isIncoming,
     required this.isMissed,
+    this.peerId,
   });
 
   final String id;
@@ -23,6 +25,9 @@ class CallLogItem {
   final CallType type;
   final bool isIncoming;
   final bool isMissed;
+
+  /// Supabase user id when known; without it calls start from chats.
+  final String? peerId;
 }
 
 class CallHistoryPage extends StatefulWidget {
@@ -64,48 +69,43 @@ class _CallHistoryPageState extends State<CallHistoryPage> {
                 type: log.callType == 'video' ? CallType.video : CallType.voice,
                 isIncoming: log.direction == 'incoming',
                 isMissed: log.outcome == 'missed',
+                peerId: log.peerId,
               ),
-            ),
-          );
+            ));
       });
     } catch (_) {
       // Keep demo logs available when offline or before migration deployment.
     }
   }
 
+  /// Starts a real call when we know the peer's user id; otherwise points
+  /// at the encrypted chat, which always can.
   void _startCall(CallLogItem item, CallType type) {
-    final startedAt = DateTime.now();
-    final session = ActiveCallSession(
-      callId: DateTime.now().millisecondsSinceEpoch.toString(),
-      peerUsername: item.username,
-      peerDisplayName: item.contactName,
-      type: type,
-    );
-
-    Navigator.push(
-      context,
-      MaterialPageRoute<void>(
-        builder: (_) => CallScreen(
-          session: session,
-          onEndCall: () async {
-            Navigator.pop(context);
-            final client = widget.client;
-            if (client?.auth.currentUser != null) {
-              try {
-                await CallRepository(client!).add(
-                  peerLabel: item.contactName,
-                  callType: type == CallType.video ? 'video' : 'voice',
-                  outcome: session.durationSeconds > 0 ? 'completed' : 'failed',
-                  startedAt: startedAt,
-                  durationSeconds: session.durationSeconds,
-                );
-                await _loadCloudLogs();
-              } catch (_) {}
-            }
-          },
+    final client = widget.client;
+    if (client?.auth.currentUser == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Sign in to place calls.')),
+      );
+      return;
+    }
+    final peerId = item.peerId;
+    if (peerId == null || peerId.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Open their encrypted chat to call this contact.'),
         ),
-      ),
-    );
+      );
+      return;
+    }
+    startOutgoingCall(
+      context,
+      client: client!,
+      peerId: peerId,
+      peerName: item.contactName,
+      type: type,
+    ).then((_) {
+      if (mounted) _loadCloudLogs();
+    });
   }
 
   @override

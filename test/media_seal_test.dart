@@ -13,33 +13,36 @@ bool _eq(List<int> a, List<int> b) {
 }
 
 void main() {
-  test('seal round-trips bytes with fresh key material', () {
+  test('seal round-trips bytes with fresh key material', () async {
     final plain = Uint8List.fromList(utf8.encode('fake-image-bytes-12345'));
-    final a = MediaSeal.seal(plain);
-    final b = MediaSeal.seal(plain);
+    final a = await MediaSeal.seal(plain);
+    final b = await MediaSeal.seal(plain);
     expect(a.key.length, 32);
     expect(a.nonce.length, 12);
     // Fresh randomness: same input seals differently.
     expect(_eq(a.cipher, b.cipher), isFalse);
     expect(_eq(a.key, b.key), isFalse);
     expect(
-      _eq(MediaSeal.open(cipher: a.cipher, key: a.key, nonce: a.nonce), plain),
+      _eq(
+        await MediaSeal.open(cipher: a.cipher, key: a.key, nonce: a.nonce),
+        plain,
+      ),
       isTrue,
     );
   });
 
-  test('ciphertext reveals nothing about plaintext', () {
+  test('ciphertext reveals nothing about plaintext', () async {
     final plain = Uint8List.fromList(List<int>.filled(64, 7));
-    final sealed = MediaSeal.seal(plain);
+    final sealed = await MediaSeal.seal(plain);
     expect(sealed.cipher.length, greaterThanOrEqualTo(plain.length));
     expect(_eq(sealed.cipher, plain), isFalse);
   });
 
-  test('wrong key fails authentication instead of garbage', () {
-    final sealed = MediaSeal.seal(Uint8List.fromList([1, 2, 3, 4]));
+  test('wrong key fails authentication instead of garbage', () async {
+    final sealed = await MediaSeal.seal(Uint8List.fromList([1, 2, 3, 4]));
     final wrongKey = Uint8List.fromList(List<int>.filled(32, 9));
-    expect(
-      () => MediaSeal.open(
+    await expectLater(
+      MediaSeal.open(
         cipher: sealed.cipher,
         key: wrongKey,
         nonce: sealed.nonce,
@@ -48,11 +51,11 @@ void main() {
     );
   });
 
-  test('tampered bytes fail authentication', () {
-    final sealed = MediaSeal.seal(Uint8List.fromList([5, 6, 7, 8]));
+  test('tampered bytes fail authentication', () async {
+    final sealed = await MediaSeal.seal(Uint8List.fromList([5, 6, 7, 8]));
     final tampered = Uint8List.fromList(sealed.cipher)..[0] ^= 0xFF;
-    expect(
-      () => MediaSeal.open(
+    await expectLater(
+      MediaSeal.open(
         cipher: tampered,
         key: sealed.key,
         nonce: sealed.nonce,

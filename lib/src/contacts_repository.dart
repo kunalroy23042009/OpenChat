@@ -1,10 +1,13 @@
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 class AccountProfile {
-  const AccountProfile({required this.name, this.username, this.about});
+  const AccountProfile({required this.name, this.username, this.about, this.phone});
   final String name;
   final String? username;
   final String? about;
+
+  /// Self-asserted number until SMS verification is enabled.
+  final String? phone;
 }
 
 class CloudContact {
@@ -38,6 +41,8 @@ class CloudContact {
 abstract class ContactsRepository {
   Future<AccountProfile> profile();
   Future<void> saveProfile(String name, String username, String about);
+  Future<void> setMyPhone(String phone);
+  Future<CloudContact?> findByPhone(String phone);
   Future<List<CloudContact>> contacts();
   Future<String> invite(String username);
   Future<String> inviteByPhone(String phone);
@@ -57,13 +62,14 @@ class SupabaseContactsRepository implements ContactsRepository {
     if (id == null) throw const AuthException('Sign in to load your profile.');
     final row = await client
         .from('profiles')
-        .select('display_name, username, about')
+        .select('display_name, username, about, phone_number')
         .eq('id', id)
         .single();
     return AccountProfile(
       name: row['display_name'] as String,
       username: row['username'] as String?,
       about: row['about'] as String?,
+      phone: row['phone_number'] as String?,
     );
   }
 
@@ -89,6 +95,28 @@ class SupabaseContactsRepository implements ContactsRepository {
         .toList();
   }
 
+  @override
+  Future<void> setMyPhone(String phone) async {
+    await client.rpc('set_my_phone', params: {'p_phone': phone.trim()});
+  }
+
+  @override
+  Future<CloudContact?> findByPhone(String phone) async {
+    final row =
+        await client.rpc(
+              'find_contact_by_phone',
+              params: {'p_phone': phone.trim()},
+            )
+            as Map<String, dynamic>?;
+    if (row == null) return null;
+    return CloudContact(
+      userId: row['user_id'] as String,
+      name: row['display_name'] as String? ?? 'OpenChat user',
+      username: row['username'] as String? ?? '',
+      status: 'found',
+      incoming: false,
+    );
+  }
   @override
   Future<String> invite(String username) async => await client.rpc(
     'send_contact_invite',

@@ -13,13 +13,15 @@ dependencies:
 
   cupertino_icons: ^1.0.8
   crypto: ^3.0.7
-  encrypt: ^5.0.3
+  cryptography: ^2.7.0
   supabase_flutter: ^2.18.0
   shared_preferences: ^2.5.6
   image_picker: ^1.2.4
   url_launcher: ^6.3.2
   video_player: ^2.9.0
   flutter_secure_storage: ^9.2.4
+  livekit_client: ^2.13.0
+  permission_handler: ^12.0.0
   path_provider: ^2.1.6
   path: ^1.9.1
   firebase_core: ^4.15.0

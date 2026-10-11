@@ -1,5 +1,9 @@
 import 'dart:async';
+
 import 'package:flutter/material.dart';
+import 'package:livekit_client/livekit_client.dart';
+
+import 'call_service.dart';
 
 enum CallType { voice, video }
 
@@ -26,15 +30,20 @@ class ActiveCallSession {
   int durationSeconds = 0;
 }
 
+/// Live call screen driven by [CallService]. Media flows phone <-> LiveKit
+/// SFU; signaling (ring/accept/decline) flows over Supabase. A null service
+/// renders an honest preview for demo/group entry points.
 class CallScreen extends StatefulWidget {
   const CallScreen({
     super.key,
     required this.session,
     required this.onEndCall,
+    this.service,
   });
 
   final ActiveCallSession session;
   final VoidCallback onEndCall;
+  final CallService? service;
 
   @override
   State<CallScreen> createState() => _CallScreenState();
@@ -46,33 +55,50 @@ class _CallScreenState extends State<CallScreen> {
   @override
   void initState() {
     super.initState();
-    if (widget.session.state == CallState.initiating ||
-        widget.session.state == CallState.ringing) {
-      Timer(const Duration(seconds: 3), () {
-        if (mounted && widget.session.state != CallState.ended) {
-          setState(() {
-            widget.session.state = CallState.connected;
-          });
-          _startTimer();
-        }
-      });
-    } else if (widget.session.state == CallState.connected) {
+    widget.service?.addListener(_onService);
+    _syncState(initial: true);
+  }
+
+  void _onService() {
+    if (!mounted) return;
+    setState(() => _syncState());
+  }
+
+  void _syncState({bool initial = false}) {
+    final service = widget.service;
+    if (service == null) return;
+    final live = service.state;
+    final mapped = switch (live) {
+      LiveCallState.joining || LiveCallState.idle => CallState.initiating,
+      LiveCallState.ringing => CallState.ringing,
+      LiveCallState.connected => CallState.connected,
+      LiveCallState.reconnecting => CallState.reconnecting,
+      LiveCallState.ended || LiveCallState.failed => CallState.ended,
+    };
+    if (widget.session.state != CallState.connected &&
+        mapped == CallState.connected) {
       _startTimer();
+    }
+    widget.session.state = mapped;
+    widget.session.isMuted = service.muted;
+    widget.session.isVideoEnabled = !service.videoOff;
+    widget.session.isSpeakerOn = service.speakerOn;
+    widget.session.isFrontCamera = service.frontCamera;
+    if (!initial && mapped == CallState.ended) {
+      widget.onEndCall();
     }
   }
 
   void _startTimer() {
-    _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
-      if (mounted) {
-        setState(() {
-          widget.session.durationSeconds++;
-        });
-      }
+    _timer ??= Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted) return;
+      setState(() => widget.session.durationSeconds++);
     });
   }
 
   @override
   void dispose() {
+    widget.service?.removeListener(_onService);
     _timer?.cancel();
     super.dispose();
   }
@@ -85,7 +111,55 @@ class _CallScreenState extends State<CallScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final isVideo = widget.session.type == CallType.video && widget.session.isVideoEnabled;
+    final service = widget.service;
+    if (service == null) {
+      return Scaffold(
+        backgroundColor: const Color(0xFF0F172A),
+        appBar: AppBar(
+          backgroundColor: Colors.transparent,
+          foregroundColor: Colors.white,
+        ),
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(32),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(
+                  Icons.call_outlined,
+                  color: Colors.white54,
+                  size: 56,
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  widget.session.peerDisplayName,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 20,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  'Real voice and video calls start from an encrypted chat with a connected contact.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: Colors.white70),
+                ),
+                const SizedBox(height: 24),
+                FilledButton(
+                  onPressed: widget.onEndCall,
+                  child: const Text('Back'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+    final failed = service.state == LiveCallState.failed;
+    final showVideo =
+        widget.session.type == CallType.video &&
+        service.state == LiveCallState.connected;
 
     return Scaffold(
       backgroundColor: const Color(0xFF0F172A),
@@ -93,7 +167,7 @@ class _CallScreenState extends State<CallScreen> {
         child: Stack(
           children: [
             Positioned.fill(
-              child: isVideo
+              child: showVideo
                   ? _buildVideoView()
                   : _buildVoiceAvatarView(),
             ),
@@ -105,20 +179,35 @@ class _CallScreenState extends State<CallScreen> {
               child: Column(
                 children: [
                   Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 6,
+                    ),
                     decoration: BoxDecoration(
                       color: Colors.black.withValues(alpha: 0.5),
                       borderRadius: BorderRadius.circular(20),
-                      border: Border.all(color: const Color(0xFF10B981).withValues(alpha: 0.5)),
+                      border: Border.all(
+                        color: const Color(
+                          0xFF10B981,
+                        ).withValues(alpha: 0.5),
+                      ),
                     ),
                     child: const Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        Icon(Icons.lock_outline, color: Color(0xFF10B981), size: 14),
+                        Icon(
+                          Icons.lock_outline,
+                          color: Color(0xFF10B981),
+                          size: 14,
+                        ),
                         SizedBox(width: 6),
                         Text(
                           'End-to-End Encrypted',
-                          style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w500),
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w500,
+                          ),
                         ),
                       ],
                     ),
@@ -134,7 +223,9 @@ class _CallScreenState extends State<CallScreen> {
                   ),
                   const SizedBox(height: 4),
                   Text(
-                    _getCallStateText(),
+                    failed
+                        ? (service.error ?? 'Call failed')
+                        : _getCallStateText(),
                     style: TextStyle(
                       color: widget.session.state == CallState.connected
                           ? const Color(0xFF34D399)
@@ -150,7 +241,7 @@ class _CallScreenState extends State<CallScreen> {
               bottom: 24,
               left: 24,
               right: 24,
-              child: _buildCallControls(),
+              child: _buildCallControls(failed),
             ),
           ],
         ),
@@ -167,7 +258,7 @@ class _CallScreenState extends State<CallScreen> {
       case CallState.connected:
         return _formatDuration(widget.session.durationSeconds);
       case CallState.reconnecting:
-        return 'Reconnecting Signal channel...';
+        return 'Reconnecting...';
       case CallState.ended:
         return 'Call Ended';
     }
@@ -185,7 +276,11 @@ class _CallScreenState extends State<CallScreen> {
               widget.session.peerDisplayName.isNotEmpty
                   ? widget.session.peerDisplayName[0].toUpperCase()
                   : '?',
-              style: const TextStyle(fontSize: 48, color: Colors.white, fontWeight: FontWeight.bold),
+              style: const TextStyle(
+                fontSize: 48,
+                color: Colors.white,
+                fontWeight: FontWeight.bold,
+              ),
             ),
           ),
           const SizedBox(height: 16),
@@ -199,43 +294,56 @@ class _CallScreenState extends State<CallScreen> {
   }
 
   Widget _buildVideoView() {
+    final service = widget.service;
+    final remote = service?.remoteVideo;
+    final local = service?.localVideo;
     return Stack(
       children: [
         Container(
           color: const Color(0xFF1E293B),
-          child: const Center(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Icon(Icons.videocam_outlined, size: 64, color: Colors.white38),
-                SizedBox(height: 8),
-                Text('E2EE Video Stream Connected', style: TextStyle(color: Colors.white54)),
-              ],
-            ),
-          ),
+          child: remote == null
+              ? const Center(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(
+                        Icons.videocam_outlined,
+                        size: 64,
+                        color: Colors.white38,
+                      ),
+                      SizedBox(height: 8),
+                      Text(
+                        'Waiting for video…',
+                        style: TextStyle(color: Colors.white54),
+                      ),
+                    ],
+                  ),
+                )
+              : VideoTrackRenderer(remote),
         ),
 
-        Positioned(
-          top: 80,
-          right: 16,
-          width: 100,
-          height: 150,
-          child: Container(
-            decoration: BoxDecoration(
-              color: Colors.black,
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: Colors.white30, width: 2),
-            ),
-            child: const Center(
-              child: Icon(Icons.person, color: Colors.white54, size: 36),
+        if (local != null)
+          Positioned(
+            top: 80,
+            right: 16,
+            width: 100,
+            height: 150,
+            child: Container(
+              decoration: BoxDecoration(
+                color: Colors.black,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: Colors.white30, width: 2),
+              ),
+              clipBehavior: Clip.antiAlias,
+              child: VideoTrackRenderer(local),
             ),
           ),
-        ),
       ],
     );
   }
 
-  Widget _buildCallControls() {
+  Widget _buildCallControls(bool failed) {
+    final service = widget.service;
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
       decoration: BoxDecoration(
@@ -250,27 +358,29 @@ class _CallScreenState extends State<CallScreen> {
               widget.session.isMuted ? Icons.mic_off : Icons.mic,
               color: widget.session.isMuted ? Colors.redAccent : Colors.white,
             ),
-            onPressed: () {
-              setState(() => widget.session.isMuted = !widget.session.isMuted);
-            },
+            onPressed: failed
+                ? null
+                : () => service?.toggleMute(),
           ),
+          if (widget.session.type == CallType.video)
+            IconButton(
+              icon: const Icon(Icons.flip_camera_ios_outlined, color: Colors.white),
+              onPressed: failed
+                  ? null
+                  : () => service?.switchCamera(),
+            ),
           IconButton(
             icon: Icon(
-              widget.session.isVideoEnabled ? Icons.videocam : Icons.videocam_off,
-              color: widget.session.isVideoEnabled ? Colors.white : Colors.white38,
+              widget.session.isSpeakerOn
+                  ? Icons.volume_up
+                  : Icons.volume_off,
+              color: widget.session.isSpeakerOn
+                  ? Colors.white
+                  : Colors.white38,
             ),
-            onPressed: () {
-              setState(() => widget.session.isVideoEnabled = !widget.session.isVideoEnabled);
-            },
-          ),
-          IconButton(
-            icon: Icon(
-              widget.session.isSpeakerOn ? Icons.volume_up : Icons.volume_off,
-              color: widget.session.isSpeakerOn ? Colors.white : Colors.white38,
-            ),
-            onPressed: () {
-              setState(() => widget.session.isSpeakerOn = !widget.session.isSpeakerOn);
-            },
+            onPressed: failed
+                ? null
+                : () => service?.toggleSpeaker(),
           ),
           FloatingActionButton(
             heroTag: 'end_call_fab',

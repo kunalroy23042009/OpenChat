@@ -35,6 +35,19 @@ class FakeContactsRepository implements ContactsRepository {
   }
 
   @override
+  Future<void> setMyPhone(String phone) async {
+    account = AccountProfile(
+      name: account.name,
+      username: account.username,
+      about: account.about,
+      phone: phone,
+    );
+  }
+
+  @override
+  Future<CloudContact?> findByPhone(String phone) async => null;
+
+  @override
   Future<String> invite(String username) async => 'rate_limited';
   @override
   Future<String> inviteByPhone(String phone) async => 'rate_limited';

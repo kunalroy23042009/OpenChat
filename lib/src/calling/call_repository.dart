@@ -9,6 +9,7 @@ class CloudCallLog {
     required this.outcome,
     required this.startedAt,
     required this.durationSeconds,
+    this.peerId,
   });
 
   final String id;
@@ -19,6 +20,9 @@ class CloudCallLog {
   final DateTime startedAt;
   final int durationSeconds;
 
+  /// Null for rows logged before peer ids were recorded.
+  final String? peerId;
+
   factory CloudCallLog.fromJson(Map<String, dynamic> json) => CloudCallLog(
     id: json['id'] as String,
     peerLabel: json['peer_label'] as String? ?? 'OpenChat user',
@@ -27,6 +31,7 @@ class CloudCallLog {
     outcome: json['outcome'] as String,
     startedAt: DateTime.parse(json['started_at'] as String),
     durationSeconds: json['duration_seconds'] as int? ?? 0,
+    peerId: json['peer_id'] as String?,
   );
 }
 
@@ -54,11 +59,14 @@ class CallRepository {
     required String outcome,
     required DateTime startedAt,
     required int durationSeconds,
+    String? peerId,
+    String direction = 'outgoing',
   }) => client.from('call_logs').insert({
     'owner_id': client.auth.currentUser!.id,
+    'peer_id': peerId,
     'peer_label': peerLabel,
     'call_type': callType,
-    'direction': 'outgoing',
+    'direction': direction,
     'outcome': outcome,
     'started_at': startedAt.toUtc().toIso8601String(),
     'duration_seconds': durationSeconds,

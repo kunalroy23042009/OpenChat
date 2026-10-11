@@ -9,6 +9,8 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:video_player/video_player.dart';
 
 import 'chat_store.dart';
+import 'calling/call_flow.dart';
+import 'calling/call_screen.dart';
 import 'local_profile.dart';
 import 'media/chat_media.dart';
 import 'media/media_message.dart';
@@ -813,6 +815,28 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
         title: Text(widget.peerName),
 
         actions: [
+          IconButton(
+            tooltip: 'Voice call',
+            onPressed: () => startOutgoingCall(
+              context,
+              client: widget.client,
+              peerId: widget.peerId,
+              peerName: widget.peerName,
+              type: CallType.voice,
+            ),
+            icon: const Icon(Icons.call_outlined),
+          ),
+          IconButton(
+            tooltip: 'Video call',
+            onPressed: () => startOutgoingCall(
+              context,
+              client: widget.client,
+              peerId: widget.peerId,
+              peerName: widget.peerName,
+              type: CallType.video,
+            ),
+            icon: const Icon(Icons.videocam_outlined),
+          ),
           IconButton(
             tooltip: 'Verify contact',
             onPressed: () => _showVerification(context),

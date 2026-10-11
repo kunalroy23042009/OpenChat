@@ -30,10 +30,12 @@ class _ContactsPageState extends State<ContactsPage>
   final name = TextEditingController();
   final username = TextEditingController();
   final about = TextEditingController();
+  final phone = TextEditingController();
   final inviteName = TextEditingController();
   final invitePhone = TextEditingController();
   final profileForm = GlobalKey<FormState>();
   List<CloudContact> contacts = [];
+  CloudContact? phoneMatch;
   bool loading = true;
   bool busy = false;
   bool loaded = false;
@@ -52,6 +54,7 @@ class _ContactsPageState extends State<ContactsPage>
     name.dispose();
     username.dispose();
     about.dispose();
+    phone.dispose();
     inviteName.dispose();
     invitePhone.dispose();
     super.dispose();
@@ -76,6 +79,7 @@ class _ContactsPageState extends State<ContactsPage>
           name.text = profile.name;
           username.text = profile.username ?? '';
           about.text = profile.about ?? '';
+          phone.text = profile.phone ?? '';
         }
         loaded = true;
         contacts = rows;
@@ -231,6 +235,27 @@ class _ContactsPageState extends State<ContactsPage>
                             : 'Write a short about line (up to 140 characters).',
                       ),
                       const SizedBox(height: 12),
+                      TextFormField(
+                        controller: phone,
+                        enabled: !disabled,
+                        keyboardType: TextInputType.phone,
+                        decoration: const InputDecoration(
+                          labelText: 'Phone number (optional)',
+                          hintText: '+14155552671',
+                          prefixIcon: Icon(Icons.phone_outlined),
+                          helperText:
+                              'Lets contacts find you by number. Verified by SMS once phone login is enabled.',
+                          helperMaxLines: 2,
+                        ),
+                        validator: (v) {
+                          final t = (v ?? '').trim();
+                          if (t.isEmpty) return null;
+                          return RegExp(r'^\+[1-9][0-9]{7,14}$').hasMatch(t)
+                              ? null
+                              : 'Use E.164 format (e.g. +14155552671).';
+                        },
+                      ),
+                      const SizedBox(height: 12),
                       FilledButton(
                         onPressed: disabled
                             ? null
@@ -241,6 +266,9 @@ class _ContactsPageState extends State<ContactsPage>
                                       name.text,
                                       username.text,
                                       about.text,
+                                    );
+                                    await widget.repository.setMyPhone(
+                                      phone.text,
                                     );
                                     return 'Profile saved. Share your username to connect.';
                                   });
@@ -330,6 +358,92 @@ class _ContactsPageState extends State<ContactsPage>
                   icon: const Icon(Icons.send_to_mobile),
                   label: const Text('Invite by phone number'),
                 ),
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  onPressed: disabled
+                      ? null
+                      : () async {
+                          final number = invitePhone.text.trim();
+                          if (number.isEmpty) {
+                            setState(
+                              () => error = 'Enter a phone number to look up first.',
+                            );
+                            return;
+                          }
+                          setState(() {
+                            busy = true;
+                            error = null;
+                            phoneMatch = null;
+                          });
+                          try {
+                            final found = await widget.repository.findByPhone(
+                              number,
+                            );
+                            if (!mounted) return;
+                            setState(() {
+                              phoneMatch = found;
+                              if (found == null) {
+                                error = 'No OpenChat user has that number yet.';
+                              }
+                            });
+                          } catch (e) {
+                            if (mounted) {
+                              setState(() => error = cloudError(e));
+                            }
+                          } finally {
+                            if (mounted) setState(() => busy = false);
+                          }
+                        },
+                  icon: const Icon(Icons.person_search_outlined),
+                  label: const Text('Look up number'),
+                ),
+                if (phoneMatch != null)
+                  Card(
+                    margin: const EdgeInsets.only(top: 12),
+                    child: ListTile(
+                      leading: CircleAvatar(
+                        child: Text(
+                          phoneMatch!.name.isEmpty
+                              ? '?'
+                              : phoneMatch!.name[0].toUpperCase(),
+                        ),
+                      ),
+                      title: Text(phoneMatch!.name),
+                      subtitle: Text(
+                        phoneMatch!.username.isEmpty
+                            ? 'No username yet'
+                            : '@${phoneMatch!.username}',
+                      ),
+                      trailing: FilledButton(
+                        onPressed: disabled
+                            ? null
+                            : () {
+                                final target = phoneMatch!;
+                                perform(() async {
+                                  if (target.username.isEmpty) {
+                                    return await widget.repository
+                                        .inviteByPhone(invitePhone.text);
+                                  }
+                                  final status =
+                                      await widget.repository.invite(
+                                        target.username,
+                                      );
+                                  return switch (status) {
+                                    'sent' => 'Invitation sent.',
+                                    'already_sent' =>
+                                      'Your invitation is already pending.',
+                                    'already_connected' =>
+                                      'You are already connected.',
+                                    'incoming_pending' =>
+                                      'They invited you already. Accept their invitation below.',
+                                    _ => 'That person is unavailable right now.',
+                                  };
+                                });
+                              },
+                        child: const Text('Invite'),
+                      ),
+                    ),
+                  ),
                 const SizedBox(height: 6),
                 const Text(
                   'Up to 20 invitation attempts per day. Fast phone contact discovery.',

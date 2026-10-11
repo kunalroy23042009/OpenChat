@@ -64,7 +64,7 @@ class ChatMedia {
       throw StateError('Image is larger than 10 MB.');
     }
     final plain = await file.readAsBytes();
-    final sealed = MediaSeal.seal(plain);
+    final sealed = await MediaSeal.seal(plain);
     final name =
         '${DateTime.now().microsecondsSinceEpoch}-${file.uri.pathSegments.last}.enc';
     final path = '$me/$peerId/$name';
@@ -114,7 +114,7 @@ class ChatMedia {
     final stamp = DateTime.now().microsecondsSinceEpoch;
     final base = file.uri.pathSegments.last;
     Future<SealedUpload> putBytes(Uint8List bytes, String name) async {
-      final sealed = MediaSeal.seal(bytes);
+      final sealed = await MediaSeal.seal(bytes);
       final path = '$me/$peerId/$stamp-$name.enc';
       await client.storage
           .from(bucket)
