@@ -407,15 +407,20 @@ class ConversationRepository extends ChangeNotifier {
           .map(GroupMessage.fromJson)
           .toList();
 
-      if (before != null && _messages[conversationId] != null) {
-        // Append older messages
-        _messages[conversationId] = [
-          ..._messages[conversationId]!,
-          ...messages,
-        ];
-      } else {
-        _messages[conversationId] = messages;
+      // Never replace the in-memory thread with a network page. A refresh can
+      // race with a send or realtime insert; replacing here would make older
+      // messages appear to vanish. Merge by id and keep one stable newest-first
+      // ordering for the reverse ListView.
+      final byId = <String, GroupMessage>{
+        for (final message in _messages[conversationId] ?? <GroupMessage>[])
+          message.id: message,
+      };
+      for (final message in messages) {
+        byId[message.id] = message;
       }
+      final merged = byId.values.toList()
+        ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+      _messages[conversationId] = merged;
       notifyListeners();
     } catch (e) {
       _error = 'Failed to load messages: $e';
@@ -466,7 +471,10 @@ class ConversationRepository extends ChangeNotifier {
       forwardCount: forwardCount,
     );
 
-    _messages[conversationId] = [msg, ...(_messages[conversationId] ?? [])];
+    final existing = _messages[conversationId] ?? <GroupMessage>[];
+    if (!existing.any((item) => item.id == msg.id)) {
+      _messages[conversationId] = [msg, ...existing];
+    }
     notifyListeners();
     return id;
   }
@@ -618,6 +626,12 @@ class ConversationRepository extends ChangeNotifier {
           final record = payload.newRecord;
           final msg = GroupMessage.fromJson(record);
           if (msg.senderId == _userId) return; // Skip own echoes
+
+          if ((_messages[conversationId] ?? const <GroupMessage>[]).any(
+            (item) => item.id == msg.id,
+          )) {
+            return;
+          }
 
           _messages[conversationId] = [
             msg,
