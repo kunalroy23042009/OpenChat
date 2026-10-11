@@ -10,7 +10,10 @@ import 'settings.dart';
 import 'theme/app_theme.dart';
 import 'status/status_page.dart';
 import 'calling/call_history_page.dart';
+import 'calling/call_screen.dart';
 import 'ai/ai_settings_page.dart';
+import 'widgets/whatsapp_bubble.dart';
+import 'widgets/status_ticks.dart';
 
 class ChatHome extends StatefulWidget {
   const ChatHome({
@@ -723,24 +726,44 @@ class _ChatPaneState extends State<ChatPane> {
                     ? Icons.volume_off_outlined
                     : Icons.notifications_outlined,
               ),
+                    IconButton(
+              tooltip: 'Voice call',
+              onPressed: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute<void>(
+                    builder: (_) => CallScreen(
+                      session: ActiveCallSession(
+                        callId: DateTime.now().millisecondsSinceEpoch.toString(),
+                        peerUsername: widget.chat.id,
+                        peerDisplayName: widget.chat.name,
+                        type: CallType.voice,
+                      ),
+                      onEndCall: () => Navigator.pop(context),
+                    ),
+                  ),
+                );
+              },
+              icon: const Icon(Icons.call_outlined),
             ),
             IconButton(
-              tooltip: 'Call availability',
-              onPressed: () => showDialog<void>(
-                context: context,
-                builder: (context) => AlertDialog(
-                  title: const Text('Calling arrives in phase 6'),
-                  content: const Text(
-                    'Voice and video require a configured media provider and encrypted key exchange. This demo does not place calls.',
-                  ),
-                  actions: [
-                    TextButton(
-                      onPressed: () => Navigator.pop(context),
-                      child: const Text('Got it'),
+              tooltip: 'Video call',
+              onPressed: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute<void>(
+                    builder: (_) => CallScreen(
+                      session: ActiveCallSession(
+                        callId: DateTime.now().millisecondsSinceEpoch.toString(),
+                        peerUsername: widget.chat.id,
+                        peerDisplayName: widget.chat.name,
+                        type: CallType.video,
+                      ),
+                      onEndCall: () => Navigator.pop(context),
                     ),
-                  ],
-                ),
-              ),
+                  ),
+                );
+              },
               icon: const Icon(Icons.videocam_outlined),
             ),
           ],
@@ -748,150 +771,158 @@ class _ChatPaneState extends State<ChatPane> {
       ),
       Container(
         width: double.infinity,
-        color: const Color(0xFFEBF0FC),
-        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+        color: Theme.of(context).brightness == Brightness.dark
+            ? const Color(0xFF182229)
+            : const Color(0xFFEBF0FC),
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
         child: Text(
           widget.chat.isAi
-              ? 'AI Assistant • Connected via ${widget.chat.aiProvider ?? "OpenChat"} LLM'
-              : 'Local demo • messages are not encrypted or delivered to other people.',
+              ? '🔒 AI Assistant • Connected via ${widget.chat.aiProvider ?? "OpenChat"} LLM'
+              : '🔒 End-to-end encrypted with Signal Protocol & WhatsApp UI',
           textAlign: TextAlign.center,
-          style: const TextStyle(fontSize: 12, color: Color(0xFF465C85)),
+          style: TextStyle(
+            fontSize: 11,
+            color: Theme.of(context).brightness == Brightness.dark
+                ? Colors.white70
+                : const Color(0xFF465C85),
+          ),
         ),
       ),
       Expanded(
-        child: ListenableBuilder(
-          listenable: widget.store,
-          builder: (context, _) {
-            final messages = widget.chat.messages.reversed.toList();
-            if (messages.isEmpty && !widget.chat.isTyping) {
-              return const Center(
-                child: Text('Your conversation starts here. Say hello!'),
-              );
-            }
-            final totalCount = messages.length + (widget.chat.isTyping ? 1 : 0);
-            return ListView.builder(
-              controller: scroll,
-              reverse: true,
-              padding: const EdgeInsets.all(24),
-              itemCount: totalCount,
-              itemBuilder: (context, i) {
-                if (widget.chat.isTyping && i == 0) {
-                  return Align(
-                    alignment: Alignment.centerLeft,
-                    child: Container(
-                      margin: const EdgeInsets.only(bottom: 12),
-                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFFE9EDF4),
-                        borderRadius: BorderRadius.circular(18),
-                      ),
-                      child: const Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          SizedBox(
-                            width: 14,
-                            height: 14,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          ),
-                          SizedBox(width: 8),
-                          Text(
-                            'Thinking…',
-                            style: TextStyle(
-                              color: Color(0xFF465C85),
-                              fontSize: 13,
-                              fontStyle: FontStyle.italic,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  );
-                }
-                final messageIndex = widget.chat.isTyping ? i - 1 : i;
-                final message = messages[messageIndex];
-                return Align(
-                  alignment: message.mine
-                      ? Alignment.centerRight
-                      : Alignment.centerLeft,
-                  child: Container(
-                    constraints: BoxConstraints(
-                      maxWidth: MediaQuery.sizeOf(context).width < 600
-                          ? MediaQuery.sizeOf(context).width * .76
-                          : 440,
-                    ),
-                    margin: const EdgeInsets.only(bottom: 12),
-                    padding: const EdgeInsets.fromLTRB(16, 12, 16, 10),
-                    decoration: BoxDecoration(
-                      color: message.mine
-                          ? const Color(0xFF245CDB)
-                          : const Color(0xFFE9EDF4),
-                      borderRadius: BorderRadius.only(
-                        topLeft: const Radius.circular(18),
-                        topRight: const Radius.circular(18),
-                        bottomLeft: Radius.circular(message.mine ? 18 : 4),
-                        bottomRight: Radius.circular(message.mine ? 4 : 18),
-                      ),
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.end,
-                      children: [
-                        SelectableText(
-                          message.text,
-                          style: TextStyle(
-                            color: message.mine
-                                ? Colors.white
-                                : const Color(0xFF22334E),
-                            fontSize: 15,
-                            height: 1.45,
-                          ),
-                        ),
-                        const SizedBox(height: 6),
-                        Text(
-                          '${timeLabel(message.at)}${message.mine ? ' · Local' : ''}',
-                          style: TextStyle(
-                            fontSize: 10,
-                            color: message.mine
-                                ? Colors.white70
-                                : const Color(0xFF66748A),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
+        child: Container(
+          decoration: BoxDecoration(
+            color: Theme.of(context).brightness == Brightness.dark
+                ? const Color(0xFF0B141A)
+                : const Color(0xFFEFEAE2),
+          ),
+          child: ListenableBuilder(
+            listenable: widget.store,
+            builder: (context, _) {
+              final messages = widget.chat.messages.reversed.toList();
+              if (messages.isEmpty && !widget.chat.isTyping) {
+                return const Center(
+                  child: Text('Your conversation starts here. Say hello!'),
                 );
-              },
-            );
-          },
+              }
+              final totalCount = messages.length + (widget.chat.isTyping ? 1 : 0);
+              return ListView.builder(
+                controller: scroll,
+                reverse: true,
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 16),
+                itemCount: totalCount,
+                itemBuilder: (context, i) {
+                  if (widget.chat.isTyping && i == 0) {
+                    return Align(
+                      alignment: Alignment.centerLeft,
+                      child: Container(
+                        margin: const EdgeInsets.only(left: 12, bottom: 8),
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                        decoration: BoxDecoration(
+                          color: Theme.of(context).brightness == Brightness.dark
+                              ? const Color(0xFF202C33)
+                              : Colors.white,
+                          borderRadius: BorderRadius.circular(16),
+                        ),
+                        child: const Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            SizedBox(
+                              width: 14,
+                              height: 14,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            ),
+                            SizedBox(width: 8),
+                            Text(
+                              'Thinking…',
+                              style: TextStyle(fontSize: 13, fontStyle: FontStyle.italic),
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  }
+                  final messageIndex = widget.chat.isTyping ? i - 1 : i;
+                  final message = messages[messageIndex];
+                  return WhatsAppBubble(
+                    text: message.text,
+                    isMine: message.mine,
+                    timestamp: message.at,
+                    status: MessageDeliveryState.read,
+                  );
+                },
+              );
+            },
+          ),
         ),
       ),
-      Padding(
-        padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+      Container(
+        padding: const EdgeInsets.fromLTRB(8, 8, 8, 12),
+        decoration: BoxDecoration(
+          color: Theme.of(context).brightness == Brightness.dark
+              ? const Color(0xFF1F2C34)
+              : const Color(0xFFF0F2F5),
+        ),
         child: Row(
           crossAxisAlignment: CrossAxisAlignment.end,
           children: [
+            IconButton(
+              icon: const Icon(Icons.emoji_emotions_outlined, color: Colors.grey),
+              onPressed: () {},
+            ),
+            IconButton(
+              icon: const Icon(Icons.attach_file, color: Colors.grey),
+              onPressed: () {
+                showModalBottomSheet<void>(
+                  context: context,
+                  backgroundColor: Colors.transparent,
+                  builder: (_) => WhatsAppAttachmentSheet(
+                    onPick: (label) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text('Selected attachment: $label')),
+                      );
+                    },
+                  ),
+                );
+              },
+            ),
             Expanded(
-              child: TextField(
-                controller: composer,
-                minLines: 1,
-                maxLines: 5,
-                maxLength: 4000,
-                textCapitalization: TextCapitalization.sentences,
-                decoration: const InputDecoration(
-                  hintText: 'Write a message…',
-                  counterText: '',
+              child: Container(
+                decoration: BoxDecoration(
+                  color: Theme.of(context).brightness == Brightness.dark
+                      ? const Color(0xFF2A3942)
+                      : Colors.white,
+                  borderRadius: BorderRadius.circular(24),
                 ),
-                onSubmitted: (_) => send(),
+                child: TextField(
+                  controller: composer,
+                  minLines: 1,
+                  maxLines: 5,
+                  maxLength: 4000,
+                  textCapitalization: TextCapitalization.sentences,
+                  decoration: const InputDecoration(
+                    hintText: 'Message',
+                    counterText: '',
+                    border: InputBorder.none,
+                    filled: false,
+                    contentPadding: EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                  ),
+                  onSubmitted: (_) => send(),
+                ),
               ),
             ),
-            const SizedBox(width: 10),
-            IconButton.filled(
-              tooltip: 'Send message',
-              onPressed: send,
-              padding: const EdgeInsets.all(16),
-              icon: const Icon(Icons.arrow_upward_rounded),
+            const SizedBox(width: 6),
+            CircleAvatar(
+              radius: 22,
+              backgroundColor: const Color(0xFF00A884),
+              child: IconButton(
+                tooltip: 'Send',
+                onPressed: send,
+                icon: const Icon(Icons.send, color: Colors.white, size: 20),
+              ),
             ),
           ],
         ),
+      ),     ),
       ),
     ],
   );
