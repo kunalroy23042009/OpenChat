@@ -68,8 +68,11 @@ flutter run -d <DEVICE_ID>
    - `202610090005_messaging.sql` (Realtime message envelopes & inbox catchup)
    - `202610090006_kyber_signatures.sql` (Signal prekey bundle exchange)
    - `202610090007_attachments.sql` (Attachment blob reservations & caps)
-   - `202610090008_phone_auth.sql` (Phone SMS authentication & lookup)
-   *(Or run `supabase/verify_migrations.sql` to verify all 8 migrations at once)*
+   - `202610090008_phone_auth.sql` through `202610090015_conversation_rpcs.sql`
+     (repair, realtime, storage, receipts, AI quota, groups and conversation RPCs)
+   - `202610090016_team_collaboration.sql` (tasks, polls, communities and vault data)
+   - `202610090017_privacy_status_calls.sql` (privacy, linked devices, status and call logs)
+   *(Then run `supabase/verify_migrations.sql` to verify the complete schema.)*
 
 3. Create `config.json` in the project root:
    ```json
@@ -119,7 +122,7 @@ lib/src/widgets/status_ticks.dart    WhatsApp single/double/blue read delivery t
 lib/src/theme/app_theme.dart          Dynamic Light, Dark, Emerald, and System theme controller
 lib/src/secure_chat_screen.dart      Realtime Signal E2EE messaging screen
 lib/src/security/device_security.dart Android Keystore Signal identity bridge
-supabase/migrations/                 Database schema migrations (0001 - 0008)
+supabase/migrations/                 Ordered database schema migrations
 supabase/verify_migrations.sql       Database verification suite
 android/app/proguard-rules.pro        Production release obfuscation rules
 docs/DEVELOPMENT_PLAN.md             Comprehensive 7-phase implementation plan

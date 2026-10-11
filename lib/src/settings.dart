@@ -19,6 +19,7 @@ import 'recovery_page.dart';
 import 'security/security_page.dart';
 import 'theme/app_theme.dart';
 import 'ai/ai_settings_page.dart';
+import 'privacy_settings_page.dart';
 
 class SettingsPage extends StatefulWidget {
   const SettingsPage({
@@ -189,6 +190,24 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
             ListTile(
               contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.privacy_tip_outlined),
+              title: const Text('Privacy and linked devices'),
+              subtitle: const Text(
+                'Receipts, visibility, disappearing messages, focus and sessions.',
+              ),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () => Navigator.push(
+                context,
+                MaterialPageRoute<void>(
+                  builder: (_) => PrivacySettingsPage(
+                    preferences: widget.store.preferences,
+                    client: widget.client,
+                  ),
+                ),
+              ),
+            ),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
               leading: const Icon(Icons.auto_awesome_outlined),
               title: const Text('AI Assistants (ChatGPT, Claude, Gemini)'),
               subtitle: const Text(
@@ -229,9 +248,7 @@ class _SettingsPageState extends State<SettingsPage> {
                   ),
                 ],
                 selected: {
-                  mode == AppThemeMode.emerald
-                      ? AppThemeMode.dark
-                      : mode,
+                  mode == AppThemeMode.emerald ? AppThemeMode.dark : mode,
                 },
                 onSelectionChanged: (selected) =>
                     theme.setTheme(selected.first),
@@ -326,8 +343,9 @@ class _SettingsPageState extends State<SettingsPage> {
                                 ),
                                 FilledButton(
                                   style: FilledButton.styleFrom(
-                                    backgroundColor:
-                                        Theme.of(ctx).colorScheme.error,
+                                    backgroundColor: Theme.of(ctx)
+                                        .colorScheme
+                                        .error,
                                   ),
                                   onPressed: () => Navigator.pop(ctx, true),
                                   child: const Text('Delete account'),
@@ -404,9 +422,8 @@ class _SettingsPageState extends State<SettingsPage> {
                         : () => Navigator.push(
                             context,
                             MaterialPageRoute<void>(
-                              builder: (_) => PhoneAuthPage(
-                                client: widget.client!,
-                              ),
+                              builder: (_) =>
+                                  PhoneAuthPage(client: widget.client!),
                             ),
                           ),
                     icon: const Icon(Icons.phone_android),

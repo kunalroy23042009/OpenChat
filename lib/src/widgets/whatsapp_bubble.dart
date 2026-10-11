@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'formatted_text.dart';
 import 'status_ticks.dart';
 
 class WhatsAppBubble extends StatelessWidget {
@@ -173,9 +174,9 @@ class WhatsAppBubble extends StatelessWidget {
                 alignment: WrapAlignment.end,
                 crossAxisAlignment: WrapCrossAlignment.end,
                 children: [
-                  Text(
-                    text,
-                    style: TextStyle(fontSize: 15, color: textColor, height: 1.25),
+                  FormattedText(
+                    text: text,
+                    baseStyle: TextStyle(fontSize: 15, color: textColor, height: 1.25),
                   ),
                   const SizedBox(width: 8),
                   Row(

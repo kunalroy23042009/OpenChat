@@ -5,6 +5,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'src/chat_store.dart';
 import 'src/auth/password_page.dart';
 import 'src/auth/recovery_controller.dart';
+import 'src/ai/ai_service.dart';
 import 'src/home.dart';
 import 'src/local_profile.dart';
 import 'src/onboarding.dart';
@@ -37,6 +38,9 @@ Future<void> main() async {
   final preferences = store.preferences;
   final profile = LocalProfile(preferences);
   final theme = AppThemeController(preferences);
+  // Load saved AI provider keys before any screen reads them; the ChatStore
+  // constructor only fires off an unawaited load as a fallback.
+  await AiService.instance.init(preferences);
   final onboarded = preferences.getBool('openchat.onboarding.v1') ?? false;
   final push = PushService();
   runApp(

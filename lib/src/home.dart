@@ -127,10 +127,18 @@ class _ChatHomeState extends State<ChatHome> {
                       decoration: const BoxDecoration(
                         shape: BoxShape.circle,
                         gradient: LinearGradient(
-                          colors: [Color(0xFF245CDB), Color(0xFF00C6FF), Color(0xFF9D50BB)],
+                          colors: [
+                            Color(0xFF245CDB),
+                            Color(0xFF00C6FF),
+                            Color(0xFF9D50BB),
+                          ],
                         ),
                       ),
-                      child: const Icon(Icons.auto_awesome, size: 18, color: Colors.white),
+                      child: const Icon(
+                        Icons.auto_awesome,
+                        size: 18,
+                        color: Colors.white,
+                      ),
                     ),
                   ),
                   IconButton(
@@ -319,16 +327,16 @@ class _ChatHomeState extends State<ChatHome> {
           ],
         );
         final currentBody = switch (activeTab) {
-          1 => const StatusPage(),
-          2 => const CallHistoryPage(),
+          1 => StatusPage(client: widget.client),
+          2 => CallHistoryPage(client: widget.client),
           3 => SettingsPage(
-              store: widget.store,
-              profile: widget.profile,
-              push: widget.push,
-              client: widget.client,
-              startupError: widget.startupError,
-              theme: widget.theme,
-            ),
+            store: widget.store,
+            profile: widget.profile,
+            push: widget.push,
+            client: widget.client,
+            startupError: widget.startupError,
+            theme: widget.theme,
+          ),
           _ => list,
         };
 
@@ -513,7 +521,11 @@ class _SecureSectionState extends State<_SecureSection> {
             const SizedBox(width: 6),
             const Text(
               'Encrypted chats',
-              style: TextStyle(fontSize: 13, fontWeight: FontWeight.w800, letterSpacing: 0.4),
+              style: TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.w800,
+                letterSpacing: 0.4,
+              ),
             ),
             const Spacer(),
             IconButton(
@@ -538,7 +550,10 @@ class _SecureSectionState extends State<_SecureSection> {
                 padding: const EdgeInsets.symmetric(vertical: 4),
                 child: Text(
                   'Could not load encrypted chats. Pull to retry with the refresh button.',
-                  style: const TextStyle(fontSize: 12, color: Color(0xFF66748A)),
+                  style: const TextStyle(
+                    fontSize: 12,
+                    color: Color(0xFF66748A),
+                  ),
                 ),
               );
             }
@@ -564,7 +579,9 @@ class _SecureSectionState extends State<_SecureSection> {
                     leading: CircleAvatar(
                       backgroundColor: const Color(0xFFE4EBFF),
                       child: Text(
-                        contact.name.isEmpty ? '?' : contact.name[0].toUpperCase(),
+                        contact.name.isEmpty
+                            ? '?'
+                            : contact.name[0].toUpperCase(),
                         style: const TextStyle(
                           color: Color(0xFF245CDB),
                           fontWeight: FontWeight.w800,
@@ -575,7 +592,9 @@ class _SecureSectionState extends State<_SecureSection> {
                       contact.name,
                       style: const TextStyle(fontWeight: FontWeight.w700),
                     ),
-                    subtitle: Text('@${contact.username} • end-to-end encrypted'),
+                    subtitle: Text(
+                      '@${contact.username} • end-to-end encrypted',
+                    ),
                     trailing: const Icon(Icons.chevron_right),
                     onTap: () => _open(contact),
                   );
@@ -702,12 +721,18 @@ class _ChatPaneState extends State<ChatPane> {
                   ),
                   Text(
                     widget.chat.isAi
-                        ? (widget.chat.isTyping ? 'Thinking…' : 'AI Assistant (${widget.chat.aiProvider ?? "OpenChat"})')
+                        ? (widget.chat.isTyping
+                              ? 'Thinking…'
+                              : 'AI Assistant (${widget.chat.aiProvider ?? "OpenChat"})')
                         : 'Demo contact',
                     style: TextStyle(
-                      color: widget.chat.isTyping ? const Color(0xFF245CDB) : const Color(0xFF66748A),
+                      color: widget.chat.isTyping
+                          ? const Color(0xFF245CDB)
+                          : const Color(0xFF66748A),
                       fontSize: 12,
-                      fontWeight: widget.chat.isTyping ? FontWeight.w600 : FontWeight.normal,
+                      fontWeight: widget.chat.isTyping
+                          ? FontWeight.w600
+                          : FontWeight.normal,
                     ),
                   ),
                 ],
@@ -726,7 +751,8 @@ class _ChatPaneState extends State<ChatPane> {
                     ? Icons.volume_off_outlined
                     : Icons.notifications_outlined,
               ),
-                    IconButton(
+            ),
+            IconButton(
               tooltip: 'Voice call',
               onPressed: () {
                 Navigator.push(
@@ -734,7 +760,8 @@ class _ChatPaneState extends State<ChatPane> {
                   MaterialPageRoute<void>(
                     builder: (_) => CallScreen(
                       session: ActiveCallSession(
-                        callId: DateTime.now().millisecondsSinceEpoch.toString(),
+                        callId: DateTime.now().millisecondsSinceEpoch
+                            .toString(),
                         peerUsername: widget.chat.id,
                         peerDisplayName: widget.chat.name,
                         type: CallType.voice,
@@ -754,7 +781,8 @@ class _ChatPaneState extends State<ChatPane> {
                   MaterialPageRoute<void>(
                     builder: (_) => CallScreen(
                       session: ActiveCallSession(
-                        callId: DateTime.now().millisecondsSinceEpoch.toString(),
+                        callId: DateTime.now().millisecondsSinceEpoch
+                            .toString(),
                         peerUsername: widget.chat.id,
                         peerDisplayName: widget.chat.name,
                         type: CallType.video,
@@ -804,11 +832,15 @@ class _ChatPaneState extends State<ChatPane> {
                   child: Text('Your conversation starts here. Say hello!'),
                 );
               }
-              final totalCount = messages.length + (widget.chat.isTyping ? 1 : 0);
+              final totalCount =
+                  messages.length + (widget.chat.isTyping ? 1 : 0);
               return ListView.builder(
                 controller: scroll,
                 reverse: true,
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 16),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 8,
+                  vertical: 16,
+                ),
                 itemCount: totalCount,
                 itemBuilder: (context, i) {
                   if (widget.chat.isTyping && i == 0) {
@@ -816,7 +848,10 @@ class _ChatPaneState extends State<ChatPane> {
                       alignment: Alignment.centerLeft,
                       child: Container(
                         margin: const EdgeInsets.only(left: 12, bottom: 8),
-                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 10,
+                        ),
                         decoration: BoxDecoration(
                           color: Theme.of(context).brightness == Brightness.dark
                               ? const Color(0xFF202C33)
@@ -834,7 +869,10 @@ class _ChatPaneState extends State<ChatPane> {
                             SizedBox(width: 8),
                             Text(
                               'Thinking…',
-                              style: TextStyle(fontSize: 13, fontStyle: FontStyle.italic),
+                              style: TextStyle(
+                                fontSize: 13,
+                                fontStyle: FontStyle.italic,
+                              ),
                             ),
                           ],
                         ),
@@ -866,8 +904,39 @@ class _ChatPaneState extends State<ChatPane> {
           crossAxisAlignment: CrossAxisAlignment.end,
           children: [
             IconButton(
-              icon: const Icon(Icons.emoji_emotions_outlined, color: Colors.grey),
-              onPressed: () {},
+              icon: const Icon(
+                Icons.emoji_emotions_outlined,
+                color: Colors.grey,
+              ),
+              onPressed: () async {
+                const choices = ['😀', '😂', '❤️', '👍', '🎉', '🙏'];
+                final emoji = await showDialog<String>(
+                  context: context,
+                  builder: (context) => AlertDialog(
+                    title: const Text('Choose emoji'),
+                    content: Wrap(
+                      spacing: 14,
+                      children: choices
+                          .map(
+                            (value) => InkWell(
+                              onTap: () => Navigator.pop(context, value),
+                              child: Text(
+                                value,
+                                style: const TextStyle(fontSize: 30),
+                              ),
+                            ),
+                          )
+                          .toList(),
+                    ),
+                  ),
+                );
+                if (emoji != null) {
+                  composer.text += emoji;
+                  composer.selection = TextSelection.collapsed(
+                    offset: composer.text.length,
+                  );
+                }
+              },
             ),
             IconButton(
               icon: const Icon(Icons.attach_file, color: Colors.grey),
@@ -900,11 +969,14 @@ class _ChatPaneState extends State<ChatPane> {
                   maxLength: 4000,
                   textCapitalization: TextCapitalization.sentences,
                   decoration: const InputDecoration(
-                    hintText: 'Message',
+                    hintText: 'Write a message…',
                     counterText: '',
                     border: InputBorder.none,
                     filled: false,
-                    contentPadding: EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                    contentPadding: EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 10,
+                    ),
                   ),
                   onSubmitted: (_) => send(),
                 ),
@@ -915,14 +987,13 @@ class _ChatPaneState extends State<ChatPane> {
               radius: 22,
               backgroundColor: const Color(0xFF00A884),
               child: IconButton(
-                tooltip: 'Send',
+                tooltip: 'Send message',
                 onPressed: send,
                 icon: const Icon(Icons.send, color: Colors.white, size: 20),
               ),
             ),
           ],
         ),
-      ),     ),
       ),
     ],
   );

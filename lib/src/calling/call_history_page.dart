@@ -1,5 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+
 import 'call_screen.dart';
+import 'call_repository.dart';
 
 class CallLogItem {
   const CallLogItem({
@@ -22,7 +26,9 @@ class CallLogItem {
 }
 
 class CallHistoryPage extends StatefulWidget {
-  const CallHistoryPage({super.key});
+  const CallHistoryPage({super.key, this.client});
+
+  final SupabaseClient? client;
 
   @override
   State<CallHistoryPage> createState() => _CallHistoryPageState();
@@ -59,7 +65,42 @@ class _CallHistoryPageState extends State<CallHistoryPage> {
     ),
   ];
 
+  @override
+  void initState() {
+    super.initState();
+    _loadCloudLogs();
+  }
+
+  Future<void> _loadCloudLogs() async {
+    final client = widget.client;
+    if (client?.auth.currentUser == null) return;
+    try {
+      final cloud = await CallRepository(client!).list();
+      if (!mounted) return;
+      setState(() {
+        _logs
+          ..clear()
+          ..addAll(
+            cloud.map(
+              (log) => CallLogItem(
+                id: log.id,
+                contactName: log.peerLabel,
+                username: log.peerLabel,
+                timestamp: log.startedAt,
+                type: log.callType == 'video' ? CallType.video : CallType.voice,
+                isIncoming: log.direction == 'incoming',
+                isMissed: log.outcome == 'missed',
+              ),
+            ),
+          );
+      });
+    } catch (_) {
+      // Keep demo logs available when offline or before migration deployment.
+    }
+  }
+
   void _startCall(CallLogItem item, CallType type) {
+    final startedAt = DateTime.now();
     final session = ActiveCallSession(
       callId: DateTime.now().millisecondsSinceEpoch.toString(),
       peerUsername: item.username,
@@ -72,7 +113,22 @@ class _CallHistoryPageState extends State<CallHistoryPage> {
       MaterialPageRoute<void>(
         builder: (_) => CallScreen(
           session: session,
-          onEndCall: () => Navigator.pop(context),
+          onEndCall: () async {
+            Navigator.pop(context);
+            final client = widget.client;
+            if (client?.auth.currentUser != null) {
+              try {
+                await CallRepository(client!).add(
+                  peerLabel: item.contactName,
+                  callType: type == CallType.video ? 'video' : 'voice',
+                  outcome: session.durationSeconds > 0 ? 'completed' : 'failed',
+                  startedAt: startedAt,
+                  durationSeconds: session.durationSeconds,
+                );
+                await _loadCloudLogs();
+              } catch (_) {}
+            }
+          },
         ),
       ),
     );
@@ -100,14 +156,27 @@ class _CallHistoryPageState extends State<CallHistoryPage> {
         children: [
           ListTile(
             leading: CircleAvatar(
-              backgroundColor: theme.colorScheme.primary.withValues(alpha: 0.15),
+              backgroundColor: theme.colorScheme.primary.withValues(
+                alpha: 0.15,
+              ),
               child: Icon(Icons.link, color: theme.colorScheme.primary),
             ),
-            title: const Text('Create call link', style: TextStyle(fontWeight: FontWeight.bold)),
+            title: const Text(
+              'Create call link',
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
             subtitle: const Text('Share a link for your OpenChat call'),
             onTap: () {
+              final token = DateTime.now().microsecondsSinceEpoch.toRadixString(
+                36,
+              );
+              Clipboard.setData(
+                ClipboardData(text: 'https://openchat.app/call/$token'),
+              );
               ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('E2EE call link copied to clipboard')),
+                const SnackBar(
+                  content: Text('E2EE call link copied to clipboard'),
+                ),
               );
             },
           ),
@@ -115,7 +184,11 @@ class _CallHistoryPageState extends State<CallHistoryPage> {
             padding: EdgeInsets.fromLTRB(16, 16, 16, 8),
             child: Text(
               'Recent calls',
-              style: TextStyle(fontWeight: FontWeight.bold, color: Colors.grey, fontSize: 13),
+              style: TextStyle(
+                fontWeight: FontWeight.bold,
+                color: Colors.grey,
+                fontSize: 13,
+              ),
             ),
           ),
           ..._logs.map(
@@ -124,7 +197,10 @@ class _CallHistoryPageState extends State<CallHistoryPage> {
                 backgroundColor: theme.colorScheme.primary,
                 child: Text(
                   log.contactName[0].toUpperCase(),
-                  style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                  ),
                 ),
               ),
               title: Text(
@@ -168,6 +244,22 @@ class _CallHistoryPageState extends State<CallHistoryPage> {
             ),
           ),
         ],
+      ),
+      floatingActionButton: FloatingActionButton(
+        heroTag: 'add_call_fab',
+        backgroundColor: const Color(0xFF00A884),
+        foregroundColor: Colors.white,
+        tooltip: 'Start new call',
+        onPressed: () {
+          if (_logs.isNotEmpty) {
+            _startCall(_logs.first, CallType.voice);
+          } else {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('Select a contact to call')),
+            );
+          }
+        },
+        child: const Icon(Icons.add_call),
       ),
     );
   }

@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 import '../chat_store.dart';
 
 enum AiProviderType {
@@ -9,6 +10,7 @@ enum AiProviderType {
   gemini,
   deepseek,
   custom,
+  openchat,
 }
 
 class AiProviderConfig {
@@ -23,7 +25,7 @@ class AiProviderConfig {
 
   final AiProviderType type;
   final String name;
-  final String defaultModel;
+  String defaultModel;
   String apiKey;
   String baseUrl;
   String systemPrompt;
@@ -72,7 +74,7 @@ class AiService {
     AiProviderType.gemini: AiProviderConfig(
       type: AiProviderType.gemini,
       name: 'Google Gemini',
-      defaultModel: 'gemini-1.5-flash',
+      defaultModel: 'gemini-3.8-flash',
       baseUrl:
           'https://generativelanguage.googleapis.com/v1beta/models',
     ),
@@ -88,6 +90,16 @@ class AiService {
       defaultModel: 'default',
       baseUrl: 'http://localhost:11434/v1/chat/completions',
     ),
+    AiProviderType.openchat: AiProviderConfig(
+      type: AiProviderType.openchat,
+      name: 'OpenChat AI',
+      defaultModel: 'gemini-3.8-flash',
+    ),
+  };
+
+  static const _retiredGeminiModels = {
+    'gemini-1.5-flash',
+    'gemini-2.0-flash',
   };
 
   Future<void> init(SharedPreferences prefs) async {
@@ -102,6 +114,13 @@ class AiService {
           providers[p.type] = p;
         }
       } catch (_) {}
+    }
+    // One-time migration: Google retires model names; refresh retired
+    // Gemini defaults while keeping the user's saved API key.
+    final gemini = providers[AiProviderType.gemini]!;
+    if (_retiredGeminiModels.contains(gemini.defaultModel)) {
+      gemini.defaultModel = 'gemini-3.8-flash';
+      await save();
     }
   }
 
@@ -121,6 +140,11 @@ class AiService {
       return 'AI Provider configuration not found.';
     }
 
+    // OpenChat AI needs no key: it rides the user's OpenChat sign-in.
+    if (providerType == AiProviderType.openchat) {
+      return _callOpenChatBackend(userPrompt, history);
+    }
+
     // If no API key is provided, provide an intelligent demo reply
     if (config.apiKey.trim().isEmpty && providerType != AiProviderType.custom) {
       return _generateDemoReply(config.name, userPrompt);
@@ -136,9 +160,54 @@ class AiService {
           return await _callAnthropic(config, userPrompt, history);
         case AiProviderType.gemini:
           return await _callGemini(config, userPrompt, history);
+        case AiProviderType.openchat:
+          return await _callOpenChatBackend(userPrompt, history);
       }
     } catch (e) {
       return 'Could not connect to ${config.name}: $e\n\n(Tip: Check your API key and network connection in Settings → AI Assistants.)';
+    }
+  }
+
+  /// Keyless assistant: the Supabase session (Google sign-in) is the only
+  /// credential. Quota and the model key live server-side.
+  Future<String> _callOpenChatBackend(
+    String userPrompt,
+    List<ChatMessage> history,
+  ) async {
+    try {
+      final response = await Supabase.instance.client.functions.invoke(
+        'ai-chat',
+        body: {
+          'prompt': userPrompt,
+          'history': history.reversed
+              .take(6)
+              .toList()
+              .reversed
+              .map(
+                (m) => {
+                  'role': m.mine ? 'user' : 'assistant',
+                  'text': m.text,
+                },
+              )
+              .toList(),
+        },
+      );
+      final data = response.data;
+      if (data is Map<String, dynamic>) {
+        final reply = data['reply'];
+        if (reply is String && reply.isNotEmpty) return reply;
+        final error = data['error'];
+        if (error is String && error.isNotEmpty) return error;
+      }
+      return 'OpenChat AI gave no answer. Try again.';
+    } on FunctionException catch (e) {
+      final detail = e.details;
+      final message = detail is Map<String, dynamic> && detail['error'] is String
+          ? detail['error'] as String
+          : 'OpenChat AI is unavailable (code ${e.status}). Try again.';
+      return message;
+    } catch (_) {
+      return 'OpenChat AI is unreachable. Check your connection and sign-in.';
     }
   }
 

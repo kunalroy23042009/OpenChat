@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:url_launcher/url_launcher.dart';
 import '../chat_store.dart';
 import 'ai_service.dart';
 
@@ -128,11 +129,23 @@ class _AiSettingsPageState extends State<AiSettingsPage> {
           ),
           const SizedBox(height: 12),
           _buildProviderCard(
+            type: AiProviderType.openchat,
+            title: 'OpenChat AI',
+            icon: Icons.auto_awesome_outlined,
+            color: const Color(0xFF245CDB),
+            keyHint: '',
+            showKeyField: false,
+            note:
+                'No key needed — uses your OpenChat sign-in. 50 answers/day.',
+          ),
+          _buildProviderCard(
             type: AiProviderType.openai,
             title: 'ChatGPT (OpenAI)',
             icon: Icons.smart_toy_outlined,
             color: const Color(0xFF10A37F),
             keyHint: 'sk-proj-...',
+            keyUrl: 'https://platform.openai.com/api-keys',
+            keyUrlLabel: 'Get a key with your OpenAI account',
           ),
           _buildProviderCard(
             type: AiProviderType.anthropic,
@@ -140,6 +153,8 @@ class _AiSettingsPageState extends State<AiSettingsPage> {
             icon: Icons.psychology_outlined,
             color: const Color(0xFFD97706),
             keyHint: 'sk-ant-...',
+            keyUrl: 'https://console.anthropic.com/settings/keys',
+            keyUrlLabel: 'Get a key with your Anthropic account',
           ),
           _buildProviderCard(
             type: AiProviderType.gemini,
@@ -147,6 +162,9 @@ class _AiSettingsPageState extends State<AiSettingsPage> {
             icon: Icons.diamond_outlined,
             color: const Color(0xFF3B82F6),
             keyHint: 'AIzaSy...',
+            keyUrl: 'https://aistudio.google.com/apikey',
+            keyUrlLabel:
+                'Get a free key with your Google account — Gemini selected? Continue with your own account here, then paste it below to use your own quota.',
           ),
           _buildProviderCard(
             type: AiProviderType.deepseek,
@@ -154,6 +172,8 @@ class _AiSettingsPageState extends State<AiSettingsPage> {
             icon: Icons.blur_on,
             color: const Color(0xFF4F46E5),
             keyHint: 'sk-...',
+            keyUrl: 'https://platform.deepseek.com/api_keys',
+            keyUrlLabel: 'Get a key with your DeepSeek account',
           ),
           _buildProviderCard(
             type: AiProviderType.custom,
@@ -181,6 +201,10 @@ class _AiSettingsPageState extends State<AiSettingsPage> {
     required Color color,
     required String keyHint,
     bool showUrlField = false,
+    bool showKeyField = true,
+    String? note,
+    String? keyUrl,
+    String? keyUrlLabel,
   }) {
     final config = AiService.instance.providers[type]!;
 
@@ -216,16 +240,52 @@ class _AiSettingsPageState extends State<AiSettingsPage> {
               ],
             ),
             const SizedBox(height: 16),
-            TextField(
-              controller: _keyControllers[type],
-              obscureText: type != AiProviderType.custom,
-              decoration: InputDecoration(
-                labelText: 'API Key',
-                hintText: keyHint,
-                prefixIcon: const Icon(Icons.key, size: 20),
-                contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            if (showKeyField)
+              TextField(
+                controller: _keyControllers[type],
+                obscureText: type != AiProviderType.custom,
+                decoration: InputDecoration(
+                  labelText: 'API Key',
+                  hintText: keyHint,
+                  prefixIcon: const Icon(Icons.key, size: 20),
+                  contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 12,
+                  ),
+                ),
               ),
-            ),
+            if (note != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Text(
+                  note,
+                  style: const TextStyle(fontSize: 12, color: Colors.grey),
+                ),
+              ),
+            if (keyUrl != null)
+              Align(
+                alignment: Alignment.centerLeft,
+                child: TextButton.icon(
+                  onPressed: () async {
+                    final uri = Uri.parse(keyUrl);
+                    final messenger = ScaffoldMessenger.of(context);
+                    if (!await launchUrl(
+                      uri,
+                      mode: LaunchMode.externalApplication,
+                    )) {
+                      messenger.showSnackBar(
+                        const SnackBar(
+                          content: Text(
+                            'Could not open the browser. Copy the link from help.',
+                          ),
+                        ),
+                      );
+                    }
+                  },
+                  icon: const Icon(Icons.open_in_new, size: 16),
+                  label: Text(keyUrlLabel ?? 'Get a free key'),
+                ),
+              ),
             if (showUrlField) ...[
               const SizedBox(height: 12),
               TextField(

@@ -1,5 +1,5 @@
 -- Open Chat: Database Migration Schema Verification Suite
--- Execute this script in the Supabase SQL Editor to verify all 8 migrations (0001 - 0008).
+-- Execute this script in the Supabase SQL Editor after applying every migration.
 
 DO $$
 DECLARE
@@ -7,13 +7,22 @@ DECLARE
   v_function text;
   v_tables text[] := ARRAY[
     'profiles',
-    'invitations',
-    'contacts',
+    'devices',
+    'contact_requests',
     'push_tokens',
     'message_envelopes',
-    'identity_keys',
-    'prekey_bundles',
-    'attachment_blobs'
+    'key_bundles',
+    'attachment_blobs',
+    'conversations',
+    'conversation_members',
+    'group_messages',
+    'tasks',
+    'poll_votes',
+    'communities',
+    'user_preferences',
+    'status_updates',
+    'status_views',
+    'call_logs'
   ];
   v_functions text[] := ARRAY[
     'delete_account',
@@ -32,10 +41,20 @@ DECLARE
     'reserve_attachment',
     'finalize_attachment',
     'authorize_download',
-    'send_invite_by_phone'
+    'send_invite_by_phone',
+    'create_conversation',
+    'send_group_message',
+    'create_task',
+    'update_task_status',
+    'create_poll',
+    'vote_poll',
+    'upsert_preferences',
+    'register_device_session',
+    'publish_status',
+    'mark_status_viewed'
   ];
 BEGIN
-  RAISE NOTICE '========== OPEN CHAT SCHEMA VERIFICATION (8 MIGRATIONS) ==========';
+  RAISE NOTICE '========== OPEN CHAT SCHEMA VERIFICATION ==========';
 
   -- Check tables
   FOREACH v_table IN ARRAY v_tables
