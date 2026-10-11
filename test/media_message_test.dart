@@ -63,4 +63,86 @@ void main() {
     expect(body.kind, 'image');
     expect(body.isSealed, isFalse);
   });
+
+  test('sealed video round-trips all fields', () {
+    final raw = encodeVideoBody(
+      's/r/v.enc',
+      'trip 🎬',
+      key: 'a2V5',
+      nonce: 'bm9uY2U',
+      thumbPath: 's/r/v.thumb.enc',
+      thumbKey: 'dGhr',
+      thumbNonce: 'dGhu',
+      durationSec: 65,
+    );
+    final body = parseMessageBody(raw);
+    expect(body.kind, 'video');
+    expect(body.isVideo, isTrue);
+    expect(body.isSealed, isTrue);
+    expect(body.path, 's/r/v.enc');
+    expect(body.thumbPath, 's/r/v.thumb.enc');
+    expect(body.thumbKey, 'dGhr');
+    expect(body.thumbNonce, 'dGhu');
+    expect(body.durationSec, 65);
+    expect(body.text, 'trip 🎬');
+    expect(raw.length, lessThan(8192));
+  });
+
+  test('video without thumbnail still parses', () {
+    final body = parseMessageBody(
+      encodeVideoBody('s/r/v.enc', '', durationSec: 7),
+    );
+    expect(body.isVideo, isTrue);
+    expect(body.isSealed, isFalse);
+    expect(body.thumbPath, isNull);
+    expect(body.durationSec, 7);
+  });
+
+  test('poll round-trips question, options, and mode', () {
+    final raw = encodePollBody(
+      'poll-1',
+      'Saturday at 10?',
+      ['Yes', 'No', 'Maybe'],
+    );
+    final body = parseMessageBody(raw);
+    expect(body.kind, 'poll');
+    expect(body.pollId, 'poll-1');
+    expect(body.question, 'Saturday at 10?');
+    expect(body.options, ['Yes', 'No', 'Maybe']);
+    expect(body.multi, isFalse);
+    expect(raw.length, lessThan(8192));
+  });
+
+  test('malformed polls stay text', () {
+    expect(parseMessageBody('{"t":"poll"}').kind, 'text');
+    expect(
+      parseMessageBody('{"t":"poll","id":"x","q":"y","opts":["one"]}').kind,
+      'text',
+    );
+    expect(
+      parseMessageBody('{"t":"vote","id":"x","choices":[]}').kind,
+      'text',
+    );
+  });
+
+  test('tally counts latest ballot per side', () {
+    final messages = [
+      (text: encodeVoteBody('p', [0]), mine: true),
+      (text: encodeVoteBody('p', [1]), mine: false),
+      (text: encodeVoteBody('p', [2]), mine: true),
+      (text: 'unrelated text', mine: false),
+      (text: encodeVoteBody('other', [0]), mine: false),
+    ];
+    final tally = tallyPoll('p', 3, messages);
+    expect(tally.counts, [0, 1, 1]);
+    expect(tally.total, 2);
+  });
+
+  test('tally ignores out-of-range options', () {
+    final messages = [
+      (text: encodeVoteBody('p', [0, 9, -1]), mine: false),
+    ];
+    final tally = tallyPoll('p', 2, messages);
+    expect(tally.counts, [1, 0]);
+  });
 }

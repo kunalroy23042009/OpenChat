@@ -66,9 +66,12 @@ class MainActivity : FlutterActivity() {
                     runOnUiThread { result.success(output) }
                 } catch (_: LinkageError) {
                     runOnUiThread { result.error("SIGNAL_UNAVAILABLE", "The native Signal library could not load on this device.", null) }
-                } catch (_: Exception) {
-                    // Do not return key material, serialized state, or internal exception strings.
-                    runOnUiThread { result.error("SECURITY_FAILED", "Security operation failed. Existing keys were not replaced. Retry after unlocking your phone; if it persists, preserve app data for recovery.", null) }
+                } catch (error: Exception) {
+                    // Forward the real failure (type + message carry operation
+                    // state only; key material and serialized state never
+                    // leave in exception strings).
+                    val detail = "${error.javaClass.simpleName}: ${error.message ?: "failed"}"
+                    runOnUiThread { result.error("SECURITY_FAILED", "Security operation failed. $detail", null) }
                 }
             }
         }

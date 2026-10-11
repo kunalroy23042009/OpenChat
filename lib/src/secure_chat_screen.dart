@@ -6,11 +6,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:video_player/video_player.dart';
 
 import 'chat_store.dart';
 import 'local_profile.dart';
 import 'media/chat_media.dart';
 import 'media/media_message.dart';
+import 'media/video_player_screen.dart';
 import 'push/push_service.dart';
 import 'security/envelope_codec.dart';
 import 'security/safety_number.dart';
@@ -62,13 +64,20 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
 
   Future<void> _bootstrap() async {
     try {
-      await channel.invokeMapMethod('initialize', {'accountId': accountId});
+      final init = await channel.invokeMapMethod<String, dynamic>(
+        'initialize',
+        {'accountId': accountId},
+      );
+      // A rotated identity (orphaned keystore entry, corrupt state) has no
+      // valid server bundle: force republication and rebuild sessions, or
+      // the peer keeps encrypting to a dead identity.
+      final freshIdentity = init?['fresh'] == true;
       final status = await channel.invokeMapMethod<String, dynamic>(
         'status',
         {'accountId': accountId},
       );
       _ownFingerprint = status?['fingerprint'] as String?;
-      await _publishKeys();
+      await _publishKeys(force: freshIdentity);
       await _ensureSession();
       await widget.store.loadSecureConversation(accountId, widget.peerId);
       _subscribeRealtime();
@@ -376,7 +385,7 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
 
   Future<void> _pickAndSendImage() async {
     if (_sendingMedia) return;
-    final source = await showModalBottomSheet<ImageSource>(
+    final choice = await showModalBottomSheet<String>(
       context: context,
       showDragHandle: true,
       builder: (ctx) => SafeArea(
@@ -385,22 +394,40 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
           children: [
             ListTile(
               leading: const Icon(Icons.photo_library_outlined),
-              title: const Text('Choose from gallery'),
-              onTap: () => Navigator.pop(ctx, ImageSource.gallery),
+              title: const Text('Choose photo'),
+              onTap: () => Navigator.pop(ctx, 'photo_gallery'),
             ),
             ListTile(
               leading: const Icon(Icons.photo_camera_outlined),
               title: const Text('Take a photo'),
-              onTap: () => Navigator.pop(ctx, ImageSource.camera),
+              onTap: () => Navigator.pop(ctx, 'photo_camera'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.video_library_outlined),
+              title: const Text('Choose video'),
+              subtitle: const Text('Up to 64 MB'),
+              onTap: () => Navigator.pop(ctx, 'video_gallery'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.videocam_outlined),
+              title: const Text('Record a video'),
+              subtitle: const Text('Up to 3 minutes'),
+              onTap: () => Navigator.pop(ctx, 'video_camera'),
             ),
           ],
         ),
       ),
     );
-    if (source == null || !mounted) return;
+    if (choice == null || !mounted) return;
+    if (choice.startsWith('video_')) {
+      await _pickAndSendVideo(
+        choice == 'video_camera',
+      );
+      return;
+    }
     XFile? picked;
     try {
-      picked = source == ImageSource.gallery
+      picked = choice == 'photo_gallery'
           ? await media.pickGalleryImage()
           : await media.pickCameraImage();
     } on Exception catch (e) {
@@ -470,6 +497,208 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
     } catch (e) {
       if (mounted) {
         setState(() => _error = 'Image failed: $e');
+      }
+    } finally {
+      if (mounted) setState(() => _sendingMedia = false);
+    }
+  }
+
+  Future<void> _createPoll() async {
+    final question = TextEditingController();
+    final options = [TextEditingController(), TextEditingController()];
+    var multi = false;
+    final create = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialog) => AlertDialog(
+          title: const Text('Create poll'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: question,
+                  maxLength: 200,
+                  decoration: const InputDecoration(
+                    hintText: 'Ask a question…',
+                    counterText: '',
+                  ),
+                ),
+                const SizedBox(height: 8),
+                ...options.asMap().entries.map(
+                  (entry) => Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: entry.value,
+                            maxLength: 100,
+                            decoration: InputDecoration(
+                              hintText: 'Option ${entry.key + 1}',
+                              counterText: '',
+                            ),
+                          ),
+                        ),
+                        if (options.length > 2)
+                          IconButton(
+                            tooltip: 'Remove option',
+                            icon: const Icon(Icons.remove_circle_outline),
+                            onPressed: () => setDialog(() {
+                              entry.value.dispose();
+                              options.removeAt(entry.key);
+                            }),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+                if (options.length < 8)
+                  TextButton.icon(
+                    onPressed: () => setDialog(
+                      () => options.add(TextEditingController()),
+                    ),
+                    icon: const Icon(Icons.add),
+                    label: const Text('Add option'),
+                  ),
+                Row(
+                  children: [
+                    const Expanded(child: Text('Allow multiple answers')),
+                    Switch(
+                      value: multi,
+                      onChanged: (v) => setDialog(() => multi = v),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Send poll'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (create != true || !mounted) return;
+    final q = question.text.trim();
+    final opts = options
+        .map((c) => c.text.trim())
+        .where((o) => o.isNotEmpty)
+        .toList();
+    if (q.isEmpty || opts.length < 2) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('A poll needs a question and 2–8 options.'),
+          ),
+        );
+      }
+      return;
+    }
+    final pollId =
+        '${DateTime.now().microsecondsSinceEpoch}-${accountId.hashCode}';
+    await _transmit(encodePollBody(pollId, q, opts, multi: multi));
+  }
+
+  Future<void> _pickAndSendVideo(bool fromCamera) async {
+    if (_sendingMedia) return;
+    XFile? picked;
+    try {
+      picked = fromCamera
+          ? await media.pickCameraVideo()
+          : await media.pickGalleryVideo();
+    } on Exception catch (e) {
+      if (mounted) setState(() => _error = 'Could not open videos: $e');
+      return;
+    }
+    if (picked == null || !mounted) return;
+    final file = File(picked.path);
+    int durationSec = 0;
+    VideoPlayerController? probe;
+    try {
+      probe = VideoPlayerController.file(file);
+      await probe.initialize();
+      durationSec = probe.value.duration.inSeconds;
+    } catch (_) {
+    } finally {
+      await probe?.dispose();
+    }
+    if (!mounted) return;
+    final caption = TextEditingController();
+    final send = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Send video'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.videocam_outlined),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      '${picked!.name} • ${durationSec}s',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: caption,
+                maxLength: 200,
+                decoration: const InputDecoration(
+                  hintText: 'Add a caption…',
+                  counterText: '',
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Send'),
+          ),
+        ],
+      ),
+    );
+    if (send != true || !mounted) return;
+    setState(() {
+      _sendingMedia = true;
+      _error = null;
+    });
+    try {
+      final sealed = await media.uploadSealedVideo(file, widget.peerId);
+      await _transmit(
+        encodeVideoBody(
+          sealed.path,
+          caption.text.trim(),
+          key: sealed.key,
+          nonce: sealed.nonce,
+          thumbPath: sealed.thumbPath.isEmpty ? null : sealed.thumbPath,
+          thumbKey: sealed.thumbKey.isEmpty ? null : sealed.thumbKey,
+          thumbNonce: sealed.thumbNonce.isEmpty ? null : sealed.thumbNonce,
+          durationSec: durationSec,
+        ),
+      );
+    } catch (e) {
+      if (mounted) {
+        setState(() => _error = 'Video failed: $e');
       }
     } finally {
       if (mounted) setState(() => _sendingMedia = false);
@@ -644,19 +873,67 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                         accountId,
                         widget.peerId,
                       );
-                      if (msgs.isEmpty) {
+                      // Ballots travel as messages but never render as
+                      // bubbles; they only feed poll tallies.
+                      final visible = msgs
+                          .where(
+                            (m) => !parseMessageBody(m.text).isVote,
+                          )
+                          .toList();
+                      if (visible.isEmpty) {
                         return const Center(
                           child: Text('No messages yet. Say hello!'),
                         );
                       }
+                      final records = msgs
+                          .map((m) => (text: m.text, mine: m.mine))
+                          .toList();
                       return ListView.builder(
                         controller: scroll,
                         reverse: true,
                         padding: const EdgeInsets.all(16),
-                        itemCount: msgs.length,
+                        itemCount: visible.length,
                         itemBuilder: (context, i) {
-                          final msg = msgs[i];
+                          final msg = visible[i];
                           final body = parseMessageBody(msg.text);
+                          if (body.isPoll &&
+                              body.pollId != null &&
+                              body.question != null &&
+                              body.options != null) {
+                            return _SecurePollBubble(
+                              pollId: body.pollId!,
+                              question: body.question!,
+                              options: body.options!,
+                              multi: body.multi,
+                              tally: tallyPoll(
+                                body.pollId!,
+                                body.options!.length,
+                                records,
+                              ),
+                              mine: msg.mine,
+                              time: msg.at,
+                              status: msg.status,
+                              onVote: (choices) => _transmit(
+                                encodeVoteBody(body.pollId!, choices),
+                              ),
+                            );
+                          }
+                          if (body.isVideo && body.path != null) {
+                            return _SecureVideoBubble(
+                              client: widget.client,
+                              path: body.path!,
+                              caption: body.text,
+                              imageKey: body.key,
+                              imageNonce: body.nonce,
+                              thumbPath: body.thumbPath,
+                              thumbKey: body.thumbKey,
+                              thumbNonce: body.thumbNonce,
+                              durationSec: body.durationSec,
+                              mine: msg.mine,
+                              time: msg.at,
+                              status: msg.status,
+                            );
+                          }
                           if (body.isImage && body.path != null) {
                             return _SecureImageBubble(
                               client: widget.client,
@@ -695,6 +972,11 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                           child: CircularProgressIndicator(strokeWidth: 2),
                         )
                       : const Icon(Icons.attach_file),
+                ),
+                IconButton(
+                  tooltip: 'Create poll',
+                  onPressed: _sendingMedia ? null : _createPoll,
+                  icon: const Icon(Icons.bar_chart_outlined),
                 ),
                 Expanded(
                   child: TextField(
@@ -926,6 +1208,410 @@ class _SecureImageBubbleState extends State<_SecureImageBubble> {
       ),
     ),
   );
+}
+
+/// Sealed video bubble: thumbnail preview with duration + play overlay.
+/// Tapping downloads, unseals, and opens fullscreen playback.
+class _SecureVideoBubble extends StatefulWidget {
+  const _SecureVideoBubble({
+    required this.client,
+    required this.path,
+    required this.caption,
+    required this.mine,
+    required this.time,
+    this.status = 'sent',
+    this.imageKey,
+    this.imageNonce,
+    this.thumbPath,
+    this.thumbKey,
+    this.thumbNonce,
+    this.durationSec = 0,
+  });
+  final SupabaseClient client;
+  final String path;
+  final String caption;
+  final bool mine;
+  final DateTime time;
+  final String status;
+  final String? imageKey;
+  final String? imageNonce;
+  final String? thumbPath;
+  final String? thumbKey;
+  final String? thumbNonce;
+  final int durationSec;
+  @override
+  State<_SecureVideoBubble> createState() => _SecureVideoBubbleState();
+}
+
+class _SecureVideoBubbleState extends State<_SecureVideoBubble> {
+  late final Future<Uint8List?> _thumb = () async {
+    if (widget.thumbPath != null &&
+        widget.thumbPath!.isNotEmpty &&
+        widget.thumbKey != null &&
+        widget.thumbNonce != null) {
+      try {
+        return await ChatMedia(
+          widget.client,
+        ).downloadSealed(widget.thumbPath!, widget.thumbKey!, widget.thumbNonce!);
+      } catch (_) {
+        return null;
+      }
+    }
+    return null;
+  }();
+
+  String get _durationLabel {
+    final m = widget.durationSec ~/ 60;
+    final s = widget.durationSec % 60;
+    return m > 0
+        ? '$m:${s.toString().padLeft(2, '0')}'
+        : '0:${s.toString().padLeft(2, '0')}';
+  }
+
+  Future<void> _play() async {
+    if (widget.imageKey == null || widget.imageNonce == null) return;
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final bytes = await ChatMedia(
+        widget.client,
+      ).downloadSealed(widget.path, widget.imageKey!, widget.imageNonce!);
+      if (!mounted) return;
+      await Navigator.push(
+        context,
+        MaterialPageRoute<void>(
+          builder: (_) => SealedVideoScreen(
+            bytes: bytes,
+            caption: widget.caption,
+          ),
+        ),
+      );
+    } catch (_) {
+      if (mounted) {
+        messenger.showSnackBar(
+          const SnackBar(content: Text('Could not load this video.')),
+        );
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Align(
+    alignment: widget.mine ? Alignment.centerRight : Alignment.centerLeft,
+    child: Container(
+      constraints: BoxConstraints(
+        maxWidth: MediaQuery.of(context).size.width * 0.72,
+      ),
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.all(6),
+      decoration: BoxDecoration(
+        color: widget.mine
+            ? const Color(0xFF245CDB)
+            : const Color(0xFFE9EDF4),
+        borderRadius: const BorderRadius.all(Radius.circular(18)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.end,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          GestureDetector(
+            onTap: _play,
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(12),
+              child: SizedBox(
+                height: 170,
+                width: double.infinity,
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    FutureBuilder<Uint8List?>(
+                      future: _thumb,
+                      builder: (context, snapshot) => snapshot.hasData
+                          ? Image.memory(snapshot.data!, fit: BoxFit.cover)
+                          : Container(
+                              color: Colors.black38,
+                              child: const Center(
+                                child: Icon(
+                                  Icons.movie_outlined,
+                                  color: Colors.white54,
+                                  size: 48,
+                                ),
+                              ),
+                            ),
+                    ),
+                    const Center(
+                      child: CircleAvatar(
+                        backgroundColor: Colors.black54,
+                        child: Icon(
+                          Icons.play_arrow,
+                          color: Colors.white,
+                        ),
+                      ),
+                    ),
+                    Positioned(
+                      bottom: 8,
+                      left: 8,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 4,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: 0.6),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Text(
+                          _durationLabel,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 11,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          if (widget.caption.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(10, 6, 10, 2),
+              child: SelectableText(
+                widget.caption,
+                style: TextStyle(
+                  color: widget.mine
+                      ? Colors.white
+                      : const Color(0xFF22334E),
+                  fontSize: 14,
+                ),
+              ),
+            ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(10, 2, 10, 6),
+            child: Text.rich(
+              TextSpan(
+                children: [
+                  TextSpan(
+                    text:
+                        '${widget.time.hour.toString().padLeft(2, '0')}:${widget.time.minute.toString().padLeft(2, '0')}',
+                    style: TextStyle(
+                      fontSize: 10,
+                      color: widget.mine
+                          ? Colors.white70
+                          : const Color(0xFF66748A),
+                    ),
+                  ),
+                  if (widget.mine)
+                    TextSpan(
+                      text: _Ticks.glyph(widget.status),
+                      style: TextStyle(
+                        fontSize: 10,
+                        color: _Ticks.color(widget.status, true),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
+/// Encrypted poll bubble. Votes travel as ballots inside the Signal
+/// stream; the tally aggregates the latest ballot per side live.
+class _SecurePollBubble extends StatefulWidget {
+  const _SecurePollBubble({
+    required this.pollId,
+    required this.question,
+    required this.options,
+    required this.multi,
+    required this.tally,
+    required this.mine,
+    required this.time,
+    required this.status,
+    required this.onVote,
+  });
+  final String pollId;
+  final String question;
+  final List<String> options;
+  final bool multi;
+  final PollTally tally;
+  final bool mine;
+  final DateTime time;
+  final String status;
+  final ValueChanged<List<int>> onVote;
+  @override
+  State<_SecurePollBubble> createState() => _SecurePollBubbleState();
+}
+
+class _SecurePollBubbleState extends State<_SecurePollBubble> {
+  late Set<int> selected = widget.tally.mine.toSet();
+
+  @override
+  Widget build(BuildContext context) {
+    final counts = widget.tally.counts;
+    final total = widget.tally.total;
+    return Align(
+      alignment: widget.mine ? Alignment.centerRight : Alignment.centerLeft,
+      child: Container(
+        constraints: BoxConstraints(
+          maxWidth: MediaQuery.of(context).size.width * 0.78,
+        ),
+        margin: const EdgeInsets.only(bottom: 12),
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 10),
+        decoration: BoxDecoration(
+          color: widget.mine
+              ? const Color(0xFF245CDB)
+              : const Color(0xFFE9EDF4),
+          borderRadius: const BorderRadius.all(Radius.circular(18)),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.bar_chart_outlined, size: 16),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    widget.question,
+                    style: TextStyle(
+                      fontWeight: FontWeight.w700,
+                      fontSize: 15,
+                      color: widget.mine
+                          ? Colors.white
+                          : const Color(0xFF22334E),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            ...widget.options.asMap().entries.map((entry) {
+              final i = entry.key;
+              final count = i < counts.length ? counts[i] : 0;
+              final frac = total == 0 ? 0.0 : count / total;
+              final isMine = selected.contains(i);
+              final fg = widget.mine
+                  ? Colors.white
+                  : const Color(0xFF22334E);
+              return InkWell(
+                onTap: () => setState(() {
+                  if (widget.multi) {
+                    isMine ? selected.remove(i) : selected.add(i);
+                  } else {
+                    selected = {i};
+                  }
+                }),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 4),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Icon(
+                            widget.multi
+                                ? (isMine
+                                      ? Icons.check_box
+                                      : Icons.check_box_outline_blank)
+                                : (isMine
+                                      ? Icons.radio_button_checked
+                                      : Icons.radio_button_unchecked),
+                            size: 18,
+                            color: fg,
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              entry.value,
+                              style: TextStyle(fontSize: 14, color: fg),
+                            ),
+                          ),
+                          Text(
+                            '$count',
+                            style: TextStyle(fontSize: 13, color: fg),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 4),
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(4),
+                        child: LinearProgressIndicator(
+                          value: frac,
+                          minHeight: 6,
+                          backgroundColor: widget.mine
+                              ? Colors.white24
+                              : Colors.black12,
+                          valueColor: AlwaysStoppedAnimation<Color>(
+                            widget.mine
+                                ? Colors.white
+                                : Theme.of(context).colorScheme.primary,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            }),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    '$total vote${total == 1 ? '' : 's'}${widget.multi ? ' • multiple choice' : ''}',
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: widget.mine
+                          ? Colors.white70
+                          : const Color(0xFF66748A),
+                    ),
+                  ),
+                ),
+                TextButton(
+                  onPressed: selected.isEmpty
+                      ? null
+                      : () => widget.onVote(selected.toList()..sort()),
+                  child: const Text('Vote'),
+                ),
+              ],
+            ),
+            Align(
+              alignment: Alignment.centerRight,
+              child: Text.rich(
+                TextSpan(
+                  children: [
+                    TextSpan(
+                      text:
+                          '${widget.time.hour.toString().padLeft(2, '0')}:${widget.time.minute.toString().padLeft(2, '0')}',
+                      style: TextStyle(
+                        fontSize: 10,
+                        color: widget.mine
+                            ? Colors.white70
+                            : const Color(0xFF66748A),
+                      ),
+                    ),
+                    if (widget.mine)
+                      TextSpan(
+                        text: _Ticks.glyph(widget.status),
+                        style: TextStyle(
+                          fontSize: 10,
+                          color: _Ticks.color(widget.status, true),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 }
 
 class _SecureBubble extends StatelessWidget {

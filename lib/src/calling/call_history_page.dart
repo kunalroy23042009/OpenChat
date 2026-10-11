@@ -35,35 +35,9 @@ class CallHistoryPage extends StatefulWidget {
 }
 
 class _CallHistoryPageState extends State<CallHistoryPage> {
-  final List<CallLogItem> _logs = [
-    CallLogItem(
-      id: 'call_1',
-      contactName: 'Taylor',
-      username: 'taylor',
-      timestamp: DateTime.now().subtract(const Duration(minutes: 15)),
-      type: CallType.video,
-      isIncoming: true,
-      isMissed: false,
-    ),
-    CallLogItem(
-      id: 'call_2',
-      contactName: 'Alex',
-      username: 'alex',
-      timestamp: DateTime.now().subtract(const Duration(hours: 3)),
-      type: CallType.voice,
-      isIncoming: false,
-      isMissed: false,
-    ),
-    CallLogItem(
-      id: 'call_3',
-      contactName: 'Jordan',
-      username: 'jordan',
-      timestamp: DateTime.now().subtract(const Duration(days: 1)),
-      type: CallType.voice,
-      isIncoming: true,
-      isMissed: true,
-    ),
-  ];
+  /// Real call entries only: cloud history when signed in, plus calls
+  /// placed on this device. No fictional sample entries.
+  final List<CallLogItem> _logs = [];
 
   @override
   void initState() {

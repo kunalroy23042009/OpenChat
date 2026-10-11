@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import 'chat_lock.dart';
 import 'chat_store.dart';
 import 'auth/password_auth.dart';
 import 'auth/password_field.dart';
@@ -220,6 +221,31 @@ class _SettingsPageState extends State<SettingsPage> {
                   builder: (_) => AiSettingsPage(store: widget.store),
                 ),
               ),
+            ),
+            const Divider(height: 40),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.lock_outline),
+              title: const Text('Chat lock'),
+              subtitle: FutureBuilder<bool>(
+                future: ChatLock.hasPin(),
+                builder: (context, snapshot) => Text(
+                  snapshot.data == true
+                      ? 'PIN is set. Long-press any chat to lock it.'
+                      : 'Protect chats behind a 4-digit PIN.',
+                ),
+              ),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () async {
+                final messenger = ScaffoldMessenger.of(context);
+                final saved = await ChatLock.promptSetup(context);
+                if (saved && context.mounted) {
+                  setState(() {});
+                  messenger.showSnackBar(
+                    const SnackBar(content: Text('Chat lock PIN saved.')),
+                  );
+                }
+              },
             ),
             const Divider(height: 40),
             const Text(

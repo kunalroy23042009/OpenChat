@@ -2,8 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'chat_store.dart';
+import 'chat_lock.dart';
 import 'contacts_repository.dart';
 import 'local_profile.dart';
+import 'media/media_message.dart';
 import 'push/push_service.dart';
 import 'secure_chat_screen.dart';
 import 'settings.dart';
@@ -38,7 +40,8 @@ class ChatHome extends StatefulWidget {
 class _ChatHomeState extends State<ChatHome> {
   Conversation? selected;
   String query = '';
-  bool unreadOnly = false;
+  String filter = 'all';
+  bool lockRevealed = false;
   int activeTab = 0;
   void open(Conversation chat, bool wide) {
     widget.store.markRead(chat);
@@ -71,19 +74,137 @@ class _ChatHomeState extends State<ChatHome> {
     if (mounted) open(chat, wide);
   }
 
+  /// WhatsApp-style long-press menu: pin, favourite, lock, archive, delete.
+  Future<void> _chatActions(Conversation chat) async {
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: Icon(
+                chat.pinned ? Icons.push_pin : Icons.push_pin_outlined,
+              ),
+              title: Text(chat.pinned ? 'Unpin chat' : 'Pin to top'),
+              onTap: () => Navigator.pop(ctx, 'pin'),
+            ),
+            ListTile(
+              leading: Icon(
+                chat.favourite ? Icons.star : Icons.star_outline,
+              ),
+              title: Text(
+                chat.favourite ? 'Remove from favourites' : 'Add to favourites',
+              ),
+              onTap: () => Navigator.pop(ctx, 'favourite'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.lock_outline),
+              title: Text(chat.locked ? 'Unlock chat' : 'Lock chat'),
+              subtitle: chat.locked
+                  ? null
+                  : const Text('Needs a chat lock PIN from Settings.'),
+              onTap: () => Navigator.pop(ctx, 'lock'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.archive_outlined),
+              title: Text(chat.archived ? 'Unarchive' : 'Archive'),
+              onTap: () => Navigator.pop(ctx, 'archive'),
+            ),
+            ListTile(
+              leading: Icon(
+                Icons.delete_outline,
+                color: Theme.of(ctx).colorScheme.error,
+              ),
+              title: const Text('Delete'),
+              onTap: () => Navigator.pop(ctx, 'delete'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (action == null || !mounted) return;
+    final store = widget.store;
+    switch (action) {
+      case 'pin':
+        await store.setPinned(chat.id, !chat.pinned);
+      case 'favourite':
+        await store.setFavourite(chat.id, !chat.favourite);
+      case 'lock':
+        if (chat.locked) {
+          await store.setLocked(chat.id, false);
+        } else if (!await ChatLock.hasPin()) {
+          if (!mounted) return;
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Set a chat lock PIN in Settings first.'),
+            ),
+          );
+        } else {
+          await store.setLocked(chat.id, true);
+          setState(() => lockRevealed = false);
+        }
+      case 'archive':
+        await store.setArchived(chat.id, !chat.archived);
+      case 'delete':
+        final confirmed = await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: Text('Delete "${chat.name}"?'),
+            content: const Text(
+              'This removes the conversation from this device forever. Encrypted cloud chats are unaffected.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                style: FilledButton.styleFrom(
+                  backgroundColor: Theme.of(ctx).colorScheme.error,
+                ),
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('Delete'),
+              ),
+            ],
+          ),
+        );
+        if (confirmed == true) {
+          await store.deleteConversation(chat.id);
+        }
+    }
+  }
+
   @override
   Widget build(BuildContext context) => ListenableBuilder(
     listenable: widget.store,
     builder: (context, _) => LayoutBuilder(
       builder: (context, constraints) {
         final wide = constraints.maxWidth >= 850;
-        final chats = widget.store.conversations
-            .where(
-              (c) =>
-                  c.name.toLowerCase().contains(query.toLowerCase()) &&
-                  (!unreadOnly || c.unread > 0),
-            )
-            .toList();
+        final viewingArchived = filter == 'archived';
+        final base = widget.store.conversations.where((c) {
+          if (!c.name.toLowerCase().contains(query.toLowerCase())) {
+            return false;
+          }
+          if (viewingArchived != c.archived) return false;
+          if (filter == 'unread' && c.unread == 0) return false;
+          if (filter == 'favourites' && !c.favourite) return false;
+          if (c.locked && !lockRevealed) return false;
+          return true;
+        }).toList();
+        // Pinned first, otherwise stable insertion order.
+        final indexed = base.asMap().entries.toList();
+        indexed.sort((a, b) {
+          if (a.value.pinned != b.value.pinned) {
+            return a.value.pinned ? -1 : 1;
+          }
+          return a.key.compareTo(b.key);
+        });
+        final chats = [for (final e in indexed) e.value];
+        final lockedCount = widget.store.conversations
+            .where((c) => c.locked && !c.archived)
+            .length;
         final list = Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -186,13 +307,23 @@ class _ChatHomeState extends State<ChatHome> {
                 children: [
                   ChoiceChip(
                     label: const Text('All chats'),
-                    selected: !unreadOnly,
-                    onSelected: (_) => setState(() => unreadOnly = false),
+                    selected: filter == 'all',
+                    onSelected: (_) => setState(() => filter = 'all'),
                   ),
                   ChoiceChip(
                     label: const Text('Unread'),
-                    selected: unreadOnly,
-                    onSelected: (_) => setState(() => unreadOnly = true),
+                    selected: filter == 'unread',
+                    onSelected: (_) => setState(() => filter = 'unread'),
+                  ),
+                  ChoiceChip(
+                    label: const Text('Favourites'),
+                    selected: filter == 'favourites',
+                    onSelected: (_) => setState(() => filter = 'favourites'),
+                  ),
+                  ChoiceChip(
+                    label: const Text('Archived'),
+                    selected: filter == 'archived',
+                    onSelected: (_) => setState(() => filter = 'archived'),
                   ),
                   IconButton(
                     tooltip: 'New conversation',
@@ -210,6 +341,36 @@ class _ChatHomeState extends State<ChatHome> {
                 profile: widget.profile,
                 push: widget.push,
               ),
+            if (lockedCount > 0)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(24, 0, 24, 8),
+                child: ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: const CircleAvatar(
+                    child: Icon(Icons.lock_outline, size: 20),
+                  ),
+                  title: Text(
+                    lockRevealed
+                        ? 'Hide locked chats'
+                        : 'Locked chats ($lockedCount)',
+                    style: const TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                  subtitle: lockRevealed
+                      ? null
+                      : const Text('Verify your PIN to reveal them.'),
+                  trailing: const Icon(Icons.chevron_right),
+                  onTap: () async {
+                    if (lockRevealed) {
+                      setState(() => lockRevealed = false);
+                      return;
+                    }
+                    if (await ChatLock.promptVerify(context)) {
+                      if (!mounted) return;
+                      setState(() => lockRevealed = true);
+                    }
+                  },
+                ),
+              ),
             Expanded(
               child: chats.isEmpty
                   ? const Center(
@@ -222,7 +383,41 @@ class _ChatHomeState extends State<ChatHome> {
                       itemCount: chats.length,
                       itemBuilder: (context, i) {
                         final chat = chats[i];
-                        return Padding(
+                        return Dismissible(
+                          key: ValueKey(chat.id),
+                          direction: DismissDirection.endToStart,
+                          background: Container(
+                            alignment: Alignment.centerRight,
+                            padding: const EdgeInsets.only(right: 24),
+                            decoration: BoxDecoration(
+                              color: Theme.of(context).colorScheme.primary,
+                              borderRadius: BorderRadius.circular(18),
+                            ),
+                            child: const Icon(
+                              Icons.archive_outlined,
+                              color: Colors.white,
+                            ),
+                          ),
+                          onDismissed: (_) async {
+                            await widget.store.setArchived(chat.id, true);
+                            if (context.mounted) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                    '${chat.name} archived.',
+                                  ),
+                                  action: SnackBarAction(
+                                    label: 'Undo',
+                                    onPressed: () => widget.store.setArchived(
+                                      chat.id,
+                                      false,
+                                    ),
+                                  ),
+                                ),
+                              );
+                            }
+                          },
+                          child: Padding(
                           padding: const EdgeInsets.symmetric(
                             horizontal: 12,
                             vertical: 3,
@@ -238,11 +433,46 @@ class _ChatHomeState extends State<ChatHome> {
                                 borderRadius: BorderRadius.circular(18),
                               ),
                               leading: ContactAvatar(chat: chat),
-                              title: Text(
-                                chat.name,
-                                style: const TextStyle(
-                                  fontWeight: FontWeight.w700,
-                                ),
+                              title: Row(
+                                children: [
+                                  Expanded(
+                                    child: Text(
+                                      chat.name,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                    ),
+                                  ),
+                                  if (chat.pinned)
+                                    const Padding(
+                                      padding: EdgeInsets.only(left: 4),
+                                      child: Icon(
+                                        Icons.push_pin_outlined,
+                                        size: 14,
+                                        color: Color(0xFF66748A),
+                                      ),
+                                    ),
+                                  if (chat.favourite)
+                                    const Padding(
+                                      padding: EdgeInsets.only(left: 4),
+                                      child: Icon(
+                                        Icons.star,
+                                        size: 14,
+                                        color: Color(0xFFF59E0B),
+                                      ),
+                                    ),
+                                  if (chat.locked)
+                                    const Padding(
+                                      padding: EdgeInsets.only(left: 4),
+                                      child: Icon(
+                                        Icons.lock_outline,
+                                        size: 14,
+                                        color: Color(0xFF66748A),
+                                      ),
+                                    ),
+                                ],
                               ),
                               subtitle: Padding(
                                 padding: const EdgeInsets.only(top: 5),
@@ -291,9 +521,10 @@ class _ChatHomeState extends State<ChatHome> {
                                 ],
                               ),
                               onTap: () => open(chat, wide),
+                              onLongPress: () => _chatActions(chat),
                             ),
                           ),
-                        );
+                        ));
                       },
                     ),
             ),
@@ -305,25 +536,6 @@ class _ChatHomeState extends State<ChatHome> {
                   style: const TextStyle(color: Colors.red),
                 ),
               ),
-            const Padding(
-              padding: EdgeInsets.all(24),
-              child: Row(
-                children: [
-                  Icon(
-                    Icons.science_outlined,
-                    size: 18,
-                    color: Color(0xFF66748A),
-                  ),
-                  SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      'Demo workspace · stored on this device',
-                      style: TextStyle(fontSize: 12, color: Color(0xFF66748A)),
-                    ),
-                  ),
-                ],
-              ),
-            ),
           ],
         );
         final currentBody = switch (activeTab) {
@@ -476,8 +688,15 @@ class _SecureSection extends StatefulWidget {
   State<_SecureSection> createState() => _SecureSectionState();
 }
 
+class _SecureRow {
+  const _SecureRow({required this.contact, required this.preview, this.at});
+  final CloudContact contact;
+  final String preview;
+  final DateTime? at;
+}
+
 class _SecureSectionState extends State<_SecureSection> {
-  late Future<List<CloudContact>> _future;
+  late Future<List<_SecureRow>> _future;
 
   @override
   void initState() {
@@ -485,9 +704,47 @@ class _SecureSectionState extends State<_SecureSection> {
     _future = _load();
   }
 
-  Future<List<CloudContact>> _load() async {
-    final contacts = await SupabaseContactsRepository(widget.client).contacts();
-    return contacts.where((c) => c.status == 'accepted').toList();
+  Future<List<_SecureRow>> _load() async {
+    final me = widget.client.auth.currentUser?.id;
+    final contacts =
+        (await SupabaseContactsRepository(widget.client).contacts())
+            .where((c) => c.status == 'accepted')
+            .toList();
+    return [for (final c in contacts) _row(me, c)];
+  }
+
+  /// Last-message preview so encrypted chats feel persistent: text
+  /// snippet, media/poll glyphs, or the invite hint when empty.
+  _SecureRow _row(String? me, CloudContact contact) {
+    final fallback = '@${contact.username} • end-to-end encrypted';
+    if (me == null) {
+      return _SecureRow(contact: contact, preview: fallback);
+    }
+    final msgs = widget.store.getSecureConversation(me, contact.userId);
+    if (msgs.isEmpty) {
+      return _SecureRow(contact: contact, preview: fallback);
+    }
+    final last = msgs.last;
+    final body = parseMessageBody(last.text);
+    final String preview;
+    if (body.isImage) {
+      preview = '📷 ${body.text.isEmpty ? 'Photo' : body.text}';
+    } else if (body.isVideo) {
+      preview = '🎬 ${body.text.isEmpty ? 'Video' : body.text}';
+    } else if (body.isPoll) {
+      preview = '📊 ${body.question ?? 'Poll'}';
+    } else if (body.isVote) {
+      preview = '🗳️ Voted in a poll';
+    } else if (body.text.length > 60) {
+      preview = '${body.text.substring(0, 60)}…';
+    } else {
+      preview = body.text;
+    }
+    return _SecureRow(
+      contact: contact,
+      preview: '${last.mine ? 'You: ' : ''}$preview',
+      at: last.at,
+    );
   }
 
   void _refresh() => setState(() => _future = _load());
@@ -536,7 +793,7 @@ class _SecureSectionState extends State<_SecureSection> {
             ),
           ],
         ),
-        FutureBuilder<List<CloudContact>>(
+        FutureBuilder<List<_SecureRow>>(
           future: _future,
           builder: (context, snapshot) {
             if (snapshot.connectionState == ConnectionState.waiting) {
@@ -557,7 +814,7 @@ class _SecureSectionState extends State<_SecureSection> {
                 ),
               );
             }
-            final chats = snapshot.data ?? const <CloudContact>[];
+            final chats = snapshot.data ?? const <_SecureRow>[];
             if (chats.isEmpty) {
               return const Padding(
                 padding: EdgeInsets.symmetric(vertical: 4),
@@ -573,7 +830,8 @@ class _SecureSectionState extends State<_SecureSection> {
                 padding: EdgeInsets.zero,
                 itemCount: chats.length,
                 itemBuilder: (context, i) {
-                  final contact = chats[i];
+                  final row = chats[i];
+                  final contact = row.contact;
                   return ListTile(
                     contentPadding: EdgeInsets.zero,
                     leading: CircleAvatar(
@@ -593,9 +851,25 @@ class _SecureSectionState extends State<_SecureSection> {
                       style: const TextStyle(fontWeight: FontWeight.w700),
                     ),
                     subtitle: Text(
-                      '@${contact.username} • end-to-end encrypted',
+                      row.preview,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                     ),
-                    trailing: const Icon(Icons.chevron_right),
+                    trailing: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      crossAxisAlignment: CrossAxisAlignment.end,
+                      children: [
+                        if (row.at != null)
+                          Text(
+                            timeLabel(row.at!),
+                            style: const TextStyle(
+                              fontSize: 11,
+                              color: Color(0xFF66748A),
+                            ),
+                          ),
+                        const Icon(Icons.chevron_right),
+                      ],
+                    ),
                     onTap: () => _open(contact),
                   );
                 },
@@ -803,10 +1077,10 @@ class _ChatPaneState extends State<ChatPane> {
             ? const Color(0xFF182229)
             : const Color(0xFFEBF0FC),
         padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
-        child: Text(
-          widget.chat.isAi
-              ? '🔒 AI Assistant • Connected via ${widget.chat.aiProvider ?? "OpenChat"} LLM'
-              : '🔒 End-to-end encrypted with Signal Protocol & WhatsApp UI',
+          child: Text(
+            widget.chat.isAi
+                ? '🔒 AI Assistant • Connected via ${widget.chat.aiProvider ?? "OpenChat"} LLM'
+                : '💬 Demo conversation · stored only on this device',
           textAlign: TextAlign.center,
           style: TextStyle(
             fontSize: 11,

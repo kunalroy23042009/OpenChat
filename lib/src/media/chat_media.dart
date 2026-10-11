@@ -6,7 +6,6 @@ import 'package:image_picker/image_picker.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'media_seal.dart';
-
 /// Reference to a sealed upload: object path plus base64 key material that
 /// travels inside the Signal-encrypted message.
 class SealedUpload {
@@ -18,6 +17,25 @@ class SealedUpload {
   final String path;
   final String key;
   final String nonce;
+}
+
+/// Reference to a sealed video upload: sealed file + sealed thumbnail,
+/// each with its own key pair, plus duration for the bubble.
+class SealedVideo {
+  const SealedVideo({
+    required this.path,
+    required this.key,
+    required this.nonce,
+    required this.thumbPath,
+    required this.thumbKey,
+    required this.thumbNonce,
+  });
+  final String path;
+  final String key;
+  final String nonce;
+  final String thumbPath;
+  final String thumbKey;
+  final String thumbNonce;
 }
 
 /// Pilot media transport on the private `chat-media` bucket. Files are
@@ -81,6 +99,60 @@ class ChatMedia {
   /// Raw download for legacy unsealed uploads (no key material).
   Future<Uint8List> downloadRaw(String path) =>
       client.storage.from(bucket).download(path);
+
+  static const maxVideoBytes = 64 * 1024 * 1024;
+
+  /// Seals a video plus a small thumbnail (own key pair each) and uploads
+  /// both ciphertexts. WhatsApp-style pilot cap: 64 MB per video.
+  Future<SealedVideo> uploadSealedVideo(File file, String peerId) async {
+    final me = client.auth.currentUser?.id;
+    if (me == null) throw const AuthException('Sign in to send videos.');
+    final size = await file.length();
+    if (size > maxVideoBytes) {
+      throw StateError('Video is larger than 64 MB.');
+    }
+    final stamp = DateTime.now().microsecondsSinceEpoch;
+    final base = file.uri.pathSegments.last;
+    Future<SealedUpload> putBytes(Uint8List bytes, String name) async {
+      final sealed = MediaSeal.seal(bytes);
+      final path = '$me/$peerId/$stamp-$name.enc';
+      await client.storage
+          .from(bucket)
+          .uploadBinary(
+            path,
+            sealed.cipher,
+            fileOptions: const FileOptions(upsert: true),
+          );
+      return SealedUpload(
+        path: path,
+        key: base64Encode(sealed.key),
+        nonce: base64Encode(sealed.nonce),
+      );
+    }
+
+    final video = await putBytes(await file.readAsBytes(), base);
+    // No thumbnail: the video_thumbnail plugin is unmaintained and breaks
+    // the Android build (jcenter/AGP9). The bubble renders a duration tile
+    // until a maintained thumbnail solution lands.
+    return SealedVideo(
+      path: video.path,
+      key: video.key,
+      nonce: video.nonce,
+      thumbPath: '',
+      thumbKey: '',
+      thumbNonce: '',
+    );
+  }
+
+  Future<XFile?> pickGalleryVideo() => ImagePicker().pickVideo(
+    source: ImageSource.gallery,
+    maxDuration: const Duration(minutes: 3),
+  );
+
+  Future<XFile?> pickCameraVideo() => ImagePicker().pickVideo(
+    source: ImageSource.camera,
+    maxDuration: const Duration(minutes: 3),
+  );
 
   /// Short-lived authenticated URL for rendering. Never share or persist it.
   Future<String> displayUrl(String path) =>

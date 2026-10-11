@@ -21,10 +21,12 @@ import javax.crypto.spec.GCMParameterSpec
 
 /** Account-scoped identity only. Persistent ratchet sessions are a later milestone. */
 class IdentityVault(context: Context, accountId: String) {
+    private val appContext = context.applicationContext
     private val account = UUID.fromString(accountId).toString()
     private val alias = "openchat.identity.v1.$account"
-    private val file = File(context.noBackupFilesDir, "signal-identity-$account.bin")
+    private val file = File(appContext.noBackupFilesDir, "signal-identity-$account.bin")
     private val atomicFile = AtomicFile(file)
+    private val sessionsFile = File(appContext.noBackupFilesDir, "signal-store-$account.bin")
     private val aad = "openchat.identity.v1:$account".toByteArray(Charsets.UTF_8)
 
     private fun keyStore() = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
@@ -56,9 +58,41 @@ class IdentityVault(context: Context, accountId: String) {
     }
 
     fun initialize(): Map<String, Any> {
-        if (file.exists()) return status()
-        // Missing/corrupt state must never cause silent identity replacement.
-        check(!keyStore().containsAlias(alias)) { "Incomplete identity state" }
+        try {
+            if (file.exists()) return status() + mapOf("fresh" to false)
+        } catch (_: Exception) {
+            // Corrupt state file: nothing salvageable, rotate below.
+            dropState()
+            return generate(fresh = true)
+        }
+        if (keyStore().containsAlias(alias)) {
+            // Orphaned key without a state file (e.g. app data was cleared
+            // while the keystore entry survived). The identity is
+            // unrecoverable, so rotate: drop the orphan and generate fresh.
+            // Peers will observe a safety-number change, which is the honest
+            // signal for an identity rotation.
+            try {
+                keyStore().deleteEntry(alias)
+            } catch (e: Exception) {
+                throw IllegalStateException("Keystore locked. Unlock your phone and retry.", e)
+            }
+            return generate(fresh = true)
+        }
+        return generate(fresh = false)
+    }
+
+    private fun dropState() {
+        try { atomicFile.delete() } catch (_: Exception) {}
+        try { keyStore().deleteEntry(alias) } catch (_: Exception) {}
+    }
+
+    private fun generate(fresh: Boolean): Map<String, Any> {
+        if (fresh) {
+            // Sessions bound to the previous identity would fail
+            // cryptographically and poison peers' inboxes. Drop them: the
+            // next chat bootstrap claims fresh prekeys and rebuilds.
+            try { if (sessionsFile.exists()) AtomicFile(sessionsFile).delete() } catch (_: Exception) {}
+        }
         val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
         generator.init(KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
             .setKeySize(256).setBlockModes(KeyProperties.BLOCK_MODE_GCM)
@@ -90,7 +124,7 @@ class IdentityVault(context: Context, accountId: String) {
             privateBytes.fill(0)
             clear.fill(0)
         }
-        return status()
+        return status() + mapOf("fresh" to fresh)
     }
 
     fun status(): Map<String, Any> {

@@ -40,32 +40,9 @@ class StatusPage extends StatefulWidget {
 }
 
 class _StatusPageState extends State<StatusPage> {
-  final List<StatusItem> _statuses = [
-    StatusItem(
-      id: 'my_status_1',
-      authorName: 'My Status',
-      content: 'Available on OpenChat!',
-      timestamp: DateTime.now().subtract(const Duration(hours: 2)),
-      isMe: true,
-      isViewed: true,
-    ),
-    StatusItem(
-      id: 'status_taylor',
-      authorName: 'Taylor',
-      content: '☕ Coffee first before coding!',
-      timestamp: DateTime.now().subtract(const Duration(minutes: 45)),
-      isViewed: false,
-      backgroundColor: const Color(0xFF8B5CF6),
-    ),
-    StatusItem(
-      id: 'status_alex',
-      authorName: 'Alex',
-      content: 'Building secure Flutter apps with Signal E2EE 🚀',
-      timestamp: DateTime.now().subtract(const Duration(hours: 5)),
-      isViewed: false,
-      backgroundColor: const Color(0xFF10B981),
-    ),
-  ];
+  /// User-created statuses only. No fictional sample entries: the list
+  /// starts empty and fills from the + action on this device.
+  final List<StatusItem> _statuses = [];
 
   @override
   void initState() {
@@ -380,18 +357,19 @@ class _StatusPageState extends State<StatusPage> {
               }
             },
           ),
-          const Padding(
-            padding: EdgeInsets.fromLTRB(16, 16, 16, 8),
-            child: Text(
-              'Recent updates',
-              style: TextStyle(
-                fontWeight: FontWeight.bold,
-                color: Colors.grey,
-                fontSize: 13,
+          if (recentStatuses.isNotEmpty) ...[
+            const Padding(
+              padding: EdgeInsets.fromLTRB(16, 16, 16, 8),
+              child: Text(
+                'Recent updates',
+                style: TextStyle(
+                  fontWeight: FontWeight.bold,
+                  color: Colors.grey,
+                  fontSize: 13,
+                ),
               ),
             ),
-          ),
-          ...recentStatuses.map(
+            ...recentStatuses.map(
             (status) => ListTile(
               leading: Container(
                 padding: const EdgeInsets.all(2),
@@ -427,7 +405,7 @@ class _StatusPageState extends State<StatusPage> {
               ),
               onTap: () => _viewStatus(status),
             ),
-          ),
+          )],
           const Divider(thickness: 8, height: 24),
           // WhatsApp Channels Section
           Padding(

@@ -34,7 +34,10 @@ Future<void> main() async {
   final recovery = client == null
       ? null
       : RecoveryController(client.auth.onAuthStateChange);
-  final store = ChatStore(await SharedPreferences.getInstance());
+  final store = ChatStore(
+    await SharedPreferences.getInstance(),
+    purgeDemoSeeds: true,
+  );
   final preferences = store.preferences;
   final profile = LocalProfile(preferences);
   final theme = AppThemeController(preferences);
