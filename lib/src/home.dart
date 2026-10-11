@@ -6,6 +6,7 @@ import 'chat_lock.dart';
 import 'contacts_repository.dart';
 import 'local_profile.dart';
 import 'media/media_message.dart';
+import 'profile_page.dart';
 import 'push/push_service.dart';
 import 'secure_chat_screen.dart';
 import 'settings.dart';
@@ -45,6 +46,7 @@ class _ChatHomeState extends State<ChatHome> {
   String query = '';
   String filter = 'all';
   bool lockRevealed = false;
+  bool archivedOpen = false;
   RealtimeChannel? _callWatch;
   String? _callWatchUid;
   bool _incomingOpen = false;
@@ -375,12 +377,11 @@ class _ChatHomeState extends State<ChatHome> {
       builder: (context, constraints) {
         _watchIncomingCalls(context);
         final wide = constraints.maxWidth >= 850;
-        final viewingArchived = filter == 'archived';
         final base = widget.store.conversations.where((c) {
           if (!c.name.toLowerCase().contains(query.toLowerCase())) {
             return false;
           }
-          if (viewingArchived != c.archived) return false;
+          if (c.archived) return false;
           if (filter == 'unread' && c.unread == 0) return false;
           if (filter == 'favourites' && !c.favourite) return false;
           if (c.locked && !lockRevealed) return false;
@@ -398,6 +399,13 @@ class _ChatHomeState extends State<ChatHome> {
         final lockedCount = widget.store.conversations
             .where((c) => c.locked && !c.archived)
             .length;
+        final archivedChats = widget.store.conversations
+            .where(
+              (c) =>
+                  c.archived &&
+                  c.name.toLowerCase().contains(query.toLowerCase()),
+            )
+            .toList();
         final list = Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -455,22 +463,53 @@ class _ChatHomeState extends State<ChatHome> {
                       ),
                     ),
                   ),
-                  IconButton(
-                    tooltip: 'Settings and account',
-                    onPressed: () => Navigator.push(
-                      context,
-                      MaterialPageRoute<void>(
-                        builder: (_) => SettingsPage(
-                          store: widget.store,
-                          profile: widget.profile,
-                          push: widget.push,
-                          client: widget.client,
-                          startupError: widget.startupError,
-                          theme: widget.theme,
+                  PopupMenuButton<String>(
+                    tooltip: 'More options',
+                    icon: const Icon(Icons.more_vert),
+                    onSelected: (value) {
+                      switch (value) {
+                        case 'profile':
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute<void>(
+                              builder: (_) => ProfilePage(
+                                profile: widget.profile,
+                                client: widget.client,
+                              ),
+                            ),
+                          );
+                        case 'new':
+                          newChat(wide);
+                        case 'settings':
+                          setState(() => activeTab = 3);
+                      }
+                    },
+                    itemBuilder: (context) => const [
+                      PopupMenuItem(
+                        value: 'profile',
+                        child: ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          leading: Icon(Icons.account_circle_outlined),
+                          title: Text('My profile'),
                         ),
                       ),
-                    ),
-                    icon: const Icon(Icons.tune_rounded),
+                      PopupMenuItem(
+                        value: 'new',
+                        child: ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          leading: Icon(Icons.edit_square),
+                          title: Text('New conversation'),
+                        ),
+                      ),
+                      PopupMenuItem(
+                        value: 'settings',
+                        child: ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          leading: Icon(Icons.settings_outlined),
+                          title: Text('Settings'),
+                        ),
+                      ),
+                    ],
                   ),
                 ],
               ),
@@ -512,11 +551,6 @@ class _ChatHomeState extends State<ChatHome> {
                     label: const Text('Favourites'),
                     selected: filter == 'favourites',
                     onSelected: (_) => setState(() => filter = 'favourites'),
-                  ),
-                  ChoiceChip(
-                    label: const Text('Archived'),
-                    selected: filter == 'archived',
-                    onSelected: (_) => setState(() => filter = 'archived'),
                   ),
                   IconButton(
                     tooltip: 'New conversation',
@@ -562,6 +596,72 @@ class _ChatHomeState extends State<ChatHome> {
                       setState(() => lockRevealed = true);
                     }
                   },
+                ),
+              ),
+            if (archivedChats.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(24, 0, 24, 8),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: const CircleAvatar(
+                        child: Icon(Icons.archive_outlined, size: 20),
+                      ),
+                      title: Text(
+                        'Archived (${archivedChats.length})',
+                        style: const TextStyle(fontWeight: FontWeight.w700),
+                      ),
+                      trailing: AnimatedRotation(
+                        turns: archivedOpen ? 0.5 : 0.0,
+                        duration: const Duration(milliseconds: 200),
+                        child: const Icon(Icons.expand_more),
+                      ),
+                      onTap: () =>
+                          setState(() => archivedOpen = !archivedOpen),
+                    ),
+                    AnimatedSize(
+                      duration: const Duration(milliseconds: 250),
+                      alignment: Alignment.topCenter,
+                      child: archivedOpen
+                          ? Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                for (final c in archivedChats)
+                                  ListTile(
+                                    contentPadding: const EdgeInsets.only(
+                                      left: 12,
+                                    ),
+                                    leading: ContactAvatar(chat: c),
+                                    title: Text(
+                                      c.name,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                    subtitle: Text(
+                                      c.messages.isEmpty
+                                          ? 'No messages'
+                                          : c.messages.last.text,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                    trailing: IconButton(
+                                      tooltip: 'Unarchive',
+                                      icon: const Icon(
+                                        Icons.unarchive_outlined,
+                                      ),
+                                      onPressed: () => widget.store
+                                          .setArchived(c.id, false),
+                                    ),
+                                    onTap: () => open(c, wide),
+                                    onLongPress: () => _chatActions(c),
+                                  ),
+                              ],
+                            )
+                          : const SizedBox.shrink(),
+                    ),
+                  ],
                 ),
               ),
             Expanded(

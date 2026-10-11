@@ -391,32 +391,49 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
       context: context,
       showDragHandle: true,
       builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ListTile(
-              leading: const Icon(Icons.photo_library_outlined),
-              title: const Text('Choose photo'),
-              onTap: () => Navigator.pop(ctx, 'photo_gallery'),
-            ),
-            ListTile(
-              leading: const Icon(Icons.photo_camera_outlined),
-              title: const Text('Take a photo'),
-              onTap: () => Navigator.pop(ctx, 'photo_camera'),
-            ),
-            ListTile(
-              leading: const Icon(Icons.video_library_outlined),
-              title: const Text('Choose video'),
-              subtitle: const Text('Up to 64 MB'),
-              onTap: () => Navigator.pop(ctx, 'video_gallery'),
-            ),
-            ListTile(
-              leading: const Icon(Icons.videocam_outlined),
-              title: const Text('Record a video'),
-              subtitle: const Text('Up to 3 minutes'),
-              onTap: () => Navigator.pop(ctx, 'video_camera'),
-            ),
-          ],
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(24, 8, 24, 24),
+          child: GridView.count(
+            crossAxisCount: 3,
+            shrinkWrap: true,
+            mainAxisSpacing: 20,
+            crossAxisSpacing: 8,
+            children: [
+              _AttachTile(
+                icon: Icons.photo_library_outlined,
+                color: const Color(0xFF7F66FF),
+                label: 'Gallery',
+                onTap: () => Navigator.pop(ctx, 'photo_gallery'),
+              ),
+              _AttachTile(
+                icon: Icons.photo_camera_outlined,
+                color: const Color(0xFFEC407A),
+                label: 'Camera',
+                onTap: () => Navigator.pop(ctx, 'photo_camera'),
+              ),
+              _AttachTile(
+                icon: Icons.video_library_outlined,
+                color: const Color(0xFF00A884),
+                label: 'Video',
+                onTap: () => Navigator.pop(ctx, 'video_gallery'),
+              ),
+              _AttachTile(
+                icon: Icons.videocam_outlined,
+                color: const Color(0xFF0288D1),
+                label: 'Record',
+                onTap: () => Navigator.pop(ctx, 'video_camera'),
+              ),
+              _AttachTile(
+                icon: Icons.bar_chart_outlined,
+                color: const Color(0xFFF59E0B),
+                label: 'Poll',
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _createPoll();
+                },
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -837,43 +854,65 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
             ),
             icon: const Icon(Icons.videocam_outlined),
           ),
-          IconButton(
-            tooltip: 'Verify contact',
-            onPressed: () => _showVerification(context),
-            icon: const Icon(Icons.verified_user_outlined),
-          ),
-          IconButton(
-            tooltip: 'Refresh keys and retry session',
-            onPressed: () async {
-              final messenger = ScaffoldMessenger.of(context);
-              try {
-                await _publishKeys(force: true);
-                await _ensureSession();
-                if (!mounted) return;
-                messenger.showSnackBar(
-                  const SnackBar(
-                    content: Text('Keys published, session refreshed'),
-                  ),
-                );
-              } catch (e) {
-                if (!mounted) return;
-                messenger.showSnackBar(SnackBar(content: Text('Error: $e')));
+          PopupMenuButton<String>(
+            tooltip: 'More options',
+            icon: const Icon(Icons.more_vert),
+            onSelected: (value) async {
+              switch (value) {
+                case 'verify':
+                  _showVerification(context);
+                case 'refresh':
+                  final messenger = ScaffoldMessenger.of(context);
+                  try {
+                    await _publishKeys(force: true);
+                    await _ensureSession();
+                    if (!mounted) return;
+                    messenger.showSnackBar(
+                      const SnackBar(
+                        content: Text('Keys published, session refreshed'),
+                      ),
+                    );
+                  } catch (e) {
+                    if (!mounted) return;
+                    messenger.showSnackBar(SnackBar(content: Text('Error: $e')));
+                  }
+                case 'link':
+                  final link =
+                      'https://open.chat/invite?account=$accountId&peer=${widget.peerId}';
+                  Clipboard.setData(ClipboardData(text: link));
+                  if (mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Link copied to clipboard')),
+                    );
+                  }
               }
             },
-            icon: const Icon(Icons.refresh),
-          ),
-          IconButton(
-            tooltip: 'Copy invite link',
-            onPressed: () {
-              final link = 'https://open.chat/invite?account=$accountId&peer=${widget.peerId}';
-              Clipboard.setData(ClipboardData(text: link));
-              if (mounted) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Link copied to clipboard')),
-                );
-              }
-            },
-            icon: const Icon(Icons.link),
+            itemBuilder: (context) => const [
+              PopupMenuItem(
+                value: 'verify',
+                child: ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: Icon(Icons.verified_user_outlined),
+                  title: Text('Verify contact'),
+                ),
+              ),
+              PopupMenuItem(
+                value: 'refresh',
+                child: ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: Icon(Icons.refresh),
+                  title: Text('Refresh encryption'),
+                ),
+              ),
+              PopupMenuItem(
+                value: 'link',
+                child: ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: Icon(Icons.link),
+                  title: Text('Copy invite link'),
+                ),
+              ),
+            ],
           ),
         ],
       ),
@@ -987,7 +1026,7 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
               crossAxisAlignment: CrossAxisAlignment.end,
               children: [
                 IconButton(
-                  tooltip: 'Send image',
+                  tooltip: 'Attach photo, video, or poll',
                   onPressed: _sendingMedia ? null : _pickAndSendImage,
                   icon: _sendingMedia
                       ? const SizedBox(
@@ -996,11 +1035,6 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                           child: CircularProgressIndicator(strokeWidth: 2),
                         )
                       : const Icon(Icons.attach_file),
-                ),
-                IconButton(
-                  tooltip: 'Create poll',
-                  onPressed: _sendingMedia ? null : _createPoll,
-                  icon: const Icon(Icons.bar_chart_outlined),
                 ),
                 Expanded(
                   child: TextField(
@@ -1439,6 +1473,37 @@ class _SecureVideoBubbleState extends State<_SecureVideoBubble> {
           ),
         ],
       ),
+    ),
+  );
+}
+
+/// WhatsApp-style attach grid tile: colored round icon over a label.
+class _AttachTile extends StatelessWidget {
+  const _AttachTile({
+    required this.icon,
+    required this.color,
+    required this.label,
+    required this.onTap,
+  });
+  final IconData icon;
+  final Color color;
+  final String label;
+  final VoidCallback onTap;
+  @override
+  Widget build(BuildContext context) => InkWell(
+    onTap: onTap,
+    borderRadius: BorderRadius.circular(16),
+    child: Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        CircleAvatar(
+          radius: 28,
+          backgroundColor: color,
+          child: Icon(icon, color: Colors.white, size: 26),
+        ),
+        const SizedBox(height: 6),
+        Text(label, style: const TextStyle(fontSize: 12)),
+      ],
     ),
   );
 }
