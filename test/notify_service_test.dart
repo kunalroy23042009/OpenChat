@@ -64,6 +64,16 @@ class FakeNotifications extends AndroidFlutterLocalNotificationsPlugin {
 }
 
 void main() {
+  test('notification ids separate message/status and stay deterministic', () {
+    expect(
+      NotifyService.notificationId('msg', 'peer'),
+      NotifyService.notificationId('msg', 'peer'),
+    );
+    expect(
+      NotifyService.notificationId('msg', 'peer'),
+      isNot(NotifyService.notificationId('status', 'peer')),
+    );
+  });
   TestWidgetsFlutterBinding.ensureInitialized();
   late FakeNotifications fake;
 

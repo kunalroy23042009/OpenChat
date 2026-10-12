@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
-import 'package:firebase_messaging/firebase_messaging.dart';
+
 import 'dart:async';
 
 import 'chat_store.dart';
@@ -81,38 +81,18 @@ class _ChatHomeState extends State<ChatHome> {
   @override
   void initState() {
     super.initState();
-    NotifyService.instance.init();
     NotifyService.instance.onTap = _onNotifyTap;
-    NotifyService.instance.ensurePermission();
+    _initializeNotifications();
     widget.store.ensureSelfChat();
     _watchNotify();
-    // Cold start from a notification tap (killed app): route once Firebase
-    // delivers the launch intent. Foreground FCM stays silent because the
-    // realtime watchers already render those events. Never runs without a
-    // Firebase app (widget tests, unsupported platforms).
-    try {
-      FirebaseMessaging.instance.getInitialMessage().then((message) {
-      final data = message?.data;
-      if (data == null || !mounted) return;
-      final kind = data['kind'];
-      final peer = data['peer'];
-      if ((kind != 'msg' && kind != 'status' && kind != 'call') ||
-          peer is! String ||
-          peer.isEmpty) {
-        return;
-      }
-      _onNotifyTap(
-        NotifyTap(
-          kind: kind,
-          peer: peer,
-          name: (data['name'] as String?) ?? 'Contact',
-        ),
-      );
-      });
-    } catch (_) {
-      // No Firebase app on this device/test run: cold-start routing is
-      // unavailable, everything else works.
-    }
+  }
+
+  Future<void> _initializeNotifications() async {
+    await NotifyService.instance.init();
+    if (!mounted) return;
+    await NotifyService.instance.ensurePermission();
+    final tap = await NotifyService.instance.launchTap();
+    if (tap != null && mounted) await _onNotifyTap(tap);
   }
 
   /// Foreground fan-in for message + status notifications. Never decrypts
@@ -131,26 +111,25 @@ class _ChatHomeState extends State<ChatHome> {
     _notifyWatch?.unsubscribe();
     _notifyUid = uid;
     _refreshNotifyNames();
-    _notifyWatch =
-        client!.channel('notify:$uid')
-          ..onPostgresChanges(
-            event: PostgresChangeEvent.insert,
-            schema: 'public',
-            table: 'message_envelopes',
-            filter: PostgresChangeFilter(
-              type: PostgresChangeFilterType.eq,
-              column: 'recipient_id',
-              value: uid,
-            ),
-            callback: (payload) => _onNotifyMessage(payload.newRecord),
-          )
-          ..onPostgresChanges(
-            event: PostgresChangeEvent.insert,
-            schema: 'public',
-            table: 'status_updates',
-            callback: (payload) => _onNotifyStatus(payload.newRecord),
-          )
-          ..subscribe();
+    _notifyWatch = client!.channel('notify:$uid')
+      ..onPostgresChanges(
+        event: PostgresChangeEvent.insert,
+        schema: 'public',
+        table: 'message_envelopes',
+        filter: PostgresChangeFilter(
+          type: PostgresChangeFilterType.eq,
+          column: 'recipient_id',
+          value: uid,
+        ),
+        callback: (payload) => _onNotifyMessage(payload.newRecord),
+      )
+      ..onPostgresChanges(
+        event: PostgresChangeEvent.insert,
+        schema: 'public',
+        table: 'status_updates',
+        callback: (payload) => _onNotifyStatus(payload.newRecord),
+      )
+      ..subscribe();
   }
 
   Future<void> _refreshNotifyNames() async {
@@ -166,6 +145,9 @@ class _ChatHomeState extends State<ChatHome> {
   }
 
   Future<void> _onNotifyMessage(Map<String, dynamic> record) async {
+    if (WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
+      return;
+    }
     final uid = widget.client?.auth.currentUser?.id;
     final sender = record['sender_id'] as String? ?? '';
     if (uid == null ||
@@ -181,10 +163,17 @@ class _ChatHomeState extends State<ChatHome> {
       await _refreshNotifyNames();
       name = _notifyNames[sender] ?? 'New contact';
     }
-    await NotifyService.instance.showMessage(peerId: sender, name: name);
+    await NotifyService.instance.showMessage(
+      peerId: sender,
+      name: name,
+      event: record['client_message_id'] as String?,
+    );
   }
 
   Future<void> _onNotifyStatus(Map<String, dynamic> record) async {
+    if (WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
+      return;
+    }
     final uid = widget.client?.auth.currentUser?.id;
     final author = record['author_id'] as String? ?? '';
     if (uid == null || author.isEmpty || author == uid) return;
@@ -200,9 +189,12 @@ class _ChatHomeState extends State<ChatHome> {
     await NotifyService.instance.showStatus(
       authorId: author,
       name: name,
+      event: record['id'] as String?,
       snippet: type == 'text' && content.isNotEmpty
           ? (content.length > 80 ? '${content.substring(0, 80)}…' : content)
-          : (type == 'image' ? 'Shared a photo status' : 'Shared a video status'),
+          : (type == 'image'
+                ? 'Shared a photo status'
+                : 'Shared a video status'),
     );
   }
 
@@ -218,12 +210,12 @@ class _ChatHomeState extends State<ChatHome> {
           final contacts = await SupabaseContactsRepository(client).contacts();
           CloudContact? match;
           for (final c in contacts) {
-            if (c.userId == tap.peer) {
+            if (c.userId == tap.peer && c.status == 'accepted') {
               match = c;
               break;
             }
           }
-          if (!mounted) return;
+          if (!mounted || match == null) return;
           setState(() => activeTab = 0);
           Navigator.of(context).push(
             MaterialPageRoute<void>(
@@ -233,23 +225,35 @@ class _ChatHomeState extends State<ChatHome> {
                 push: widget.push,
                 client: client,
                 peerId: tap.peer,
-                peerName: match?.name ?? tap.name,
-                peerUsername: match?.username ?? '',
+                peerName: match!.name,
+                peerUsername: match.username,
               ),
             ),
           );
         } catch (_) {}
       case 'status':
+        Navigator.of(context).popUntil((route) => route.isFirst);
         if (mounted) setState(() => activeTab = 1);
       case 'call':
-        // The ring is gone on a cold start; land on the Calls tab where
-        // the missed entry lives.
-        if (mounted) setState(() => activeTab = 2);
+        final invite = await client
+            .from('call_invites')
+            .select()
+            .eq('id', tap.peer)
+            .eq('callee_id', client.auth.currentUser?.id ?? '')
+            .maybeSingle();
+        if (!mounted) return;
+        if (invite != null && invite['status'] == 'ringing') {
+          await _onIncomingInvite(invite);
+        } else {
+          await NotifyService.instance.cancelCall(tap.peer);
+          if (mounted) setState(() => activeTab = 2);
+        }
     }
   }
 
   @override
   void dispose() {
+    NotifyService.instance.onTap = null;
     _callWatch?.unsubscribe();
     _notifyWatch?.unsubscribe();
     super.dispose();
@@ -270,20 +274,19 @@ class _ChatHomeState extends State<ChatHome> {
     if (_callWatchUid == uid && _callWatch != null) return;
     _callWatch?.unsubscribe();
     _callWatchUid = uid;
-    _callWatch =
-        client!.channel('calls:$uid')
-          ..onPostgresChanges(
-            event: PostgresChangeEvent.insert,
-            schema: 'public',
-            table: 'call_invites',
-            filter: PostgresChangeFilter(
-              type: PostgresChangeFilterType.eq,
-              column: 'callee_id',
-              value: uid,
-            ),
-            callback: (payload) => _onIncomingInvite(payload.newRecord),
-          )
-          ..subscribe();
+    _callWatch = client!.channel('calls:$uid')
+      ..onPostgresChanges(
+        event: PostgresChangeEvent.insert,
+        schema: 'public',
+        table: 'call_invites',
+        filter: PostgresChangeFilter(
+          type: PostgresChangeFilterType.eq,
+          column: 'callee_id',
+          value: uid,
+        ),
+        callback: (payload) => _onIncomingInvite(payload.newRecord),
+      )
+      ..subscribe();
   }
 
   Future<void> _onIncomingInvite(Map<String, dynamic> record) async {
@@ -346,12 +349,16 @@ class _ChatHomeState extends State<ChatHome> {
     );
     // Expire this invite's route only. An old timer must never dismiss a
     // newer call, permission dialog, or unrelated page.
-    final age = created == null ? Duration.zero : DateTime.now().difference(created);
+    final age = created == null
+        ? Duration.zero
+        : DateTime.now().difference(created);
     final remaining = const Duration(seconds: 60) - age;
     final expiry = Timer(remaining.isNegative ? Duration.zero : remaining, () {
       expired = true;
       NotifyService.instance.cancelCall(inviteId);
-      if (mounted && dialogRoute.isActive) dialogNavigator.removeRoute(dialogRoute);
+      if (mounted && dialogRoute.isActive) {
+        dialogNavigator.removeRoute(dialogRoute);
+      }
     });
     bool? accept;
     try {
@@ -364,11 +371,7 @@ class _ChatHomeState extends State<ChatHome> {
     if (!mounted || expired) return;
     if (accept != true) {
       try {
-        await CallSignaling.answer(
-          client,
-          inviteId: inviteId,
-          accept: false,
-        );
+        await CallSignaling.answer(client, inviteId: inviteId, accept: false);
         await CallRepository(client).add(
           peerLabel: peerName,
           peerId: callerId,
@@ -397,9 +400,7 @@ class _ChatHomeState extends State<ChatHome> {
       }
     } catch (_) {}
     final service = CallService();
-    if (!await service.ensurePermissions(
-      video: callType == 'video',
-    )) {
+    if (!await service.ensurePermissions(video: callType == 'video')) {
       messenger.showSnackBar(
         SnackBar(content: Text(service.error ?? 'Permission denied.')),
       );
@@ -514,9 +515,7 @@ class _ChatHomeState extends State<ChatHome> {
               onTap: () => Navigator.pop(ctx, 'pin'),
             ),
             ListTile(
-              leading: Icon(
-                chat.favourite ? Icons.star : Icons.star_outline,
-              ),
+              leading: Icon(chat.favourite ? Icons.star : Icons.star_outline),
               title: Text(
                 chat.favourite ? 'Remove from favourites' : 'Add to favourites',
               ),
@@ -778,8 +777,7 @@ class _ChatHomeState extends State<ChatHome> {
                           ChoiceChip(
                             label: const Text('All chats'),
                             selected: filter == 'all',
-                            onSelected: (_) =>
-                                setState(() => filter = 'all'),
+                            onSelected: (_) => setState(() => filter = 'all'),
                           ),
                           const SizedBox(width: 8),
                           ChoiceChip(
@@ -803,9 +801,8 @@ class _ChatHomeState extends State<ChatHome> {
                             ),
                             label: const Text('Archived'),
                             selected: archivedOpen,
-                            onSelected: (_) => setState(
-                              () => archivedOpen = !archivedOpen,
-                            ),
+                            onSelected: (_) =>
+                                setState(() => archivedOpen = !archivedOpen),
                           ),
                         ],
                       ),
@@ -877,8 +874,7 @@ class _ChatHomeState extends State<ChatHome> {
                         duration: const Duration(milliseconds: 200),
                         child: const Icon(Icons.expand_more),
                       ),
-                      onTap: () =>
-                          setState(() => archivedOpen = !archivedOpen),
+                      onTap: () => setState(() => archivedOpen = !archivedOpen),
                     ),
                     AnimatedSize(
                       duration: const Duration(milliseconds: 250),
@@ -910,8 +906,8 @@ class _ChatHomeState extends State<ChatHome> {
                                       icon: const Icon(
                                         Icons.unarchive_outlined,
                                       ),
-                                      onPressed: () => widget.store
-                                          .setArchived(c.id, false),
+                                      onPressed: () =>
+                                          widget.store.setArchived(c.id, false),
                                     ),
                                     onTap: () => open(c, wide),
                                     onLongPress: () => _chatActions(c),
@@ -955,9 +951,7 @@ class _ChatHomeState extends State<ChatHome> {
                             if (context.mounted) {
                               ScaffoldMessenger.of(context).showSnackBar(
                                 SnackBar(
-                                  content: Text(
-                                    '${chat.name} archived.',
-                                  ),
+                                  content: Text('${chat.name} archived.'),
                                   action: SnackBarAction(
                                     label: 'Undo',
                                     onPressed: () => widget.store.setArchived(
@@ -970,113 +964,116 @@ class _ChatHomeState extends State<ChatHome> {
                             }
                           },
                           child: Padding(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 12,
-                            vertical: 3,
-                          ),
-                          child: Material(
-                            color: selected == chat && wide
-                                ? const Color(0xFFE8EEFD)
-                                : Colors.transparent,
-                            borderRadius: BorderRadius.circular(18),
-                            child: ListTile(
-                              contentPadding: const EdgeInsets.all(12),
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(18),
-                              ),
-                              leading: ContactAvatar(chat: chat),
-                              title: Row(
-                                children: [
-                                  Expanded(
-                                    child: Text(
-                                      chat.name,
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: const TextStyle(
-                                        fontWeight: FontWeight.w700,
-                                      ),
-                                    ),
-                                  ),
-                                  if (chat.pinned)
-                                    const Padding(
-                                      padding: EdgeInsets.only(left: 4),
-                                      child: Icon(
-                                        Icons.push_pin_outlined,
-                                        size: 14,
-                                        color: Color(0xFF66748A),
-                                      ),
-                                    ),
-                                  if (chat.favourite)
-                                    const Padding(
-                                      padding: EdgeInsets.only(left: 4),
-                                      child: Icon(
-                                        Icons.star,
-                                        size: 14,
-                                        color: Color(0xFFF59E0B),
-                                      ),
-                                    ),
-                                  if (chat.locked)
-                                    const Padding(
-                                      padding: EdgeInsets.only(left: 4),
-                                      child: Icon(
-                                        Icons.lock_outline,
-                                        size: 14,
-                                        color: Color(0xFF66748A),
-                                      ),
-                                    ),
-                                ],
-                              ),
-                              subtitle: Padding(
-                                padding: const EdgeInsets.only(top: 5),
-                                child: Text(
-                                  chat.messages.isEmpty
-                                      ? 'Say hello'
-                                      : chat.messages.last.text,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 12,
+                              vertical: 3,
+                            ),
+                            child: Material(
+                              color: selected == chat && wide
+                                  ? const Color(0xFFE8EEFD)
+                                  : Colors.transparent,
+                              borderRadius: BorderRadius.circular(18),
+                              child: ListTile(
+                                contentPadding: const EdgeInsets.all(12),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(18),
                                 ),
-                              ),
-                              trailing: Column(
-                                mainAxisAlignment: MainAxisAlignment.center,
-                                children: [
-                                  Text(
-                                    chat.messages.isEmpty
-                                        ? ''
-                                        : timeLabel(chat.messages.last.at),
-                                    style: const TextStyle(
-                                      fontSize: 11,
-                                      color: Color(0xFF66748A),
-                                    ),
-                                  ),
-                                  const SizedBox(height: 6),
-                                  if (chat.muted)
-                                    const Padding(
-                                      padding: EdgeInsets.only(bottom: 4),
-                                      child: Icon(
-                                        Icons.volume_off,
-                                        size: 14,
-                                        color: Color(0xFF66748A),
-                                      ),
-                                    ),
-                                  if (chat.unread > 0)
-                                    CircleAvatar(
-                                      radius: 10,
-                                      backgroundColor: const Color(0xFF245CDB),
+                                leading: ContactAvatar(chat: chat),
+                                title: Row(
+                                  children: [
+                                    Expanded(
                                       child: Text(
-                                        '${chat.unread}',
+                                        chat.name,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
                                         style: const TextStyle(
-                                          fontSize: 11,
-                                          color: Colors.white,
+                                          fontWeight: FontWeight.w700,
                                         ),
                                       ),
                                     ),
-                                ],
+                                    if (chat.pinned)
+                                      const Padding(
+                                        padding: EdgeInsets.only(left: 4),
+                                        child: Icon(
+                                          Icons.push_pin_outlined,
+                                          size: 14,
+                                          color: Color(0xFF66748A),
+                                        ),
+                                      ),
+                                    if (chat.favourite)
+                                      const Padding(
+                                        padding: EdgeInsets.only(left: 4),
+                                        child: Icon(
+                                          Icons.star,
+                                          size: 14,
+                                          color: Color(0xFFF59E0B),
+                                        ),
+                                      ),
+                                    if (chat.locked)
+                                      const Padding(
+                                        padding: EdgeInsets.only(left: 4),
+                                        child: Icon(
+                                          Icons.lock_outline,
+                                          size: 14,
+                                          color: Color(0xFF66748A),
+                                        ),
+                                      ),
+                                  ],
+                                ),
+                                subtitle: Padding(
+                                  padding: const EdgeInsets.only(top: 5),
+                                  child: Text(
+                                    chat.messages.isEmpty
+                                        ? 'Say hello'
+                                        : chat.messages.last.text,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ),
+                                trailing: Column(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    Text(
+                                      chat.messages.isEmpty
+                                          ? ''
+                                          : timeLabel(chat.messages.last.at),
+                                      style: const TextStyle(
+                                        fontSize: 11,
+                                        color: Color(0xFF66748A),
+                                      ),
+                                    ),
+                                    const SizedBox(height: 6),
+                                    if (chat.muted)
+                                      const Padding(
+                                        padding: EdgeInsets.only(bottom: 4),
+                                        child: Icon(
+                                          Icons.volume_off,
+                                          size: 14,
+                                          color: Color(0xFF66748A),
+                                        ),
+                                      ),
+                                    if (chat.unread > 0)
+                                      CircleAvatar(
+                                        radius: 10,
+                                        backgroundColor: const Color(
+                                          0xFF245CDB,
+                                        ),
+                                        child: Text(
+                                          '${chat.unread}',
+                                          style: const TextStyle(
+                                            fontSize: 11,
+                                            color: Colors.white,
+                                          ),
+                                        ),
+                                      ),
+                                  ],
+                                ),
+                                onTap: () => open(chat, wide),
+                                onLongPress: () => _chatActions(chat),
                               ),
-                              onTap: () => open(chat, wide),
-                              onLongPress: () => _chatActions(chat),
                             ),
                           ),
-                        ));
+                        );
                       },
                     ),
             ),
@@ -1266,10 +1263,9 @@ class _SecureSectionState extends State<_SecureSection> {
 
   Future<List<_SecureRow>> _load() async {
     final me = widget.client.auth.currentUser?.id;
-    final contacts =
-        (await SupabaseContactsRepository(widget.client).contacts())
-            .where((c) => c.status == 'accepted')
-            .toList();
+    final contacts = (await SupabaseContactsRepository(
+      widget.client,
+    ).contacts()).where((c) => c.status == 'accepted').toList();
     return [for (final c in contacts) _row(me, c)];
   }
 
@@ -1331,7 +1327,9 @@ class _SecureSectionState extends State<_SecureSection> {
           children: [
             ListTile(
               leading: Icon(
-                unread ? Icons.mark_chat_read_outlined : Icons.mark_chat_unread_outlined,
+                unread
+                    ? Icons.mark_chat_read_outlined
+                    : Icons.mark_chat_unread_outlined,
               ),
               title: Text(unread ? 'Mark as read' : 'Mark as unread'),
               onTap: () => Navigator.pop(ctx, 'read'),
@@ -1430,11 +1428,11 @@ class _SecureSectionState extends State<_SecureSection> {
             return ListenableBuilder(
               listenable: widget.store,
               builder: (context, _) => ListView.builder(
-              shrinkWrap: true,
-              physics: const NeverScrollableScrollPhysics(),
-              padding: EdgeInsets.zero,
-              itemCount: chats.length,
-              itemBuilder: (context, i) {
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                padding: EdgeInsets.zero,
+                itemCount: chats.length,
+                itemBuilder: (context, i) {
                   final row = chats[i];
                   final contact = row.contact;
                   return ListTile(
@@ -1460,9 +1458,7 @@ class _SecureSectionState extends State<_SecureSection> {
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(
-                        color: row.hasDraft
-                            ? const Color(0xFF245CDB)
-                            : null,
+                        color: row.hasDraft ? const Color(0xFF245CDB) : null,
                       ),
                     ),
                     trailing: Column(
@@ -1497,8 +1493,8 @@ class _SecureSectionState extends State<_SecureSection> {
                 },
               ),
             );
-            },
-          ),
+          },
+        ),
         const Divider(height: 16),
       ],
     ),
@@ -1699,10 +1695,10 @@ class _ChatPaneState extends State<ChatPane> {
             ? const Color(0xFF182229)
             : const Color(0xFFEBF0FC),
         padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
-          child: Text(
-            widget.chat.isAi
-                ? '🔒 AI Assistant • Connected via ${widget.chat.aiProvider ?? "OpenChat"} LLM'
-                : '💬 Demo conversation · stored only on this device',
+        child: Text(
+          widget.chat.isAi
+              ? '🔒 AI Assistant • Connected via ${widget.chat.aiProvider ?? "OpenChat"} LLM'
+              : '💬 Demo conversation · stored only on this device',
           textAlign: TextAlign.center,
           style: TextStyle(
             fontSize: 11,

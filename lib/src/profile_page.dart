@@ -20,8 +20,84 @@ class ProfilePage extends StatefulWidget {
 class _ProfilePageState extends State<ProfilePage> {
   bool busy = false;
   String? feedback;
+  String? cloudUsername;
+  String? cloudPhone;
 
   bool get signedIn => widget.client?.auth.currentUser != null;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadCloud();
+  }
+
+  /// Pulls the authoritative cloud profile (username, self-asserted phone) so
+  /// the page shows what contacts actually see, not just local edits.
+  Future<void> _loadCloud() async {
+    final client = widget.client;
+    if (client == null || client.auth.currentUser == null) return;
+    try {
+      final cloud = await SupabaseContactsRepository(client).profile();
+      if (!mounted) return;
+      setState(() {
+        cloudUsername = cloud.username;
+        cloudPhone = cloud.phone;
+      });
+    } catch (_) {
+      if (mounted) {
+        setState(
+          () => feedback = 'Could not load account details. Check your connection and reopen Profile.',
+        );
+      }
+    }
+  }
+
+  Future<void> editAccountField({required bool phone}) async {
+    final client = widget.client;
+    if (client == null || !signedIn || busy) return;
+    final value = await showDialog<String>(
+      context: context,
+      builder: (_) => _AccountFieldDialog(
+        phone: phone,
+        initial: phone ? cloudPhone ?? '' : cloudUsername ?? '',
+      ),
+    );
+    if (value == null || !mounted) return;
+    setState(() {
+      busy = true;
+      feedback = null;
+    });
+    try {
+      final repository = SupabaseContactsRepository(client);
+      if (phone) {
+        await repository.setMyPhone(value);
+      } else {
+        // Updating a username must not overwrite a newer name/about with
+        // stale device-local profile values.
+        final current = await repository.profile();
+        await repository.saveProfile(
+          current.name,
+          value,
+          current.about ?? LocalProfile.defaultAbout,
+        );
+      }
+      if (!mounted) return;
+      setState(() {
+        if (phone) {
+          cloudPhone = value;
+        } else {
+          cloudUsername = value;
+        }
+        feedback = phone
+            ? 'Phone number saved (not SMS-verified).'
+            : 'Username updated.';
+      });
+    } catch (e) {
+      if (mounted) setState(() => feedback = cloudError(e));
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
 
   Future<void> changePhoto() async {
     final choice = await showModalBottomSheet<String>(
@@ -34,6 +110,11 @@ class _ProfilePageState extends State<ProfilePage> {
               leading: const Icon(Icons.photo_library_outlined),
               title: const Text('Choose from gallery'),
               onTap: () => Navigator.pop(context, 'gallery'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.photo_camera_outlined),
+              title: const Text('Take a photo'),
+              onTap: () => Navigator.pop(context, 'camera'),
             ),
             if (widget.profile.avatarPath != null)
               ListTile(
@@ -55,7 +136,7 @@ class _ProfilePageState extends State<ProfilePage> {
         await widget.profile.removeAvatar();
       } else {
         final picked = await ImagePicker().pickImage(
-          source: ImageSource.gallery,
+          source: choice == 'camera' ? ImageSource.camera : ImageSource.gallery,
           maxWidth: 512,
           imageQuality: 85,
         );
@@ -117,8 +198,14 @@ class _ProfilePageState extends State<ProfilePage> {
         name: isName ? value : widget.profile.name,
         about: isName ? widget.profile.about : value,
       );
-      await syncCloud(silent: true);
-      if (mounted) setState(() => feedback = 'Profile updated.');
+      final synced = await syncCloud(silent: true);
+      if (mounted && synced) {
+        setState(
+          () => feedback = signedIn
+              ? 'Profile updated.'
+              : 'Saved on this device.',
+        );
+      }
     } on ArgumentError catch (e) {
       if (mounted) setState(() => feedback = e.message.toString());
     } catch (_) {
@@ -134,13 +221,13 @@ class _ProfilePageState extends State<ProfilePage> {
     }
   }
 
-  Future<void> syncCloud({bool silent = false}) async {
+  Future<bool> syncCloud({bool silent = false}) async {
     final client = widget.client;
     if (client == null || client.auth.currentUser == null) {
       if (!silent && mounted) {
         setState(() => feedback = 'Sign in to sync your profile to the cloud.');
       }
-      return;
+      return true;
     }
     setState(() {
       busy = true;
@@ -158,10 +245,15 @@ class _ProfilePageState extends State<ProfilePage> {
         widget.profile.about,
       );
       if (mounted) {
-        setState(() => feedback = 'Profile synced to your cloud account.');
+        setState(() {
+          cloudUsername = username;
+          feedback = 'Profile synced to your cloud account.';
+        });
       }
+      return true;
     } catch (e) {
       if (mounted) setState(() => feedback = cloudError(e));
+      return false;
     } finally {
       if (mounted) setState(() => busy = false);
     }
@@ -236,11 +328,38 @@ class _ProfilePageState extends State<ProfilePage> {
               const Padding(
                 padding: EdgeInsets.symmetric(horizontal: 4),
                 child: Text(
-                  'This is your username in chats, not your login email. People find you by @username.',
+                  'This is your display name. People find your account by its unique @username.',
                   style: TextStyle(fontSize: 12, color: Color(0xFF66748A)),
                 ),
               ),
               const SizedBox(height: 16),
+              if (signedIn) ...[
+                _ProfileRow(
+                  icon: Icons.alternate_email,
+                  label: 'Username',
+                  value: cloudUsername == null
+                      ? 'Add a username'
+                      : '@$cloudUsername',
+                  onEdit: busy ? null : () => editAccountField(phone: false),
+                ),
+                const SizedBox(height: 16),
+                _ProfileRow(
+                  icon: Icons.phone_outlined,
+                  label: 'Phone number',
+                  value: cloudPhone?.isNotEmpty == true
+                      ? cloudPhone!
+                      : 'Optional — add a number',
+                  onEdit: busy ? null : () => editAccountField(phone: true),
+                ),
+                const Padding(
+                  padding: EdgeInsets.all(4),
+                  child: Text(
+                    'For contact discovery only. Not SMS-verified.',
+                    style: TextStyle(fontSize: 12),
+                  ),
+                ),
+                const SizedBox(height: 16),
+              ],
               _ProfileRow(
                 icon: Icons.info_outline,
                 label: 'About',
@@ -260,7 +379,7 @@ class _ProfilePageState extends State<ProfilePage> {
               const Padding(
                 padding: EdgeInsets.symmetric(horizontal: 4),
                 child: Text(
-                  'Your photo never leaves this phone yet. Photo sharing arrives with media messaging.',
+                  'Your profile photo is stored on this device. Profile-photo cloud sync is not yet available.',
                   style: TextStyle(fontSize: 12, color: Color(0xFF66748A)),
                 ),
               ),
@@ -281,6 +400,75 @@ class _ProfilePageState extends State<ProfilePage> {
         ),
       ),
     ),
+  );
+}
+
+class _AccountFieldDialog extends StatefulWidget {
+  const _AccountFieldDialog({required this.phone, required this.initial});
+  final bool phone;
+  final String initial;
+  @override
+  State<_AccountFieldDialog> createState() => _AccountFieldDialogState();
+}
+
+class _AccountFieldDialogState extends State<_AccountFieldDialog> {
+  late final controller = TextEditingController(text: widget.initial);
+  final form = GlobalKey<FormState>();
+  void save() {
+    if (form.currentState!.validate()) {
+      Navigator.pop(
+        context,
+        widget.phone
+            ? controller.text.trim()
+            : controller.text.trim().toLowerCase(),
+      );
+    }
+  }
+
+  @override
+  void dispose() {
+    controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: Text(widget.phone ? 'Phone number' : 'Username'),
+    content: Form(
+      key: form,
+      child: TextFormField(
+        controller: controller,
+        autofocus: true,
+        keyboardType: widget.phone ? TextInputType.phone : TextInputType.text,
+        autocorrect: false,
+        decoration: InputDecoration(
+          hintText: widget.phone ? '+14155552671' : 'your_username',
+          helperText: widget.phone
+              ? 'Leave blank to remove your number.'
+              : '3–24 letters, numbers or underscores.',
+        ),
+        validator: (value) {
+          final clean = (value ?? '').trim().toLowerCase();
+          if (widget.phone) {
+            return clean.isEmpty ||
+                    RegExp(r'^\+[1-9][0-9]{7,14}$').hasMatch(clean)
+                ? null
+                : 'Include + and your country code.';
+          }
+          return RegExp(r'^[a-z][a-z0-9_]{2,23}$').hasMatch(clean)
+              ? null
+              : 'Start with a letter; use 3–24 valid characters.';
+        },
+        onFieldSubmitted: (_) => save(),
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('Cancel'),
+      ),
+      FilledButton(onPressed: save, child: const Text('Save')),
+    ],
   );
 }
 

@@ -60,18 +60,30 @@ class SecureMessage {
   /// Server receipt timestamps (ISO-8601) once the tick poll reports them.
   final String? deliveredAt;
   final String? readAt;
+
   /// Retain only metadata for local deletion so redelivery cannot resurrect it.
   final bool hidden;
   static const deleteWindow = Duration(hours: 1);
 
-  bool canDeleteForEveryone(DateTime now) => mine && clientId.isNotEmpty &&
-      !hidden && !parseMessageBody(text).isTombstone &&
-      now.difference(at) >= Duration.zero && now.difference(at) <= deleteWindow;
+  bool canDeleteForEveryone(DateTime now) =>
+      mine &&
+      clientId.isNotEmpty &&
+      !hidden &&
+      !parseMessageBody(text).isTombstone &&
+      now.difference(at) >= Duration.zero &&
+      now.difference(at) <= deleteWindow;
 
   SecureMessage withBody(String body, {bool? hidden}) => SecureMessage(
-    text: body, mine: mine, at: at, clientId: clientId, status: status,
-    envelopeId: envelopeId, peerClientId: peerClientId,
-    deliveredAt: deliveredAt, readAt: readAt, hidden: hidden ?? this.hidden,
+    text: body,
+    mine: mine,
+    at: at,
+    clientId: clientId,
+    status: status,
+    envelopeId: envelopeId,
+    peerClientId: peerClientId,
+    deliveredAt: deliveredAt,
+    readAt: readAt,
+    hidden: hidden ?? this.hidden,
   );
   Map<String, dynamic> toJson() => {
     'text': text,
@@ -471,7 +483,9 @@ class ChatStore extends ChangeNotifier {
               messages.any((m) => m.envelopeId == envelopeId)) ||
           (clientId.isNotEmpty &&
               messages.any((m) => m.mine && m.clientId == clientId)) ||
-          (!mine && peerClientId != null && peerClientId.isNotEmpty &&
+          (!mine &&
+              peerClientId != null &&
+              peerClientId.isNotEmpty &&
               messages.any((m) => !m.mine && m.peerClientId == peerClientId))) {
         return;
       }
@@ -489,17 +503,25 @@ class ChatStore extends ChangeNotifier {
       // delivery. Only the author can retract or correct their own
       // message: deletes within one hour, edits within 15 minutes of the
       // send timestamp. Replacing in place preserves receipt metadata.
-      for (final control in messages.where((m) => parseMessageBody(m.text).isDelete || parseMessageBody(m.text).isEdit)) {
+      for (final control in messages.where(
+        (m) =>
+            parseMessageBody(m.text).isDelete ||
+            parseMessageBody(m.text).isEdit,
+      )) {
         final body = parseMessageBody(control.text);
         final target = body.target;
         if (target == null || target.isEmpty) continue;
-        final window = body.isDelete ? SecureMessage.deleteWindow : SecureMessage.editWindow;
+        final window = body.isDelete
+            ? SecureMessage.deleteWindow
+            : SecureMessage.editWindow;
         for (var i = 0; i < messages.length; i++) {
           final m = messages[i];
           final id = m.mine ? m.clientId : m.peerClientId;
           final age = control.at.difference(m.at);
-          if (m.mine == control.mine && id == target &&
-              age >= Duration.zero && age <= window) {
+          if (m.mine == control.mine &&
+              id == target &&
+              age >= Duration.zero &&
+              age <= window) {
             final original = parseMessageBody(m.text);
             if (original.isControl) continue;
             if (body.isDelete) {
@@ -513,11 +535,16 @@ class ChatStore extends ChangeNotifier {
         }
       }
       // Stable chronological ordering, including equal timestamps.
-      final ordered = messages.asMap().entries.toList()..sort((a, b) {
-        final time = a.value.at.compareTo(b.value.at);
-        return time == 0 ? a.key.compareTo(b.key) : time;
-      });
-      await _writeSecureMessages(accountId, peerId, ordered.map((e) => e.value).toList());
+      final ordered = messages.asMap().entries.toList()
+        ..sort((a, b) {
+          final time = a.value.at.compareTo(b.value.at);
+          return time == 0 ? a.key.compareTo(b.key) : time;
+        });
+      await _writeSecureMessages(
+        accountId,
+        peerId,
+        ordered.map((e) => e.value).toList(),
+      );
     });
   }
 
@@ -525,21 +552,35 @@ class ChatStore extends ChangeNotifier {
     final saved = preferences.getString(key);
     if (saved == null) return [];
     final rows = (jsonDecode(saved) as Map)['messages'] as List;
-    return rows.map((row) => SecureMessage.fromJson(Map<String, dynamic>.from(row as Map))).toList();
+    return rows
+        .map(
+          (row) =>
+              SecureMessage.fromJson(Map<String, dynamic>.from(row as Map)),
+        )
+        .toList();
   }
 
-  Future<void> _writeSecureMessages(String accountId, String peerId, List<SecureMessage> messages) async {
-    final ok = await preferences.setString(_secureKey(accountId, peerId),
-      jsonEncode({'messages': messages.map((m) => m.toJson()).toList()}));
+  Future<void> _writeSecureMessages(
+    String accountId,
+    String peerId,
+    List<SecureMessage> messages,
+  ) async {
+    final ok = await preferences.setString(
+      _secureKey(accountId, peerId),
+      jsonEncode({'messages': messages.map((m) => m.toJson()).toList()}),
+    );
     if (!ok) throw StateError('Secure save failed');
-    _syncSecureConversation(accountId, peerId,
+    _syncSecureConversation(
+      accountId,
+      peerId,
       messages.where((m) {
         if (m.hidden) return false;
         final kind = parseMessageBody(m.text);
         // Ballots stay for tallies; tombstones render. Delete, reaction
         // and edit markers are applied-then-dropped transport only.
         return !kind.isDelete && !kind.isReact && !kind.isEdit;
-      }).toList());
+      }).toList(),
+    );
     notifyListeners();
   }
 
@@ -573,13 +614,11 @@ class ChatStore extends ChangeNotifier {
     final saved = preferences.getString(key);
     if (saved == null) return [];
     try {
-      return _readSecureMessages(key)
-          .where((m) {
-            if (m.hidden) return false;
-            final kind = parseMessageBody(m.text);
-            return !kind.isDelete && !kind.isReact && !kind.isEdit;
-          })
-          .toList();
+      return _readSecureMessages(key).where((m) {
+        if (m.hidden) return false;
+        final kind = parseMessageBody(m.text);
+        return !kind.isDelete && !kind.isReact && !kind.isEdit;
+      }).toList();
     } catch (_) {
       storageWarning = 'Saved encrypted-chat history could not be read. The original data has been preserved.';
       return [];
@@ -607,37 +646,39 @@ class ChatStore extends ChangeNotifier {
     await _queueSecureWrite(key, () async {
       final saved = preferences.getString(key);
       if (saved == null) return;
-        final messages = _readSecureMessages(key);
-        var changed = false;
-        for (var i = 0; i < messages.length; i++) {
-          final m = messages[i];
-          if (m.mine && m.clientId == clientId) {
-            const ranks = {'sent': 0, 'delivered': 1, 'read': 2};
-            if (!ranks.containsKey(status)) continue;
-            final nextStatus = ranks[status]! >= (ranks[m.status] ?? 0) ? status : m.status;
-            final nextDelivered = deliveredAt ?? m.deliveredAt;
-            final nextRead = readAt ?? m.readAt;
-            if (m.status != nextStatus ||
-                m.deliveredAt != nextDelivered ||
-                m.readAt != nextRead) {
-              messages[i] = SecureMessage(
-                text: m.text,
-                mine: m.mine,
-                at: m.at,
-                clientId: m.clientId,
-                status: nextStatus,
-                hidden: m.hidden,
-                envelopeId: m.envelopeId,
-                peerClientId: m.peerClientId,
-                deliveredAt: nextDelivered,
-                readAt: nextRead,
-              );
-              changed = true;
-            }
+      final messages = _readSecureMessages(key);
+      var changed = false;
+      for (var i = 0; i < messages.length; i++) {
+        final m = messages[i];
+        if (m.mine && m.clientId == clientId) {
+          const ranks = {'sent': 0, 'delivered': 1, 'read': 2};
+          if (!ranks.containsKey(status)) continue;
+          final nextStatus = ranks[status]! >= (ranks[m.status] ?? 0)
+              ? status
+              : m.status;
+          final nextDelivered = deliveredAt ?? m.deliveredAt;
+          final nextRead = readAt ?? m.readAt;
+          if (m.status != nextStatus ||
+              m.deliveredAt != nextDelivered ||
+              m.readAt != nextRead) {
+            messages[i] = SecureMessage(
+              text: m.text,
+              mine: m.mine,
+              at: m.at,
+              clientId: m.clientId,
+              status: nextStatus,
+              hidden: m.hidden,
+              envelopeId: m.envelopeId,
+              peerClientId: m.peerClientId,
+              deliveredAt: nextDelivered,
+              readAt: nextRead,
+            );
+            changed = true;
           }
         }
-        if (!changed) return;
-        await _writeSecureMessages(accountId, peerId, messages);
+      }
+      if (!changed) return;
+      await _writeSecureMessages(accountId, peerId, messages);
     });
   }
 
@@ -670,11 +711,11 @@ class ChatStore extends ChangeNotifier {
       'openchat.pins.v1.$accountId-$peerId';
 
   Future<Set<String>> secureStars(String accountId, String peerId) async {
-    final list = preferences.getStringList(
-      _starKey(accountId, peerId),
-    );
+    final list = preferences.getStringList(_starKey(accountId, peerId));
     final available = getSecureConversation(accountId, peerId)
-        .where((m) => !parseMessageBody(m.text).isTombstone).map((m) => m.ref).toSet();
+        .where((m) => !parseMessageBody(m.text).isTombstone)
+        .map((m) => m.ref)
+        .toSet();
     return (list ?? <String>[]).toSet().intersection(available);
   }
 
@@ -684,25 +725,28 @@ class ChatStore extends ChangeNotifier {
     String ref,
   ) async {
     await _queueSecureWrite(_secureKey(accountId, peerId), () async {
-    final stars = await secureStars(accountId, peerId);
-    if (stars.contains(ref)) {
-      stars.remove(ref);
-    } else {
-      stars.add(ref);
-    }
-    await preferences.setStringList(
-      _starKey(accountId, peerId),
-      stars.toList(),
-    );
-    notifyListeners();
+      final stars = await secureStars(accountId, peerId);
+      if (stars.contains(ref)) {
+        stars.remove(ref);
+      } else {
+        stars.add(ref);
+      }
+      await preferences.setStringList(
+        _starKey(accountId, peerId),
+        stars.toList(),
+      );
+      notifyListeners();
     });
   }
 
   Future<List<String>> securePins(String accountId, String peerId) async {
     final available = getSecureConversation(accountId, peerId)
-        .where((m) => !parseMessageBody(m.text).isTombstone).map((m) => m.ref).toSet();
+        .where((m) => !parseMessageBody(m.text).isTombstone)
+        .map((m) => m.ref)
+        .toSet();
     return (preferences.getStringList(_pinKey(accountId, peerId)) ?? [])
-        .where(available.contains).toList();
+        .where(available.contains)
+        .toList();
   }
 
   /// Pin at most three messages without silently evicting an existing pin.
@@ -713,13 +757,16 @@ class ChatStore extends ChangeNotifier {
   ) async {
     var pinned = false;
     await _queueSecureWrite(_secureKey(accountId, peerId), () async {
-    final pins = await securePins(accountId, peerId);
-    if (pins.contains(ref)) { pinned = true; return; }
-    if (pins.length >= 3) return;
-    pins.add(ref);
-    await preferences.setStringList(_pinKey(accountId, peerId), pins);
-    pinned = true;
-    notifyListeners();
+      final pins = await securePins(accountId, peerId);
+      if (pins.contains(ref)) {
+        pinned = true;
+        return;
+      }
+      if (pins.length >= 3) return;
+      pins.add(ref);
+      await preferences.setStringList(_pinKey(accountId, peerId), pins);
+      pinned = true;
+      notifyListeners();
     });
     return pinned;
   }
@@ -730,10 +777,10 @@ class ChatStore extends ChangeNotifier {
     String ref,
   ) async {
     await _queueSecureWrite(_secureKey(accountId, peerId), () async {
-    final pins = await securePins(accountId, peerId);
-    pins.remove(ref);
-    await preferences.setStringList(_pinKey(accountId, peerId), pins);
-    notifyListeners();
+      final pins = await securePins(accountId, peerId);
+      pins.remove(ref);
+      await preferences.setStringList(_pinKey(accountId, peerId), pins);
+      notifyListeners();
     });
   }
 
@@ -758,19 +805,51 @@ class ChatStore extends ChangeNotifier {
     String peerId,
   ) {
     final saved = preferences.getString(_reactKey(accountId, peerId));
-    if (saved == null || saved.isEmpty) return {};
+    final result = <String, Map<String, String>>{};
     try {
-      final decoded = jsonDecode(saved) as Map<String, dynamic>;
-      return {
+      final decoded = jsonDecode(saved ?? '{}') as Map<String, dynamic>;
+      result.addAll({
         for (final entry in decoded.entries)
           entry.key: {
             for (final vote in (entry.value as Map).entries)
               vote.key.toString(): vote.value.toString(),
           },
-      };
-    } catch (_) {
-      return {};
+      });
+    } catch (_) {}
+    // Durable Signal control rows are the source of truth. A target carries
+    // the original author's account id, so it resolves on either device.
+    final messages = _readSecureMessages(_secureKey(accountId, peerId));
+    final targets = messages
+        .where((m) => !m.hidden && !parseMessageBody(m.text).isControl)
+        .toList();
+    for (final row in messages) {
+      final body = parseMessageBody(row.text);
+      if (!body.isReact) continue;
+      final matches = targets.where((m) {
+        final id = m.mine ? m.clientId : m.peerClientId;
+        if (id == null || id.isEmpty) return false;
+        return body.target == '${m.mine ? accountId : peerId}:$id' ||
+            body.target == id;
+      }).toList();
+      if (matches.length != 1) continue; // Reject ambiguous legacy ids.
+      final ref = matches.single.ref;
+      final votes = result.putIfAbsent(ref, () => {});
+      final own = row.mine ? 'mine' : 'peer';
+      final other = row.mine ? 'peer' : 'mine';
+      if (body.removed) {
+        if (votes[body.text] == own) votes.remove(body.text);
+        if (votes[body.text] == 'both') votes[body.text] = other;
+      } else {
+        // WhatsApp-style: each participant has one reaction per message.
+        for (final emoji in votes.keys.toList()) {
+          if (votes[emoji] == own) votes.remove(emoji);
+          if (votes[emoji] == 'both') votes[emoji] = other;
+        }
+        votes[body.text] = votes[body.text] == other ? 'both' : own;
+      }
+      if (votes.isEmpty) result.remove(ref);
     }
+    return result;
   }
 
   /// Applies an explicit reaction state (not a toggle), so redelivered
@@ -795,16 +874,14 @@ class ChatStore extends ChangeNotifier {
           ? (side == 'peer' || side == 'both')
           : (side == 'mine' || side == 'both');
       if (remove) {
-        if (!own) {
-          votes.remove(emoji);
-        } else if (other) {
+        if (other) {
           votes[emoji] = mine ? 'peer' : 'mine';
         } else {
           votes.remove(emoji);
         }
       } else if (!own && !other) {
         votes[emoji] = mine ? 'mine' : 'peer';
-      } else if (own != other) {
+      } else if (!own && other) {
         votes[emoji] = 'both';
       }
       if (votes.isEmpty) {
@@ -812,7 +889,10 @@ class ChatStore extends ChangeNotifier {
       } else {
         all[ref] = votes;
       }
-      await preferences.setString(_reactKey(accountId, peerId), jsonEncode(all));
+      await preferences.setString(
+        _reactKey(accountId, peerId),
+        jsonEncode(all),
+      );
       notifyListeners();
     });
   }
@@ -841,8 +921,7 @@ class ChatStore extends ChangeNotifier {
     notifyListeners();
   }
 
-  static String _unreadKey(String accountId) =>
-      'openchat.unread.v1.$accountId';
+  static String _unreadKey(String accountId) => 'openchat.unread.v1.$accountId';
 
   /// Manual mark-unread flags per peer. Incoming messages in the open chat
   /// are read; anything else is the user's explicit reminder.

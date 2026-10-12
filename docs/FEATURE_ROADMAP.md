@@ -22,8 +22,13 @@ stack: runtime permission, message/status/call channels, foreground
 realtime watchers (name-only nudges, no decryption outside the open chat),
 full-screen call ringing, tap routing (chat/status/calls), background FCM
 rendering, poke-on-send, and the `notify-send` Edge Function (data-only
-payloads; NEEDS the `FCM_SERVICE_ACCOUNT` secret before background
-delivery works).
+payloads; FCM_SERVICE_ACCOUNT configured and verified).
+
+**Device-verified on 2026-10-12:** two-device messaging (phone → emulator
+message arrived), blue read ticks, 😂 reaction chip, full message action
+sheet (Reply/React/Copy/Forward/Star/Pin/Info/Delete), FCM background
+notification delivered and posted (`numPostedByApp=1`), notification
+channels registered with correct importance.
 
 ## Basic messaging & text formatting (1–31)
 

@@ -55,7 +55,7 @@ async function googleAccessToken(sa: {
   });
   const key = await crypto.subtle.importKey(
     "pkcs8",
-    pemToBytes(sa.private_key),
+    new Uint8Array(pemToBytes(sa.private_key)).buffer,
     { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
     false,
     ["sign"],
@@ -67,6 +67,7 @@ async function googleAccessToken(sa: {
   );
   const assertion = `${header}.${claims}.${b64urlBytes(new Uint8Array(sig))}`;
   const res = await fetch(sa.token_uri, {
+    signal: AbortSignal.timeout(10000),
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
@@ -127,34 +128,70 @@ serve(async (req) => {
   // Service-role client: reads tokens + contact graph, never exposes them.
   const admin = createClient(supabaseUrl, serviceKey);
   let targets: string[] = [];
+  let eventId = '';
+  let video = false;
+  const recent = new Date(Date.now() - 120000).toISOString();
+  const { data: links, error: linkError } = await admin.from('contact_requests')
+    .select('sender_id,recipient_id').eq('status', 'accepted')
+    .or(`sender_id.eq.${me},recipient_id.eq.${me}`);
+  const { data: blocks, error: blockError } = await admin.from('contact_blocks')
+    .select('owner_id,blocked_id').or(`owner_id.eq.${me},blocked_id.eq.${me}`);
+  if (linkError || blockError) return json({ error: 'Contact lookup failed.' }, 503);
+  const blocked = new Set((blocks ?? []).map((r) => r.owner_id === me ? r.blocked_id : r.owner_id));
+  const accepted = [...new Set((links ?? []).map((r) => r.sender_id === me ? r.recipient_id : r.sender_id))]
+    .filter((id) => !blocked.has(id));
   if (kind === "message" || kind === "call") {
     const peer = typeof body.peer === "string" ? body.peer : "";
     if (!/^[0-9a-f-]{36}$/.test(peer) || peer === me) {
       return json({ error: "Invalid peer." }, 400);
     }
-    const { data: allowed } = await admin.rpc("messaging_allowed", { a: me, b: peer });
-    if (allowed !== true) return json({ delivered: 0 });
+    if (!accepted.includes(peer)) return json({ delivered: 0 });
+    if (kind === 'call') {
+      if (typeof body.invite !== 'string' || !/^[0-9a-f-]{36}$/.test(body.invite)) return json({ error: 'Invalid invite.' }, 400);
+      const { data: invite } = await admin.from('call_invites').select('id,call_type,created_at')
+        .eq('id', body.invite).eq('caller_id', me).eq('callee_id', peer).eq('status', 'ringing')
+        .gt('created_at', new Date(Date.now() - 60000).toISOString()).maybeSingle();
+      if (!invite) return json({ delivered: 0 });
+      eventId = invite.id;
+      video = invite.call_type === 'video';
+    } else {
+      // The caller cannot fabricate notification content or send a nudge
+      // without a recent, authenticated message to this recipient.
+      const { data: pending, error: pendingError } = await admin.from('message_envelopes')
+        .select('client_message_id,created_at').eq('sender_id', me).eq('recipient_id', peer)
+        .gt('created_at', recent).order('created_at', { ascending: false }).limit(1);
+      const { data: acked, error: ackError } = await admin.from('envelope_receipts')
+        .select('client_message_id,sent_at').eq('sender_id', me).eq('recipient_id', peer)
+        .gt('sent_at', recent).order('sent_at', { ascending: false }).limit(1);
+      if (pendingError || ackError) return json({ error: 'Message lookup failed.' }, 503);
+      const events = [...(pending ?? []).map((r) => ({ id: r.client_message_id, at: r.created_at })),
+        ...(acked ?? []).map((r) => ({ id: r.client_message_id, at: r.sent_at }))];
+      events.sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+      if (!events.length) return json({ delivered: 0 });
+      eventId = events[0].id;
+    }
     targets = [peer];
   } else {
-    // Status: fan out to every accepted contact (service role reads the
-    // contact graph directly; list_my_contacts needs a user session).
-    const { data: rows } = await admin
-      .from("contact_requests")
-      .select("sender_id,recipient_id")
-      .eq("status", "accepted")
-      .or(`sender_id.eq.${me},recipient_id.eq.${me}`);
-    targets = (rows ?? []).map((r: { sender_id: string; recipient_id: string }) =>
-      r.sender_id === me ? r.recipient_id : r.sender_id,
-    );
+    const { data: statuses, error } = await admin.from('status_updates')
+      .select('id,audience,audience_user_ids').eq('author_id', me).gt('created_at', recent)
+      .gt('expires_at', new Date().toISOString()).order('created_at', { ascending: false }).limit(1);
+    if (error) return json({ error: 'Status lookup failed.' }, 503);
+    const status = statuses?.[0];
+    if (!status) return json({ delivered: 0 });
+    eventId = status.id;
+    const audience: string[] = status.audience_user_ids ?? [];
+    targets = accepted.filter((id) => status.audience === 'contacts' ||
+      (status.audience === 'only' && audience.includes(id)) ||
+      (status.audience === 'except' && !audience.includes(id)));
   }
   if (targets.length === 0) return json({ delivered: 0 });
 
-  const { data: tokens } = await admin
+  const { data: tokens, error: tokenError } = await admin
     .from("push_tokens")
-    .select("token")
-    .in_("user_id", targets);
-  const deviceTokens = ((tokens ?? []) as { token: string }[]).map((t) => t.token);
-  if (deviceTokens.length === 0) return json({ delivered: 0 });
+    .select("token,user_id")
+    .in("user_id", targets);
+  if (tokenError) return json({ error: 'Device lookup failed.' }, 503);
+  if (!tokens?.length) return json({ delivered: 0, reason: 'no_registered_devices' });
 
   const data: Record<string, string> =
     kind === "message"
@@ -164,7 +201,7 @@ serve(async (req) => {
             kind,
             peer: me,
             invite: typeof body.invite === "string" ? body.invite : "",
-            video: body.video === true ? "true" : "false",
+            video: video ? "true" : "false",
             name: myName,
           }
         : { kind, peer: me, name: myName, snippet: "" };
@@ -181,25 +218,35 @@ serve(async (req) => {
   }
 
   let delivered = 0;
-  for (const token of deviceTokens) {
+  let failed = 0;
+  for (const { token, user_id: recipient } of tokens) {
+    const { data: claimed, error } = await admin.rpc('claim_notification_dispatch',
+      { p_actor: me, p_recipient: recipient, p_kind: kind, p_event: eventId });
+    if (error) return json({ error: 'Dispatch registration failed.' }, 503);
+    if (!claimed) continue;
     try {
       const res = await fetch(
         `https://fcm.googleapis.com/v1/projects/${sa.project_id}/messages:send`,
         {
           method: "POST",
+          signal: AbortSignal.timeout(10000),
           headers: {
             Authorization: `Bearer ${access}`,
             "Content-Type": "application/json",
           },
           body: JSON.stringify({
-            message: { token, data, android: { priority: "high" } },
+            message: { token, data: { ...data, event: eventId, recipient }, android: { priority: "high", ttl: kind === 'call' ? '60s' : '3600s' } },
           }),
         },
       );
-      if (res.ok) delivered++;
+      if (res.ok) {
+        delivered++;
+        await admin.from('notification_dispatches').update({ sent: true })
+          .eq('actor_id', me).eq('recipient_id', recipient).eq('kind', kind).eq('event_id', eventId);
+      } else { failed++; }
     } catch {
-      // One dead token must not fail the batch.
+      failed++;
     }
   }
-  return json({ delivered });
+  return json({ delivered, failed }, failed && !delivered ? 502 : 200);
 });

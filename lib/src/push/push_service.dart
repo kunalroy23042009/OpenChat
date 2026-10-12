@@ -20,6 +20,17 @@ Future<void> pushBackgroundHandler(RemoteMessage message) async {
   }
   try {
     await NotifyService.instance.init();
+    await renderPushMessage(message, background: true);
+  } catch (_) {
+    // A failed background render must never crash the isolate.
+  }
+}
+
+Future<void> renderPushMessage(
+  RemoteMessage message, {
+  bool background = false,
+}) async {
+  try {
     final data = message.data;
     switch (data['kind']) {
       case 'message':
@@ -28,6 +39,8 @@ Future<void> pushBackgroundHandler(RemoteMessage message) async {
         await NotifyService.instance.showMessage(
           peerId: peer,
           name: _orContact(data['name'] as String?),
+          event: data['event'] as String?,
+          ignoreOpenChats: background,
         );
       case 'call':
         final invite = data['invite'] as String? ?? '';
@@ -44,6 +57,7 @@ Future<void> pushBackgroundHandler(RemoteMessage message) async {
           authorId: author,
           name: _orContact(data['name'] as String?),
           snippet: data['snippet'] as String? ?? '',
+          event: data['event'] as String?,
         );
     }
   } catch (_) {
@@ -64,6 +78,7 @@ class PushService {
 
   final FirebaseMessaging? _messaging;
   StreamSubscription<String>? _refreshSubscription;
+  StreamSubscription<RemoteMessage>? _foregroundSubscription;
   PushState state = PushState.disabled;
   String? lastError;
 
@@ -82,6 +97,14 @@ class PushService {
         return state;
       }
       FirebaseMessaging.onBackgroundMessage(pushBackgroundHandler);
+      await NotifyService.instance.init();
+      await _foregroundSubscription?.cancel();
+      _foregroundSubscription = FirebaseMessaging.onMessage.listen((message) {
+        final recipient = message.data['recipient'];
+        if (client?.auth.currentUser?.id == recipient) {
+          unawaited(renderPushMessage(message));
+        }
+      });
       final userId = client?.auth.currentUser?.id;
       if (userId != null) {
         await _upload(messaging, client!);
@@ -137,5 +160,6 @@ class PushService {
 
   Future<void> dispose() async {
     await _refreshSubscription?.cancel();
+    await _foregroundSubscription?.cancel();
   }
 }

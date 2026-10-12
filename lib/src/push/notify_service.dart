@@ -59,6 +59,36 @@ class NotifyService {
   Future<void> Function(NotifyTap tap)? onTap;
 
   bool _ready = false;
+  final Set<String> _shownEvents = {};
+
+  /// Stable across background isolates and process restarts; types occupy
+  /// separate namespaces so a status cannot replace a chat notification.
+  static int notificationId(String kind, String id) {
+    var hash = 2166136261;
+    for (final unit in '$kind:$id'.codeUnits) {
+      hash = ((hash ^ unit) * 16777619) & 0x7fffffff;
+    }
+    return hash;
+  }
+
+  Future<NotifyTap?> launchTap() async {
+    if (!_ready) return null;
+    try {
+      final launch = await _plugin.getNotificationAppLaunchDetails();
+      return launch?.didNotificationLaunchApp == true
+          ? NotifyTap.decode(launch?.notificationResponse?.payload)
+          : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  bool _newEvent(String kind, String? event) {
+    if (event == null) return true;
+    if (!_shownEvents.add('$kind:$event')) return false;
+    if (_shownEvents.length > 500) _shownEvents.remove(_shownEvents.first);
+    return true;
+  }
 
   Future<void> init() async {
     if (_ready) return;
@@ -72,8 +102,10 @@ class NotifyService {
         },
       );
       if (ok != true) return;
-      final impl = _plugin.resolvePlatformSpecificImplementation<
-          AndroidFlutterLocalNotificationsPlugin>();
+      final impl = _plugin
+          .resolvePlatformSpecificImplementation<
+            AndroidFlutterLocalNotificationsPlugin
+          >();
       await impl?.createNotificationChannel(
         const AndroidNotificationChannel(
           messagesChannel,
@@ -136,17 +168,21 @@ class NotifyService {
   Future<void> showMessage({
     required String peerId,
     required String name,
+    String? event,
+    bool ignoreOpenChats = false,
   }) async {
     if (!_ready) return;
-    if (!shouldNotifyMessage(
-      myId: null,
-      senderId: peerId,
-      openPeers: openChats,
-    )) {
+    if (!ignoreOpenChats &&
+        !shouldNotifyMessage(
+          myId: null,
+          senderId: peerId,
+          openPeers: openChats,
+        )) {
       return;
     }
+    if (!_newEvent('msg', event)) return;
     await _plugin.show(
-      id: peerId.hashCode & 0x7fffffff,
+      id: notificationId('msg', peerId),
       title: name,
       body: 'New message',
       notificationDetails: const NotificationDetails(
@@ -170,7 +206,7 @@ class NotifyService {
   }) async {
     if (!_ready) return;
     await _plugin.show(
-      id: inviteId.hashCode & 0x7fffffff,
+      id: notificationId('call', inviteId),
       title: 'Incoming ${video ? 'video' : 'voice'} call',
       body: name,
       notificationDetails: NotificationDetails(
@@ -183,6 +219,7 @@ class NotifyService {
           fullScreenIntent: true,
           ongoing: true,
           autoCancel: false,
+          timeoutAfter: 60000,
         ),
       ),
       payload: NotifyTap(kind: 'call', peer: inviteId, name: name).encode(),
@@ -191,17 +228,19 @@ class NotifyService {
 
   Future<void> cancelCall(String inviteId) {
     if (!_ready) return Future.value();
-    return _plugin.cancel(id: inviteId.hashCode & 0x7fffffff);
+    return _plugin.cancel(id: notificationId('call', inviteId));
   }
 
   Future<void> showStatus({
     required String authorId,
     required String name,
     required String snippet,
+    String? event,
   }) async {
     if (!_ready) return;
+    if (!_newEvent('status', event)) return;
     await _plugin.show(
-      id: authorId.hashCode & 0x7fffffff,
+      id: notificationId('status', authorId),
       title: '$name posted a status',
       body: snippet.isEmpty ? 'Tap to view' : snippet,
       notificationDetails: const NotificationDetails(
@@ -217,7 +256,7 @@ class NotifyService {
 
   Future<void> cancelChat(String peerId) {
     if (!_ready) return Future.value();
-    return _plugin.cancel(id: peerId.hashCode & 0x7fffffff);
+    return _plugin.cancel(id: notificationId('msg', peerId));
   }
 
   /// Best-effort poke after a user-visible send so a killed/background peer

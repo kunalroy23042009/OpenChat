@@ -117,10 +117,9 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
       // valid server bundle: force republication and rebuild sessions, or
       // the peer keeps encrypting to a dead identity.
       final freshIdentity = init?['fresh'] == true;
-      final status = await channel.invokeMapMethod<String, dynamic>(
-        'status',
-        {'accountId': accountId},
-      );
+      final status = await channel.invokeMapMethod<String, dynamic>('status', {
+        'accountId': accountId,
+      });
       _ownFingerprint = status?['fingerprint'] as String?;
       await _publishKeys(force: freshIdentity);
       await _ensureSession();
@@ -185,19 +184,16 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
 
   Future<void> _ensureSessionFor(String peerId) async {
     // Native returns {'hasSession': bool}, not a bare bool.
-    final sessionState =
-        await channel.invokeMapMethod('signalHasSession', {
-          'accountId': accountId,
-          'peerId': peerId,
-        });
+    final sessionState = await channel.invokeMapMethod('signalHasSession', {
+      'accountId': accountId,
+      'peerId': peerId,
+    });
     if (sessionState?['hasSession'] == true) return;
     // Server uses snake_case; the native bridge expects camelCase.
-    final claimed =
-        await widget.client.rpc(
-              'claim_key_bundle',
-              params: {'p_user_id': peerId},
-            )
-            as Map<String, dynamic>;
+    final claimed = await widget.client.rpc(
+      'claim_key_bundle',
+      params: {'p_user_id': peerId},
+    ) as Map<String, dynamic>;
     if (peerId == widget.peerId) {
       _peerIdentityKey = claimed['identity_key'] as String?;
       if (mounted) setState(() {});
@@ -243,7 +239,9 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
   Future<void> _onEnvelope(Map<String, dynamic> record) {
     // Realtime and polling can deliver the same Signal packet concurrently.
     // Serialize decryption as well as storage so the ratchet advances once.
-    _receiveQueue = _receiveQueue.catchError((_) {}).then((_) => _receiveEnvelope(record));
+    _receiveQueue = _receiveQueue
+        .catchError((_) {})
+        .then((_) => _receiveEnvelope(record));
     return _receiveQueue;
   }
 
@@ -263,17 +261,13 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
     String? plainText;
     for (final candidate in candidates) {
       try {
-        final decrypted =
-            await channel.invokeMethod('signalDecrypt', {
-              'accountId': accountId,
-              'peerId': sender,
-              'type': candidate.key,
-              'body': candidate.value,
-            })
-                as Map<dynamic, dynamic>;
-        plainText = utf8.decode(
-          base64Decode(decrypted['plain'] as String),
-        );
+        final decrypted = await channel.invokeMethod('signalDecrypt', {
+          'accountId': accountId,
+          'peerId': sender,
+          'type': candidate.key,
+          'body': candidate.value,
+        }) as Map<dynamic, dynamic>;
+        plainText = utf8.decode(base64Decode(decrypted['plain'] as String));
         break;
       } catch (_) {}
     }
@@ -302,21 +296,6 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
       return;
     }
     try {
-      final body = parseMessageBody(plainText);
-      if (body.isReact && body.target != null) {
-        // Explicit set/remove state converges on redelivery; no row stored.
-        await widget.store.applySecureReaction(
-          accountId,
-          sender,
-          body.target!,
-          body.text,
-          mine: false,
-          remove: body.removed,
-        );
-        if (mounted) setState(() {});
-        await _ack(id);
-        return;
-      }
       await widget.store.addSecureMessage(
         accountId,
         sender,
@@ -415,8 +394,10 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
           .toList();
       if (pending.isEmpty) return;
       final start = _tickOffset % pending.length;
-      final ids = List.generate(min(50, pending.length),
-          (i) => pending[(start + i) % pending.length].clientId);
+      final ids = List.generate(
+        min(50, pending.length),
+        (i) => pending[(start + i) % pending.length].clientId,
+      );
       _tickOffset = (start + ids.length) % pending.length;
       final result = await widget.client.rpc(
         'message_statuses',
@@ -476,7 +457,11 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
       // Corrections are not new arrivals; only fresh text/replies poke.
       if (sent && edit == null) {
         unawaited(
-          NotifyService.poke(widget.client, kind: 'message', peer: widget.peerId),
+          NotifyService.poke(
+            widget.client,
+            kind: 'message',
+            peer: widget.peerId,
+          ),
         );
       }
     }
@@ -489,7 +474,9 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
     final peerId = toPeer ?? widget.peerId;
     try {
       final random = Random.secure();
-      final localId = base64UrlEncode(List<int>.generate(24, (_) => random.nextInt(256)));
+      final localId = base64UrlEncode(
+        List<int>.generate(24, (_) => random.nextInt(256)),
+      );
       await _ensureSessionFor(peerId);
       final result = await channel.invokeMethod('signalEncrypt', {
         'accountId': accountId,
@@ -497,19 +484,17 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
         'plain': base64Encode(utf8.encode(plainText)),
       }) as Map<dynamic, dynamic>;
       // Prefix the Signal message type; the envelope has no type column.
-      final queued =
-          await widget.client.rpc(
-                'enqueue_message',
-                params: {
-                  'p_recipient_id': peerId,
-                  'p_client_message_id': localId,
-                  'p_ciphertext': EnvelopeCodec.encode(
-                    result['type'] as int,
-                    result['body'] as String,
-                  ),
-                },
-              )
-              as Map<String, dynamic>;
+      final queued = await widget.client.rpc(
+        'enqueue_message',
+        params: {
+          'p_recipient_id': peerId,
+          'p_client_message_id': localId,
+          'p_ciphertext': EnvelopeCodec.encode(
+            result['type'] as int,
+            result['body'] as String,
+          ),
+        },
+      ) as Map<String, dynamic>;
       switch (queued['status']) {
         case 'sent':
         case 'duplicate':
@@ -519,8 +504,10 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
             plainText,
             mine: true,
             clientId: localId,
-            at: DateTime.tryParse(queued['created_at'] as String? ?? '') ??
-                DateTime.tryParse(queued['expires_at'] as String? ?? '')?.subtract(const Duration(days: 7)),
+            at:
+                DateTime.tryParse(queued['created_at'] as String? ?? '') ??
+                DateTime.tryParse(queued['expires_at'] as String? ?? '')
+                    ?.subtract(const Duration(days: 7)),
           );
           if (mounted) {
             setState(() {});
@@ -531,12 +518,18 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
         case 'rate_limited':
           throw StateError('Daily send limit reached. Try again tomorrow.');
         case 'unavailable':
-          throw StateError('Contact unavailable. They may have blocked you or removed the connection.');
+          throw StateError(
+            'Contact unavailable. They may have blocked you or removed the connection.',
+          );
         default:
           throw StateError('Message rejected by the server.');
       }
     } catch (e) {
-      if (mounted) setState(() => _error = e is StateError ? e.message.toString() : 'Message could not be sent. Check your connection and try again.');
+      if (mounted) {
+        setState(
+          () => _error = e is StateError ? e.message.toString() : 'Message could not be sent. Check your connection and try again.',
+        );
+      }
       return false;
     }
   }
@@ -595,9 +588,7 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
     );
     if (choice == null || !mounted) return;
     if (choice.startsWith('video_')) {
-      await _pickAndSendVideo(
-        choice == 'video_camera',
-      );
+      await _pickAndSendVideo(choice == 'video_camera');
       return;
     }
     XFile? picked;
@@ -657,10 +648,7 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
       _error = null;
     });
     try {
-      final sealed = await media.uploadSealed(
-        File(picked.path),
-        widget.peerId,
-      );
+      final sealed = await media.uploadSealed(File(picked.path), widget.peerId);
       final sent = await _transmit(
         encodeImageBody(
           sealed.path,
@@ -671,7 +659,11 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
       );
       if (sent && mounted) {
         unawaited(
-          NotifyService.poke(widget.client, kind: 'message', peer: widget.peerId),
+          NotifyService.poke(
+            widget.client,
+            kind: 'message',
+            peer: widget.peerId,
+          ),
         );
       }
     } catch (e) {
@@ -735,9 +727,8 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                 ),
                 if (options.length < 8)
                   TextButton.icon(
-                    onPressed: () => setDialog(
-                      () => options.add(TextEditingController()),
-                    ),
+                    onPressed: () =>
+                        setDialog(() => options.add(TextEditingController())),
                     icon: const Icon(Icons.add),
                     label: const Text('Add option'),
                   ),
@@ -883,7 +874,11 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
       );
       if (sent && mounted) {
         unawaited(
-          NotifyService.poke(widget.client, kind: 'message', peer: widget.peerId),
+          NotifyService.poke(
+            widget.client,
+            kind: 'message',
+            peer: widget.peerId,
+          ),
         );
       }
     } catch (e) {
@@ -932,7 +927,8 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
             _FingerprintRow(
               label: widget.peerName,
               fingerprint: peerPrint,
-              fallback: 'No session yet — open the chat online to fetch their key.',
+              fallback:
+                  'No session yet — open the chat online to fetch their key.',
             ),
             const SizedBox(height: 16),
             if (trusted == false)
@@ -959,7 +955,9 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                               widget.peerId,
                               peerPrint!,
                             );
-                            if (sheetContext.mounted) Navigator.pop(sheetContext);
+                            if (sheetContext.mounted) {
+                              Navigator.pop(sheetContext);
+                            }
                           },
                     child: const Text('Mark verified'),
                   ),
@@ -1011,100 +1009,100 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
   void _beginReply(SecureMessage msg) {
     final body = parseMessageBody(msg.text);
     if (body.isDelete || body.isVote || body.isTombstone) return;
-    setState(() => _replyTo = (
-      ref: msg.ref,
-      name: msg.mine ? (widget.profile.name.isEmpty ? 'Sender' : widget.profile.name) : widget.peerName,
-      quote: _quoteSummary(body),
-    ));
+    setState(
+      () => _replyTo = (
+        ref: msg.ref,
+        name: msg.mine
+            ? (widget.profile.name.isEmpty ? 'Sender' : widget.profile.name)
+            : widget.peerName,
+        quote: _quoteSummary(body),
+      ),
+    );
   }
 
   /// WhatsApp-style long-press menu for one message.
   Future<void> _messageActions(SecureMessage msg) async {
     final body = parseMessageBody(msg.text);
     if (body.isTombstone) return;
-    final stars = await widget.store.secureStars(
-      accountId,
-      widget.peerId,
-    );
+    final stars = await widget.store.secureStars(accountId, widget.peerId);
     final pins = await widget.store.securePins(accountId, widget.peerId);
     if (!mounted) return;
     final action = await showModalBottomSheet<String>(
       context: context,
       showDragHandle: true,
       builder: (ctx) => SafeArea(
-        child: SingleChildScrollView(child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            if (!body.isVote && !body.isDelete)
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (!body.isVote && !body.isDelete)
+                ListTile(
+                  leading: const Icon(Icons.reply_outlined),
+                  title: const Text('Reply'),
+                  onTap: () => Navigator.pop(ctx, 'reply'),
+                ),
+              if (!body.isVote &&
+                  !body.isDelete &&
+                  !body.isReact &&
+                  !body.isEdit)
+                ListTile(
+                  leading: const Icon(Icons.emoji_emotions_outlined),
+                  title: const Text('React'),
+                  onTap: () => Navigator.pop(ctx, 'react'),
+                ),
+              if (body.text.isNotEmpty || body.question != null)
+                ListTile(
+                  leading: const Icon(Icons.copy_outlined),
+                  title: const Text('Copy'),
+                  onTap: () => Navigator.pop(ctx, 'copy'),
+                ),
+              if (msg.canEdit(DateTime.now()))
+                ListTile(
+                  leading: const Icon(Icons.edit_outlined),
+                  title: const Text('Edit'),
+                  subtitle: const Text('Within 15 minutes of sending'),
+                  onTap: () => Navigator.pop(ctx, 'edit'),
+                ),
               ListTile(
-                leading: const Icon(Icons.reply_outlined),
-                title: const Text('Reply'),
-                onTap: () => Navigator.pop(ctx, 'reply'),
+                leading: const Icon(Icons.forward_outlined),
+                title: const Text('Forward'),
+                onTap: () => Navigator.pop(ctx, 'forward'),
               ),
-            if (!body.isVote &&
-                !body.isDelete &&
-                !body.isReact &&
-                !body.isEdit)
-              ListTile(
-                leading: const Icon(Icons.emoji_emotions_outlined),
-                title: const Text('React'),
-                onTap: () => Navigator.pop(ctx, 'react'),
-              ),
-            if (body.text.isNotEmpty || body.question != null)
-              ListTile(
-                leading: const Icon(Icons.copy_outlined),
-                title: const Text('Copy'),
-                onTap: () => Navigator.pop(ctx, 'copy'),
-              ),
-            if (msg.canEdit(DateTime.now()))
-              ListTile(
-                leading: const Icon(Icons.edit_outlined),
-                title: const Text('Edit'),
-                subtitle: const Text('Within 15 minutes of sending'),
-                onTap: () => Navigator.pop(ctx, 'edit'),
-              ),
-            ListTile(
-              leading: const Icon(Icons.forward_outlined),
-              title: const Text('Forward'),
-              onTap: () => Navigator.pop(ctx, 'forward'),
-            ),
-            ListTile(
-              leading: Icon(
-                stars.contains(msg.ref)
-                    ? Icons.star
-                    : Icons.star_outline,
-              ),
-              title: Text(
-                stars.contains(msg.ref) ? 'Unstar' : 'Star',
-              ),
-              onTap: () => Navigator.pop(ctx, 'star'),
-            ),
-            ListTile(
-              leading: const Icon(Icons.push_pin_outlined),
-              title: Text(pins.contains(msg.ref) ? 'Unpin' : 'Pin'),
-              onTap: () => Navigator.pop(ctx, 'pin'),
-            ),
-            if (msg.mine) ListTile(
-              leading: const Icon(Icons.info_outline),
-              title: const Text('Info'),
-              onTap: () => Navigator.pop(ctx, 'info'),
-            ),
-            ListTile(
-              leading: const Icon(Icons.delete_outline),
-              title: const Text('Delete for me'),
-              onTap: () => Navigator.pop(ctx, 'deleteme'),
-            ),
-            if (msg.canDeleteForEveryone(DateTime.now()))
               ListTile(
                 leading: Icon(
-                  Icons.delete_forever_outlined,
-                  color: Theme.of(ctx).colorScheme.error,
+                  stars.contains(msg.ref) ? Icons.star : Icons.star_outline,
                 ),
-                title: const Text('Delete for everyone'),
-                onTap: () => Navigator.pop(ctx, 'deleteall'),
+                title: Text(stars.contains(msg.ref) ? 'Unstar' : 'Star'),
+                onTap: () => Navigator.pop(ctx, 'star'),
               ),
-          ],
-        )),
+              ListTile(
+                leading: const Icon(Icons.push_pin_outlined),
+                title: Text(pins.contains(msg.ref) ? 'Unpin' : 'Pin'),
+                onTap: () => Navigator.pop(ctx, 'pin'),
+              ),
+              if (msg.mine)
+                ListTile(
+                  leading: const Icon(Icons.info_outline),
+                  title: const Text('Info'),
+                  onTap: () => Navigator.pop(ctx, 'info'),
+                ),
+              ListTile(
+                leading: const Icon(Icons.delete_outline),
+                title: const Text('Delete for me'),
+                onTap: () => Navigator.pop(ctx, 'deleteme'),
+              ),
+              if (msg.canDeleteForEveryone(DateTime.now()))
+                ListTile(
+                  leading: Icon(
+                    Icons.delete_forever_outlined,
+                    color: Theme.of(ctx).colorScheme.error,
+                  ),
+                  title: const Text('Delete for everyone'),
+                  onTap: () => Navigator.pop(ctx, 'deleteall'),
+                ),
+            ],
+          ),
+        ),
       ),
     );
     if (action == null || !mounted) return;
@@ -1116,14 +1114,12 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
             ? '${body.question ?? ''}\n${(body.options ?? []).join('\n')}'
             : (body.isReply
                   ? body.text
-                  : (body.text.isNotEmpty
-                        ? body.text
-                        : _quoteSummary(body)));
+                  : (body.text.isNotEmpty ? body.text : _quoteSummary(body)));
         await Clipboard.setData(ClipboardData(text: copyText));
         if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Copied to clipboard')),
-          );
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(const SnackBar(content: Text('Copied to clipboard')));
         }
       case 'react':
         await _reactPicker(msg);
@@ -1144,21 +1140,14 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
       case 'forward':
         await _forwardPicker(body);
       case 'star':
-        await widget.store.toggleSecureStar(
+        await widget.store.toggleSecureStar(accountId, widget.peerId, msg.ref);
+        final starred = (await widget.store.secureStars(
           accountId,
           widget.peerId,
-          msg.ref,
-        );
-        final starred = (await widget.store.secureStars(accountId, widget.peerId)).contains(msg.ref);
+        )).contains(msg.ref);
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text(
-                starred
-                    ? 'Starred.'
-                    : 'Unstarred.',
-              ),
-            ),
+            SnackBar(content: Text(starred ? 'Starred.' : 'Unstarred.')),
           );
         }
       case 'pin':
@@ -1216,7 +1205,11 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
         );
         if (confirmed == true) {
           if (!msg.canDeleteForEveryone(DateTime.now())) {
-            if (mounted) setState(() => _error = 'The one-hour deletion window has ended.');
+            if (mounted) {
+              setState(
+                () => _error = 'The one-hour deletion window has ended.',
+              );
+            }
             return;
           }
           await _transmit(encodeDeleteBody(msg.clientId));
@@ -1229,12 +1222,12 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
     List<CloudContact> contacts = [];
     try {
       contacts = (await SupabaseContactsRepository(
-            widget.client,
-          ).contacts())
-          .where((c) => c.status == 'accepted')
-          .toList();
+        widget.client,
+      ).contacts()).where((c) => c.status == 'accepted').toList();
     } catch (_) {
-      if (mounted) setState(() => _error = 'Contacts could not be loaded. Try again.');
+      if (mounted) {
+        setState(() => _error = 'Contacts could not be loaded. Try again.');
+      }
       return;
     }
     if (!mounted) return;
@@ -1242,34 +1235,34 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
       context: context,
       showDragHandle: true,
       builder: (ctx) => SafeArea(
-        child: SingleChildScrollView(child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Padding(
-              padding: EdgeInsets.all(16),
-              child: Text(
-                'Forward to…',
-                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
-              ),
-            ),
-            if (contacts.isEmpty)
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
               const Padding(
-                padding: EdgeInsets.all(24),
-                child: Text('No connected contacts yet.'),
-              ),
-            for (final c in contacts)
-              ListTile(
-                leading: CircleAvatar(
-                  child: Text(
-                    c.name.isEmpty ? '?' : c.name[0].toUpperCase(),
-                  ),
+                padding: EdgeInsets.all(16),
+                child: Text(
+                  'Forward to…',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
                 ),
-                title: Text(c.name),
-                subtitle: Text('@${c.username}'),
-                onTap: () => Navigator.pop(ctx, c),
               ),
-          ],
-        )),
+              if (contacts.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.all(24),
+                  child: Text('No connected contacts yet.'),
+                ),
+              for (final c in contacts)
+                ListTile(
+                  leading: CircleAvatar(
+                    child: Text(c.name.isEmpty ? '?' : c.name[0].toUpperCase()),
+                  ),
+                  title: Text(c.name),
+                  subtitle: Text('@${c.username}'),
+                  onTap: () => Navigator.pop(ctx, c),
+                ),
+            ],
+          ),
+        ),
       ),
     );
     if (target == null || !mounted) return;
@@ -1279,14 +1272,22 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
       final sent = await _transmit(forwarded, toPeer: target.userId);
       if (sent && mounted) {
         unawaited(
-          NotifyService.poke(widget.client, kind: 'message', peer: target.userId),
+          NotifyService.poke(
+            widget.client,
+            kind: 'message',
+            peer: target.userId,
+          ),
         );
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Forwarded to ${target.name}.')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Forwarded to ${target.name}.')));
       }
     } catch (e) {
-      if (mounted) setState(() => _error = 'The message could not be forwarded. Try again.');
+      if (mounted) {
+        setState(
+          () => _error = 'The message could not be forwarded. Try again.',
+        );
+      }
     }
   }
 
@@ -1324,11 +1325,8 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                       ? 'Remove $e'
                       : 'React $e',
                   style: IconButton.styleFrom(
-                    backgroundColor:
-                        (votes[e] == 'mine' || votes[e] == 'both')
-                        ? Theme.of(
-                            ctx,
-                          ).colorScheme.primaryContainer
+                    backgroundColor: (votes[e] == 'mine' || votes[e] == 'both')
+                        ? Theme.of(ctx).colorScheme.primaryContainer
                         : null,
                   ),
                   onPressed: () => Navigator.pop(ctx, e),
@@ -1351,17 +1349,19 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
     String emoji,
     bool mineNow,
   ) async {
-    await widget.store.applySecureReaction(
-      accountId,
-      widget.peerId,
-      msg.ref,
-      emoji,
-      mine: true,
-      remove: mineNow,
-    );
+    final id = msg.mine ? msg.clientId : msg.peerClientId;
+    if (id == null || id.isEmpty) {
+      if (mounted) {
+        setState(
+          () =>
+              _error = 'This older message has no shared reaction identifier.',
+        );
+      }
+      return;
+    }
     final sent = await _transmit(
       encodeReactBody(
-        msg.mine ? msg.clientId : (msg.peerClientId ?? msg.envelopeId ?? ''),
+        '${msg.mine ? accountId : widget.peerId}:$id',
         emoji,
         remove: mineNow,
       ),
@@ -1369,14 +1369,6 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
     // Revert the optimistic apply when nothing left the device. Unknown
     // legacy rows have no sender key and cannot be targeted remotely.
     if (!sent && mounted) {
-      await widget.store.applySecureReaction(
-        accountId,
-        widget.peerId,
-        msg.ref,
-        emoji,
-        mine: true,
-        remove: !mineNow,
-      );
       setState(() => _error = 'Reaction failed. Check your connection.');
     }
   }
@@ -1410,11 +1402,7 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                 style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
               ),
               const SizedBox(height: 16),
-              _InfoRow(
-                icon: Icons.check,
-                label: 'Sent',
-                value: sent,
-              ),
+              _InfoRow(icon: Icons.check, label: 'Sent', value: sent),
               _InfoRow(
                 icon: Icons.done_all,
                 label: 'Delivered',
@@ -1435,18 +1423,13 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
 
   /// Every starred message in this chat, newest last.
   Future<void> _showStarred() async {
-    final stars = await widget.store.secureStars(
-      accountId,
-      widget.peerId,
-    );
+    final stars = await widget.store.secureStars(accountId, widget.peerId);
     if (!mounted) return;
     final messages = widget.store.getSecureConversation(
       accountId,
       widget.peerId,
     );
-    final starred = messages
-        .where((m) => stars.contains(m.ref))
-        .toList();
+    final starred = messages.where((m) => stars.contains(m.ref)).toList();
     await showDialog<void>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -1514,14 +1497,9 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                 for (final ref in pins)
                   ListTile(
                     contentPadding: EdgeInsets.zero,
-                    leading: const Icon(
-                      Icons.push_pin_outlined,
-                      size: 18,
-                    ),
+                    leading: const Icon(Icons.push_pin_outlined, size: 18),
                     title: Text(
-                      _quoteSummary(
-                        parseMessageBody(lookup(ref)?.text ?? ''),
-                      ),
+                      _quoteSummary(parseMessageBody(lookup(ref)?.text ?? '')),
                       maxLines: 2,
                       overflow: TextOverflow.ellipsis,
                     ),
@@ -1581,9 +1559,8 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                   hintText: 'Search in conversation…',
                   border: InputBorder.none,
                 ),
-                onChanged: (v) => setState(
-                  () => _searchQuery = v.trim().toLowerCase(),
-                ),
+                onChanged: (v) =>
+                    setState(() => _searchQuery = v.trim().toLowerCase()),
               )
             : Text(widget.peerName),
 
@@ -1641,7 +1618,9 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                     );
                   } catch (e) {
                     if (!mounted) return;
-                    messenger.showSnackBar(SnackBar(content: Text('Error: $e')));
+                    messenger.showSnackBar(
+                      SnackBar(content: Text('Error: $e')),
+                    );
                   }
                 case 'link':
                   final link =
@@ -1655,9 +1634,14 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
               }
             },
             itemBuilder: (context) => const [
-              PopupMenuItem(value: 'starred', child: ListTile(
-                contentPadding: EdgeInsets.zero, leading: Icon(Icons.star_outline), title: Text('Starred messages'),
-              )),
+              PopupMenuItem(
+                value: 'starred',
+                child: ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: Icon(Icons.star_outline),
+                  title: Text('Starred messages'),
+                ),
+              ),
               PopupMenuItem(
                 value: 'verify',
                 child: ListTile(
@@ -1709,19 +1693,15 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                       // Ballots and delete markers travel as messages but never
                       // render as bubbles; ballots feed tallies, markers are
                       // applied then dropped.
-                      final visible = msgs
-                          .where(
-                            (m) {
-                              final kind = parseMessageBody(m.text);
-                              if (kind.isVote || kind.isDelete) return false;
-                              if (_searchQuery.isNotEmpty &&
-                                  !_searchText(m).contains(_searchQuery)) {
-                                return false;
-                              }
-                              return true;
-                            },
-                          )
-                          .toList();
+                      final visible = msgs.where((m) {
+                        final kind = parseMessageBody(m.text);
+                        if (kind.isVote || kind.isDelete) return false;
+                        if (_searchQuery.isNotEmpty &&
+                            !_searchText(m).contains(_searchQuery)) {
+                          return false;
+                        }
+                        return true;
+                      }).toList();
                       if (visible.isEmpty) {
                         return Center(
                           child: Text(
@@ -1850,9 +1830,25 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                           }
                           return GestureDetector(
                             key: ValueKey(msg.ref),
-                            onHorizontalDragEnd: body.isTombstone ? null : (details) {
-                              if ((details.primaryVelocity ?? 0) > 100) _beginReply(msg);
-                            },
+                            onHorizontalDragEnd: body.isTombstone
+                                ? null
+                                : (details) {
+                                    if ((details.primaryVelocity ?? 0) > 100) {
+                                      _beginReply(msg);
+                                    }
+                                  },
+                            // WhatsApp-style double-tap to heart.
+                            onDoubleTap: body.isTombstone
+                                ? null
+                                : () {
+                                    final side =
+                                        (reactions[msg.ref] ?? {})['❤️'];
+                                    _toggleReaction(
+                                      msg,
+                                      '❤️',
+                                      side == 'mine' || side == 'both',
+                                    );
+                                  },
                             onLongPress: body.isTombstone
                                 ? null
                                 : () => _messageActions(msg),
@@ -1896,17 +1892,13 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                                                     BorderRadius.circular(12),
                                                 border:
                                                     (entry.value == 'mine' ||
-                                                            entry.value ==
-                                                                'both')
-                                                        ? Border.all(
-                                                            color:
-                                                                Theme.of(
-                                                                      context,
-                                                                    )
-                                                                    .colorScheme
-                                                                    .primary,
-                                                          )
-                                                        : null,
+                                                        entry.value == 'both')
+                                                    ? Border.all(
+                                                        color: Theme.of(context)
+                                                            .colorScheme
+                                                            .primary,
+                                                      )
+                                                    : null,
                                               ),
                                               child: Text(
                                                 entry.key,
@@ -2001,9 +1993,7 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                                 style: TextStyle(
                                   fontWeight: FontWeight.w700,
                                   fontSize: 12,
-                                  color: Theme.of(
-                                    context,
-                                  ).colorScheme.primary,
+                                  color: Theme.of(context).colorScheme.primary,
                                 ),
                               ),
                               Text(
@@ -2019,8 +2009,7 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                           tooltip: 'Cancel reply',
                           visualDensity: VisualDensity.compact,
                           icon: const Icon(Icons.close, size: 18),
-                          onPressed: () =>
-                              setState(() => _replyTo = null),
+                          onPressed: () => setState(() => _replyTo = null),
                         ),
                       ],
                     ),
@@ -2052,9 +2041,7 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                                 style: TextStyle(
                                   fontWeight: FontWeight.w700,
                                   fontSize: 12,
-                                  color: Theme.of(
-                                    context,
-                                  ).colorScheme.tertiary,
+                                  color: Theme.of(context).colorScheme.tertiary,
                                 ),
                               ),
                               Text(
@@ -2081,40 +2068,40 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                 Row(
                   crossAxisAlignment: CrossAxisAlignment.end,
                   children: [
-                IconButton(
-                  tooltip: 'Attach photo, video, or poll',
-                  onPressed: _sendingMedia ? null : _pickAndSendImage,
-                  icon: _sendingMedia
-                      ? const SizedBox(
-                          width: 20,
-                          height: 20,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.attach_file),
-                ),
-                Expanded(
-                  child: TextField(
-                    controller: composer,
-                    minLines: 1,
-                    maxLines: 5,
-                    maxLength: 4000,
-                    textCapitalization: TextCapitalization.sentences,
-                    decoration: const InputDecoration(
-                      hintText: 'Write a message…',
-                      counterText: '',
+                    IconButton(
+                      tooltip: 'Attach photo, video, or poll',
+                      onPressed: _sendingMedia ? null : _pickAndSendImage,
+                      icon: _sendingMedia
+                          ? const SizedBox(
+                              width: 20,
+                              height: 20,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.attach_file),
                     ),
-                    onSubmitted: (_) => _send(),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                IconButton.filled(
-                  tooltip: 'Send',
-                   onPressed: _sendingText ? null : _send,
-                  icon: const Icon(Icons.send),
+                    Expanded(
+                      child: TextField(
+                        controller: composer,
+                        minLines: 1,
+                        maxLines: 5,
+                        maxLength: 4000,
+                        textCapitalization: TextCapitalization.sentences,
+                        decoration: const InputDecoration(
+                          hintText: 'Write a message…',
+                          counterText: '',
+                        ),
+                        onSubmitted: (_) => _send(),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    IconButton.filled(
+                      tooltip: 'Send',
+                      onPressed: _sendingText ? null : _send,
+                      icon: const Icon(Icons.send),
+                    ),
+                  ],
                 ),
               ],
-            ),
-            ],
             ),
           ),
         ],
@@ -2124,7 +2111,12 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
 }
 
 class _InfoRow extends StatelessWidget {
-  const _InfoRow({required this.icon, required this.label, required this.value, this.accent = false});
+  const _InfoRow({
+    required this.icon,
+    required this.label,
+    required this.value,
+    this.accent = false,
+  });
   final IconData icon;
   final String label;
   final String value;
@@ -2133,8 +2125,12 @@ class _InfoRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) => ListTile(
     contentPadding: EdgeInsets.zero,
-    leading: Icon(icon, color: accent ? Theme.of(context).colorScheme.primary : null),
-    title: Text(label), subtitle: Text(value),
+    leading: Icon(
+      icon,
+      color: accent ? Theme.of(context).colorScheme.primary : null,
+    ),
+    title: Text(label),
+    subtitle: Text(value),
   );
 }
 
@@ -2174,7 +2170,7 @@ class _Ticks {
   };
   static Color color(String status, bool mine) {
     if (!mine) return const Color(0xFF66748A);
-    if (status == 'read') return const Color(0xFF7DD3FC);
+    if (status == 'read') return const Color(0xFF53BDEB);
     return Colors.white70;
   }
 }
@@ -2252,9 +2248,7 @@ class _SecureImageBubbleState extends State<_SecureImageBubble> {
       margin: const EdgeInsets.only(bottom: 12),
       padding: const EdgeInsets.all(6),
       decoration: BoxDecoration(
-        color: widget.mine
-            ? const Color(0xFF245CDB)
-            : const Color(0xFFE9EDF4),
+        color: widget.mine ? const Color(0xFF245CDB) : const Color(0xFFE9EDF4),
         borderRadius: const BorderRadius.all(Radius.circular(18)),
       ),
       child: Column(
@@ -2306,9 +2300,7 @@ class _SecureImageBubbleState extends State<_SecureImageBubble> {
               child: SelectableText(
                 widget.caption,
                 style: TextStyle(
-                  color: widget.mine
-                      ? Colors.white
-                      : const Color(0xFF22334E),
+                  color: widget.mine ? Colors.white : const Color(0xFF22334E),
                   fontSize: 14,
                 ),
               ),
@@ -2386,9 +2378,11 @@ class _SecureVideoBubbleState extends State<_SecureVideoBubble> {
         widget.thumbKey != null &&
         widget.thumbNonce != null) {
       try {
-        return await ChatMedia(
-          widget.client,
-        ).downloadSealed(widget.thumbPath!, widget.thumbKey!, widget.thumbNonce!);
+        return await ChatMedia(widget.client).downloadSealed(
+          widget.thumbPath!,
+          widget.thumbKey!,
+          widget.thumbNonce!,
+        );
       } catch (_) {
         return null;
       }
@@ -2408,17 +2402,14 @@ class _SecureVideoBubbleState extends State<_SecureVideoBubble> {
     if (widget.imageKey == null || widget.imageNonce == null) return;
     final messenger = ScaffoldMessenger.of(context);
     try {
-      final bytes = await ChatMedia(
-        widget.client,
-      ).downloadSealed(widget.path, widget.imageKey!, widget.imageNonce!);
+      final bytes = await ChatMedia(widget.client)
+          .downloadSealed(widget.path, widget.imageKey!, widget.imageNonce!);
       if (!mounted) return;
       await Navigator.push(
         context,
         MaterialPageRoute<void>(
-          builder: (_) => SealedVideoScreen(
-            bytes: bytes,
-            caption: widget.caption,
-          ),
+          builder: (_) =>
+              SealedVideoScreen(bytes: bytes, caption: widget.caption),
         ),
       );
     } catch (_) {
@@ -2440,9 +2431,7 @@ class _SecureVideoBubbleState extends State<_SecureVideoBubble> {
       margin: const EdgeInsets.only(bottom: 12),
       padding: const EdgeInsets.all(6),
       decoration: BoxDecoration(
-        color: widget.mine
-            ? const Color(0xFF245CDB)
-            : const Color(0xFFE9EDF4),
+        color: widget.mine ? const Color(0xFF245CDB) : const Color(0xFFE9EDF4),
         borderRadius: const BorderRadius.all(Radius.circular(18)),
       ),
       child: Column(
@@ -2477,10 +2466,7 @@ class _SecureVideoBubbleState extends State<_SecureVideoBubble> {
                     const Center(
                       child: CircleAvatar(
                         backgroundColor: Colors.black54,
-                        child: Icon(
-                          Icons.play_arrow,
-                          color: Colors.white,
-                        ),
+                        child: Icon(Icons.play_arrow, color: Colors.white),
                       ),
                     ),
                     Positioned(
@@ -2515,9 +2501,7 @@ class _SecureVideoBubbleState extends State<_SecureVideoBubble> {
               child: SelectableText(
                 widget.caption,
                 style: TextStyle(
-                  color: widget.mine
-                      ? Colors.white
-                      : const Color(0xFF22334E),
+                  color: widget.mine ? Colors.white : const Color(0xFF22334E),
                   fontSize: 14,
                 ),
               ),
@@ -2662,9 +2646,7 @@ class _SecurePollBubbleState extends State<_SecurePollBubble> {
               final count = i < counts.length ? counts[i] : 0;
               final frac = total == 0 ? 0.0 : count / total;
               final isMine = selected.contains(i);
-              final fg = widget.mine
-                  ? Colors.white
-                  : const Color(0xFF22334E);
+              final fg = widget.mine ? Colors.white : const Color(0xFF22334E);
               return InkWell(
                 onTap: () => setState(() {
                   if (widget.multi) {
@@ -2811,34 +2793,61 @@ class _SecureBubble extends StatelessWidget {
       decoration: BoxDecoration(
         color: mine ? const Color(0xFF245CDB) : const Color(0xFFE9EDF4),
         borderRadius: const BorderRadius.all(Radius.circular(18)),
-        boxShadow: mine ? [BoxShadow(color: Colors.black26, blurRadius: 2, offset: const Offset(0, 1))] : null,
+        boxShadow: mine
+            ? [
+                BoxShadow(
+                  color: Colors.black26,
+                  blurRadius: 2,
+                  offset: const Offset(0, 1),
+                ),
+              ]
+            : null,
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.end,
         children: [
-          if (quoteText != null) Container(
-            width: double.infinity,
-            margin: const EdgeInsets.only(bottom: 8),
-            padding: const EdgeInsets.all(8),
-            decoration: BoxDecoration(
-              color: mine ? Colors.white12 : Colors.black12,
-              border: Border(left: BorderSide(color: mine ? Colors.white70 : const Color(0xFF245CDB), width: 3)),
-              borderRadius: BorderRadius.circular(4),
-            ),
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text(quoteName ?? '', style: TextStyle(fontWeight: FontWeight.bold, color: mine ? Colors.white : const Color(0xFF22334E))),
-              Text.rich(
-                TextSpan(
-                  children: formatMessageSpans(
-                    quoteText!,
-                    TextStyle(color: mine ? Colors.white70 : const Color(0xFF22334E)),
+          if (quoteText != null)
+            Container(
+              width: double.infinity,
+              margin: const EdgeInsets.only(bottom: 8),
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: mine ? Colors.white12 : Colors.black12,
+                border: Border(
+                  left: BorderSide(
+                    color: mine ? Colors.white70 : const Color(0xFF245CDB),
+                    width: 3,
                   ),
                 ),
-                maxLines: 3,
-                overflow: TextOverflow.ellipsis,
+                borderRadius: BorderRadius.circular(4),
               ),
-            ]),
-          ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    quoteName ?? '',
+                    style: TextStyle(
+                      fontWeight: FontWeight.bold,
+                      color: mine ? Colors.white : const Color(0xFF22334E),
+                    ),
+                  ),
+                  Text.rich(
+                    TextSpan(
+                      children: formatMessageSpans(
+                        quoteText!,
+                        TextStyle(
+                          color: mine
+                              ? Colors.white70
+                              : const Color(0xFF22334E),
+                        ),
+                      ),
+                    ),
+                    maxLines: 3,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ],
+              ),
+            ),
           // Plain Text, not SelectableText: in-place selection registers
           // competing long-press recognizers that swallow the message
           // action sheet (on device and in tests). Copy lives in the
@@ -2875,9 +2884,7 @@ class _SecureBubble extends StatelessWidget {
                       '${time.hour.toString().padLeft(2, "0")}:${time.minute.toString().padLeft(2, "0")}',
                   style: TextStyle(
                     fontSize: 10,
-                    color: mine
-                        ? Colors.white70
-                        : const Color(0xFF66748A),
+                    color: mine ? Colors.white70 : const Color(0xFF66748A),
                   ),
                 ),
                 if (mine && !deleted)
