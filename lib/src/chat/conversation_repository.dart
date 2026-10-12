@@ -409,9 +409,8 @@ class ConversationRepository extends ChangeNotifier {
 
       // Never replace the in-memory thread with a network page. A refresh can
       // race with a send or realtime insert; replacing here would make older
-      // messages appear to vanish. Merge by id and keep one stable
-      // chronological ordering: the reverse ListView pins the list end
-      // (newest) to the bottom edge.
+      // messages appear to vanish. Merge by id and keep one stable newest-first
+      // ordering: the reversed ListView renders index 0 at the bottom edge.
       final byId = <String, GroupMessage>{
         for (final message in _messages[conversationId] ?? <GroupMessage>[])
           message.id: message,
@@ -420,7 +419,7 @@ class ConversationRepository extends ChangeNotifier {
         byId[message.id] = message;
       }
       final merged = byId.values.toList()
-        ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+        ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
       _messages[conversationId] = merged;
       notifyListeners();
     } catch (e) {

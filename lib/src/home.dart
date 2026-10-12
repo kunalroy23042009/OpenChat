@@ -1418,10 +1418,10 @@ class _ChatPaneState extends State<ChatPane> {
           child: ListenableBuilder(
             listenable: widget.store,
             builder: (context, _) {
-              // Chronological storage + reversed list = newest at the
-              // bottom, opening scrolled there. (Never pre-reverse: that
-              // pins the newest message to the top.)
-              final messages = widget.chat.messages;
+              // Newest-first feed into the reversed list: index 0 renders
+              // at the bottom edge, so the newest message sits at the
+              // bottom like every messenger.
+              final messages = widget.chat.messages.reversed.toList();
               if (messages.isEmpty && !widget.chat.isTyping) {
                 return const Center(
                   child: Text('Your conversation starts here. Say hello!'),
@@ -1438,7 +1438,7 @@ class _ChatPaneState extends State<ChatPane> {
                 ),
                 itemCount: totalCount,
                 itemBuilder: (context, i) {
-                  if (widget.chat.isTyping && i == messages.length) {
+                  if (widget.chat.isTyping && i == 0) {
                     return Align(
                       alignment: Alignment.centerLeft,
                       child: Container(
@@ -1474,7 +1474,8 @@ class _ChatPaneState extends State<ChatPane> {
                       ),
                     );
                   }
-                  final message = messages[i];
+                  final messageIndex = widget.chat.isTyping ? i - 1 : i;
+                  final message = messages[messageIndex];
                   return WhatsAppBubble(
                     text: message.text,
                     isMine: message.mine,

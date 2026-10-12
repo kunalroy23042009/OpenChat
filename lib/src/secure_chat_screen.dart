@@ -968,16 +968,16 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                       final records = msgs
                           .map((m) => (text: m.text, mine: m.mine))
                           .toList();
-                      // Chronological storage + reversed list = newest at
-                      // the bottom: reverse:true pins index 0 (oldest) to
-                      // the bottom edge and opens scrolled there.
+                      // Newest at the bottom: the reversed list lays index
+                      // 0 at the bottom edge, so feed newest-first.
+                      final ordered = visible.reversed.toList();
                       return ListView.builder(
                         controller: scroll,
                         reverse: true,
                         padding: const EdgeInsets.all(16),
-                        itemCount: visible.length,
+                        itemCount: ordered.length,
                         itemBuilder: (context, i) {
-                          final msg = visible[i];
+                          final msg = ordered[i];
                           final body = parseMessageBody(msg.text);
                           if (body.isPoll &&
                               body.pollId != null &&
