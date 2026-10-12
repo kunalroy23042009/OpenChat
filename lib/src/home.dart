@@ -533,43 +533,55 @@ class _ChatHomeState extends State<ChatHome> {
             ),
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 24),
-              child: SingleChildScrollView(
-                scrollDirection: Axis.horizontal,
-                child: Row(
-                  children: [
-                    ChoiceChip(
-                      label: const Text('All chats'),
-                      selected: filter == 'all',
-                      onSelected: (_) => setState(() => filter = 'all'),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      child: Row(
+                        children: [
+                          ChoiceChip(
+                            label: const Text('All chats'),
+                            selected: filter == 'all',
+                            onSelected: (_) =>
+                                setState(() => filter = 'all'),
+                          ),
+                          const SizedBox(width: 8),
+                          ChoiceChip(
+                            label: const Text('Unread'),
+                            selected: filter == 'unread',
+                            onSelected: (_) =>
+                                setState(() => filter = 'unread'),
+                          ),
+                          const SizedBox(width: 8),
+                          ChoiceChip(
+                            label: const Text('Favourites'),
+                            selected: filter == 'favourites',
+                            onSelected: (_) =>
+                                setState(() => filter = 'favourites'),
+                          ),
+                          const SizedBox(width: 8),
+                          ChoiceChip(
+                            avatar: const Icon(
+                              Icons.archive_outlined,
+                              size: 18,
+                            ),
+                            label: const Text('Archived'),
+                            selected: archivedOpen,
+                            onSelected: (_) => setState(
+                              () => archivedOpen = !archivedOpen,
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
-                    const SizedBox(width: 8),
-                    ChoiceChip(
-                      label: const Text('Unread'),
-                      selected: filter == 'unread',
-                      onSelected: (_) => setState(() => filter = 'unread'),
-                    ),
-                    const SizedBox(width: 8),
-                    ChoiceChip(
-                      label: const Text('Favourites'),
-                      selected: filter == 'favourites',
-                      onSelected: (_) => setState(() => filter = 'favourites'),
-                    ),
-                    const SizedBox(width: 8),
-                    ChoiceChip(
-                      avatar: const Icon(Icons.archive_outlined, size: 18),
-                      label: const Text('Archived'),
-                      selected: archivedOpen,
-                      onSelected: (_) =>
-                          setState(() => archivedOpen = !archivedOpen),
-                    ),
-                    const SizedBox(width: 8),
-                    IconButton(
-                      tooltip: 'New conversation',
-                      onPressed: () => newChat(wide),
-                      icon: const Icon(Icons.edit_square),
-                    ),
-                  ],
-                ),
+                  ),
+                  IconButton(
+                    tooltip: 'New conversation',
+                    onPressed: () => newChat(wide),
+                    icon: const Icon(Icons.edit_square),
+                  ),
+                ],
               ),
             ),
             const SizedBox(height: 16),
@@ -1406,7 +1418,10 @@ class _ChatPaneState extends State<ChatPane> {
           child: ListenableBuilder(
             listenable: widget.store,
             builder: (context, _) {
-              final messages = widget.chat.messages.reversed.toList();
+              // Chronological storage + reversed list = newest at the
+              // bottom, opening scrolled there. (Never pre-reverse: that
+              // pins the newest message to the top.)
+              final messages = widget.chat.messages;
               if (messages.isEmpty && !widget.chat.isTyping) {
                 return const Center(
                   child: Text('Your conversation starts here. Say hello!'),
@@ -1423,7 +1438,7 @@ class _ChatPaneState extends State<ChatPane> {
                 ),
                 itemCount: totalCount,
                 itemBuilder: (context, i) {
-                  if (widget.chat.isTyping && i == 0) {
+                  if (widget.chat.isTyping && i == messages.length) {
                     return Align(
                       alignment: Alignment.centerLeft,
                       child: Container(
@@ -1459,8 +1474,7 @@ class _ChatPaneState extends State<ChatPane> {
                       ),
                     );
                   }
-                  final messageIndex = widget.chat.isTyping ? i - 1 : i;
-                  final message = messages[messageIndex];
+                  final message = messages[i];
                   return WhatsAppBubble(
                     text: message.text,
                     isMine: message.mine,
@@ -1519,20 +1533,17 @@ class _ChatPaneState extends State<ChatPane> {
               },
             ),
             IconButton(
-              icon: const Icon(Icons.attach_file, color: Colors.grey),
+              tooltip: 'Attachments live in encrypted chats',
               onPressed: () {
-                showModalBottomSheet<void>(
-                  context: context,
-                  backgroundColor: Colors.transparent,
-                  builder: (_) => WhatsAppAttachmentSheet(
-                    onPick: (label) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(content: Text('Selected attachment: $label')),
-                      );
-                    },
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text(
+                      'Photos, videos, and polls send from encrypted chats.',
+                    ),
                   ),
                 );
               },
+              icon: const Icon(Icons.attach_file, color: Colors.grey),
             ),
             Expanded(
               child: Container(

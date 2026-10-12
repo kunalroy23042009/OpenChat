@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'call_flow.dart';
@@ -128,32 +127,6 @@ class _CallHistoryPageState extends State<CallHistoryPage> {
       ),
       body: ListView(
         children: [
-          ListTile(
-            leading: CircleAvatar(
-              backgroundColor: theme.colorScheme.primary.withValues(
-                alpha: 0.15,
-              ),
-              child: Icon(Icons.link, color: theme.colorScheme.primary),
-            ),
-            title: const Text(
-              'Create call link',
-              style: TextStyle(fontWeight: FontWeight.bold),
-            ),
-            subtitle: const Text('Share a link for your OpenChat call'),
-            onTap: () {
-              final token = DateTime.now().microsecondsSinceEpoch.toRadixString(
-                36,
-              );
-              Clipboard.setData(
-                ClipboardData(text: 'https://openchat.app/call/$token'),
-              );
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text('E2EE call link copied to clipboard'),
-                ),
-              );
-            },
-          ),
           const Padding(
             padding: EdgeInsets.fromLTRB(16, 16, 16, 8),
             child: Text(

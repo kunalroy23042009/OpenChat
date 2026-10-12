@@ -236,7 +236,10 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
             mine: false,
             envelopeId: id,
           );
-          if (mounted) setState(() {});
+          if (mounted) {
+            setState(() {});
+            _stickToBottom();
+          }
           await _ack(id);
         } catch (_) {}
       }
@@ -250,7 +253,10 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
         mine: false,
         envelopeId: id.isEmpty ? null : id,
       );
-      if (mounted) setState(() {});
+      if (mounted) {
+        setState(() {});
+        _stickToBottom();
+      }
       await _ack(id);
     } catch (_) {
       // Storage failed: do not ack, so the envelope is retried next poll.
@@ -330,6 +336,14 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
     } catch (_) {}
   }
 
+  /// Keeps the view pinned to the newest message, but only when the
+  /// user is already near the bottom (never yanks reading history).
+  void _stickToBottom() {
+    if (scroll.hasClients && scroll.offset < 120) {
+      scroll.jumpTo(0);
+    }
+  }
+
   Future<void> _send() async {
     final text = composer.text.trim();
     if (text.isEmpty || text.length > 4000) return;
@@ -372,7 +386,10 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
             mine: true,
             clientId: localId,
           );
-          if (mounted) setState(() {});
+          if (mounted) {
+            setState(() {});
+            _stickToBottom();
+          }
         case 'rate_limited':
           throw StateError('Daily send limit reached. Try again tomorrow.');
         case 'unavailable':
@@ -951,6 +968,9 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                       final records = msgs
                           .map((m) => (text: m.text, mine: m.mine))
                           .toList();
+                      // Chronological storage + reversed list = newest at
+                      // the bottom: reverse:true pins index 0 (oldest) to
+                      // the bottom edge and opens scrolled there.
                       return ListView.builder(
                         controller: scroll,
                         reverse: true,
@@ -1210,12 +1230,17 @@ class _SecureImageBubbleState extends State<_SecureImageBubble> {
                 onTap: () => _openLightbox(bytes),
                 child: ClipRRect(
                   borderRadius: BorderRadius.circular(12),
-                  child: Image.memory(
-                    bytes,
-                    fit: BoxFit.cover,
-                    errorBuilder: (context, _, _) => const SizedBox(
-                      height: 120,
-                      child: Center(child: Icon(Icons.broken_image_outlined)),
+                  // WhatsApp-style fixed preview: tap opens the full image.
+                  child: SizedBox(
+                    height: 260,
+                    width: double.infinity,
+                    child: Image.memory(
+                      bytes,
+                      fit: BoxFit.cover,
+                      errorBuilder: (context, _, _) => const SizedBox(
+                        height: 120,
+                        child: Center(child: Icon(Icons.broken_image_outlined)),
+                      ),
                     ),
                   ),
                 ),

@@ -124,7 +124,7 @@ class _WelcomeStep extends StatelessWidget {
             ),
             const SizedBox(height: 16),
             const Text(
-              'A local demo for now. Real end-to-end encrypted messaging arrives in the next milestone.',
+              'Private by design. Your keys stay on your phone, and chats are end-to-end encrypted.',
               textAlign: TextAlign.center,
               style: TextStyle(fontSize: 12, color: Color(0xFF66748A)),
             ),
