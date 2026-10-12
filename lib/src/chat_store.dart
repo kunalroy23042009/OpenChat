@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'ai/ai_service.dart';
+import 'media/media_message.dart';
 
 class ChatMessage {
   ChatMessage({required this.text, required this.mine, required this.at});
@@ -30,6 +31,10 @@ class SecureMessage {
     this.clientId = '',
     this.status = 'sent',
     this.envelopeId,
+    this.peerClientId,
+    this.deliveredAt,
+    this.readAt,
+    this.hidden = false,
   });
 
   /// Decrypted body: raw text or an encoded image body.
@@ -47,6 +52,27 @@ class SecureMessage {
   /// Server envelope id; used to dedupe inbox redelivery. Null for legacy
   /// rows and local echoes created before ticks existed.
   final String? envelopeId;
+
+  /// Sender's client id on incoming rows (from the envelope metadata), so
+  /// delete-for-everyone markers can match either side's identifier.
+  final String? peerClientId;
+
+  /// Server receipt timestamps (ISO-8601) once the tick poll reports them.
+  final String? deliveredAt;
+  final String? readAt;
+  /// Retain only metadata for local deletion so redelivery cannot resurrect it.
+  final bool hidden;
+  static const deleteWindow = Duration(hours: 1);
+
+  bool canDeleteForEveryone(DateTime now) => mine && clientId.isNotEmpty &&
+      !hidden && !parseMessageBody(text).isTombstone &&
+      now.difference(at) >= Duration.zero && now.difference(at) <= deleteWindow;
+
+  SecureMessage withBody(String body, {bool? hidden}) => SecureMessage(
+    text: body, mine: mine, at: at, clientId: clientId, status: status,
+    envelopeId: envelopeId, peerClientId: peerClientId,
+    deliveredAt: deliveredAt, readAt: readAt, hidden: hidden ?? this.hidden,
+  );
   Map<String, dynamic> toJson() => {
     'text': text,
     'mine': mine,
@@ -54,6 +80,10 @@ class SecureMessage {
     'clientId': clientId,
     'status': status,
     'envelopeId': envelopeId,
+    'peerClientId': peerClientId,
+    'deliveredAt': deliveredAt,
+    'readAt': readAt,
+    'hidden': hidden,
   };
   factory SecureMessage.fromJson(Map<String, dynamic> json) => SecureMessage(
     text: json['text'] as String,
@@ -62,7 +92,19 @@ class SecureMessage {
     clientId: json['clientId'] as String? ?? '',
     status: json['status'] as String? ?? 'sent',
     envelopeId: json['envelopeId'] as String?,
+    peerClientId: json['peerClientId'] as String?,
+    deliveredAt: json['deliveredAt'] as String?,
+    readAt: json['readAt'] as String?,
+    hidden: json['hidden'] as bool? ?? false,
   );
+
+  /// Stable identity for star/pin/delete: the sender-side key when known,
+  /// else the envelope id, else a content fingerprint for legacy rows.
+  String get ref {
+    final id = mine ? clientId : (peerClientId ?? envelopeId ?? '');
+    if (id.isNotEmpty) return '${mine ? 'out' : 'in'}:$id';
+    return '${mine ? 'out' : 'in'}:${at.toIso8601String()}:$text';
+  }
 }
 
 class Conversation {
@@ -404,34 +446,22 @@ class ChatStore extends ChangeNotifier {
     required bool mine,
     String clientId = '',
     String? envelopeId,
+    String? peerClientId,
     DateTime? at,
   }) async {
     final key = _secureKey(accountId, peerId);
     await _queueSecureWrite(key, () async {
-      final saved = preferences.getString(key);
-      List<SecureMessage> messages;
-      if (saved == null) {
-        messages = [];
-      } else {
-        try {
-          final raw = (jsonDecode(saved) as Map)['messages'] as List;
-          messages = raw
-              .map(
-                (m) =>
-                    SecureMessage.fromJson(Map<String, dynamic>.from(m as Map)),
-              )
-              .toList();
-        } catch (_) {
-          messages = [];
-        }
-      }
+      // A corrupt history must never be replaced by an empty conversation.
+      final messages = _readSecureMessages(key);
       // Envelope ids are unique for incoming messages. Client ids are unique
       // for outgoing messages, including a retry that the server reports as
       // a duplicate. Checking both makes delivery idempotent locally.
       if ((envelopeId != null &&
               messages.any((m) => m.envelopeId == envelopeId)) ||
           (clientId.isNotEmpty &&
-              messages.any((m) => m.mine && m.clientId == clientId))) {
+              messages.any((m) => m.mine && m.clientId == clientId)) ||
+          (!mine && peerClientId != null && peerClientId.isNotEmpty &&
+              messages.any((m) => !m.mine && m.peerClientId == peerClientId))) {
         return;
       }
       messages.add(
@@ -441,22 +471,48 @@ class ChatStore extends ChangeNotifier {
           at: at ?? DateTime.now(),
           clientId: clientId,
           envelopeId: envelopeId,
+          peerClientId: peerClientId,
         ),
       );
-      // Keep only last 1000 messages per conversation. The important part is
-      // that pruning happens after a serialized append, never after a stale
-      // read from another concurrent writer.
-      if (messages.length > 1000) {
-        messages = messages.sublist(messages.length - 1000);
+      // Keep delete controls for idempotency and out-of-order delivery.
+      // Only the author can retract their own message, within one hour of
+      // its send timestamp. Replacing in place preserves receipt metadata.
+      for (final control in messages.where((m) => parseMessageBody(m.text).isDelete)) {
+        final target = parseMessageBody(control.text).target;
+        for (var i = 0; i < messages.length; i++) {
+          final m = messages[i];
+          final id = m.mine ? m.clientId : m.peerClientId;
+          final age = control.at.difference(m.at);
+          if (m.mine == control.mine && id == target &&
+              age >= Duration.zero && age <= SecureMessage.deleteWindow &&
+              !parseMessageBody(m.text).isDelete) {
+            messages[i] = m.withBody(encodeTombstoneBody());
+          }
+        }
       }
-      final ok = await preferences.setString(
-        key,
-        jsonEncode({'messages': messages.map((m) => m.toJson()).toList()}),
-      );
-      if (!ok) throw StateError('Secure save failed');
-      _syncSecureConversation(accountId, peerId, messages);
-      notifyListeners();
+      // Stable chronological ordering, including equal timestamps.
+      final ordered = messages.asMap().entries.toList()..sort((a, b) {
+        final time = a.value.at.compareTo(b.value.at);
+        return time == 0 ? a.key.compareTo(b.key) : time;
+      });
+      await _writeSecureMessages(accountId, peerId, ordered.map((e) => e.value).toList());
     });
+  }
+
+  List<SecureMessage> _readSecureMessages(String key) {
+    final saved = preferences.getString(key);
+    if (saved == null) return [];
+    final rows = (jsonDecode(saved) as Map)['messages'] as List;
+    return rows.map((row) => SecureMessage.fromJson(Map<String, dynamic>.from(row as Map))).toList();
+  }
+
+  Future<void> _writeSecureMessages(String accountId, String peerId, List<SecureMessage> messages) async {
+    final ok = await preferences.setString(_secureKey(accountId, peerId),
+      jsonEncode({'messages': messages.map((m) => m.toJson()).toList()}));
+    if (!ok) throw StateError('Secure save failed');
+    _syncSecureConversation(accountId, peerId,
+      messages.where((m) => !m.hidden && !parseMessageBody(m.text).isDelete).toList());
+    notifyListeners();
   }
 
   void _syncSecureConversation(
@@ -489,67 +545,175 @@ class ChatStore extends ChangeNotifier {
     final saved = preferences.getString(key);
     if (saved == null) return [];
     try {
-      final list = (jsonDecode(saved) as Map)['messages'] as List;
-      return list
-          .map((m) => SecureMessage.fromJson(Map<String, dynamic>.from(m)))
+      return _readSecureMessages(key)
+          .where((m) => !m.hidden && !parseMessageBody(m.text).isDelete)
           .toList();
     } catch (_) {
+      storageWarning = 'Saved encrypted-chat history could not be read. The original data has been preserved.';
       return [];
     }
   }
 
   bool hasSecureEnvelope(String accountId, String peerId, String envelopeId) {
     if (envelopeId.isEmpty) return false;
-    return getSecureConversation(
-      accountId,
-      peerId,
-    ).any((m) => m.envelopeId == envelopeId);
+    return _readSecureMessages(_secureKey(accountId, peerId))
+        .any((m) => m.envelopeId == envelopeId);
   }
 
-  /// Updates the sender-side tick for a local echo. No-op when the row is
-  /// missing (e.g. cleared history).
+  /// Updates the sender-side tick (plus server receipt timestamps) for a
+  /// local echo. No-op when the row is missing (e.g. cleared history).
   Future<void> updateSecureStatus(
     String accountId,
     String peerId,
     String clientId,
-    String status,
-  ) async {
+    String status, {
+    String? deliveredAt,
+    String? readAt,
+  }) async {
     if (clientId.isEmpty) return;
     final key = _secureKey(accountId, peerId);
     await _queueSecureWrite(key, () async {
       final saved = preferences.getString(key);
       if (saved == null) return;
-      try {
-        final messages = ((jsonDecode(saved) as Map)['messages'] as List)
-            .map(
-              (m) =>
-                  SecureMessage.fromJson(Map<String, dynamic>.from(m as Map)),
-            )
-            .toList();
+        final messages = _readSecureMessages(key);
         var changed = false;
         for (var i = 0; i < messages.length; i++) {
           final m = messages[i];
-          if (m.mine && m.clientId == clientId && m.status != status) {
-            messages[i] = SecureMessage(
-              text: m.text,
-              mine: m.mine,
-              at: m.at,
-              clientId: m.clientId,
-              status: status,
-              envelopeId: m.envelopeId,
-            );
-            changed = true;
+          if (m.mine && m.clientId == clientId) {
+            const ranks = {'sent': 0, 'delivered': 1, 'read': 2};
+            if (!ranks.containsKey(status)) continue;
+            final nextStatus = ranks[status]! >= (ranks[m.status] ?? 0) ? status : m.status;
+            final nextDelivered = deliveredAt ?? m.deliveredAt;
+            final nextRead = readAt ?? m.readAt;
+            if (m.status != nextStatus ||
+                m.deliveredAt != nextDelivered ||
+                m.readAt != nextRead) {
+              messages[i] = SecureMessage(
+                text: m.text,
+                mine: m.mine,
+                at: m.at,
+                clientId: m.clientId,
+                status: nextStatus,
+                hidden: m.hidden,
+                envelopeId: m.envelopeId,
+                peerClientId: m.peerClientId,
+                deliveredAt: nextDelivered,
+                readAt: nextRead,
+              );
+              changed = true;
+            }
           }
         }
         if (!changed) return;
-        await preferences.setString(
-          key,
-          jsonEncode({'messages': messages.map((m) => m.toJson()).toList()}),
-        );
-        _syncSecureConversation(accountId, peerId, messages);
-        notifyListeners();
-      } catch (_) {}
+        await _writeSecureMessages(accountId, peerId, messages);
     });
+  }
+
+  /// Removes one stored message by sender key or envelope id. Returns true
+  /// when something was removed.
+  Future<bool> removeSecureMessage(
+    String accountId,
+    String peerId,
+    String ref,
+  ) async {
+    if (ref.isEmpty) return false;
+    final key = _secureKey(accountId, peerId);
+    var removed = false;
+    await _queueSecureWrite(key, () async {
+      final saved = preferences.getString(key);
+      if (saved == null) return;
+      final messages = _readSecureMessages(key);
+      final i = messages.indexWhere((m) => m.ref == ref && !m.hidden);
+      if (i < 0) return;
+      messages[i] = messages[i].withBody(encodeTombstoneBody(), hidden: true);
+      await _writeSecureMessages(accountId, peerId, messages);
+      removed = true;
+    });
+    return removed;
+  }
+
+  static String _starKey(String accountId, String peerId) =>
+      'openchat.stars.v1.$accountId-$peerId';
+  static String _pinKey(String accountId, String peerId) =>
+      'openchat.pins.v1.$accountId-$peerId';
+
+  Future<Set<String>> secureStars(String accountId, String peerId) async {
+    final list = preferences.getStringList(
+      _starKey(accountId, peerId),
+    );
+    final available = getSecureConversation(accountId, peerId)
+        .where((m) => !parseMessageBody(m.text).isTombstone).map((m) => m.ref).toSet();
+    return (list ?? <String>[]).toSet().intersection(available);
+  }
+
+  Future<void> toggleSecureStar(
+    String accountId,
+    String peerId,
+    String ref,
+  ) async {
+    await _queueSecureWrite(_secureKey(accountId, peerId), () async {
+    final stars = await secureStars(accountId, peerId);
+    if (stars.contains(ref)) {
+      stars.remove(ref);
+    } else {
+      stars.add(ref);
+    }
+    await preferences.setStringList(
+      _starKey(accountId, peerId),
+      stars.toList(),
+    );
+    notifyListeners();
+    });
+  }
+
+  Future<List<String>> securePins(String accountId, String peerId) async {
+    final available = getSecureConversation(accountId, peerId)
+        .where((m) => !parseMessageBody(m.text).isTombstone).map((m) => m.ref).toSet();
+    return (preferences.getStringList(_pinKey(accountId, peerId)) ?? [])
+        .where(available.contains).toList();
+  }
+
+  /// Pin at most three messages without silently evicting an existing pin.
+  Future<bool> pinSecureMessage(
+    String accountId,
+    String peerId,
+    String ref,
+  ) async {
+    var pinned = false;
+    await _queueSecureWrite(_secureKey(accountId, peerId), () async {
+    final pins = await securePins(accountId, peerId);
+    if (pins.contains(ref)) { pinned = true; return; }
+    if (pins.length >= 3) return;
+    pins.add(ref);
+    await preferences.setStringList(_pinKey(accountId, peerId), pins);
+    pinned = true;
+    notifyListeners();
+    });
+    return pinned;
+  }
+
+  Future<void> unpinSecureMessage(
+    String accountId,
+    String peerId,
+    String ref,
+  ) async {
+    await _queueSecureWrite(_secureKey(accountId, peerId), () async {
+    final pins = await securePins(accountId, peerId);
+    pins.remove(ref);
+    await preferences.setStringList(_pinKey(accountId, peerId), pins);
+    notifyListeners();
+    });
+  }
+
+  Future<SecureMessage?> secureMessageByRef(
+    String accountId,
+    String peerId,
+    String ref,
+  ) async {
+    for (final m in getSecureConversation(accountId, peerId)) {
+      if (m.ref == ref || m.clientId == ref || m.envelopeId == ref) return m;
+    }
+    return null;
   }
 
   static const _failPrefix = 'openchat.envelopeFails.v1.';

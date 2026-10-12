@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'dart:async';
 
 import 'chat_store.dart';
 import 'chat_lock.dart';
@@ -136,7 +137,9 @@ class _ChatHomeState extends State<ChatHome> {
     } catch (_) {}
     if (!mounted || _incomingOpen) return;
     _incomingOpen = true;
-    final accept = await showDialog<bool>(
+    var expired = false;
+    final dialogNavigator = Navigator.of(context, rootNavigator: true);
+    final dialogRoute = DialogRoute<bool>(
       context: context,
       barrierDismissible: false,
       builder: (ctx) => AlertDialog(
@@ -155,8 +158,22 @@ class _ChatHomeState extends State<ChatHome> {
         ],
       ),
     );
-    _incomingOpen = false;
-    if (!mounted) return;
+    // Expire this invite's route only. An old timer must never dismiss a
+    // newer call, permission dialog, or unrelated page.
+    final age = created == null ? Duration.zero : DateTime.now().difference(created);
+    final remaining = const Duration(seconds: 60) - age;
+    final expiry = Timer(remaining.isNegative ? Duration.zero : remaining, () {
+      expired = true;
+      if (mounted && dialogRoute.isActive) dialogNavigator.removeRoute(dialogRoute);
+    });
+    bool? accept;
+    try {
+      accept = await dialogNavigator.push(dialogRoute);
+    } finally {
+      expiry.cancel();
+      _incomingOpen = false;
+    }
+    if (!mounted || expired) return;
     if (accept != true) {
       try {
         await CallSignaling.answer(
@@ -176,6 +193,21 @@ class _ChatHomeState extends State<ChatHome> {
       } catch (_) {}
       return;
     }
+    // The ring may have died while the dialog sat open: re-check before
+    // answering so a stale Accept becomes "already ended", never raw SQL.
+    try {
+      final row = await client
+          .from('call_invites')
+          .select('status')
+          .eq('id', inviteId)
+          .maybeSingle();
+      if (row == null || row['status'] != 'ringing') {
+        messenger.showSnackBar(
+          const SnackBar(content: Text('This call already ended.')),
+        );
+        return;
+      }
+    } catch (_) {}
     final service = CallService();
     if (!await service.ensurePermissions(
       video: callType == 'video',
@@ -199,7 +231,16 @@ class _ChatHomeState extends State<ChatHome> {
       );
       url = creds.url;
       token = creds.token;
-      await CallSignaling.answer(client, inviteId: inviteId, accept: true);
+      try {
+        await CallSignaling.answer(client, inviteId: inviteId, accept: true);
+      } catch (e) {
+        // Lost race with the caller hanging up: report plainly.
+        messenger.showSnackBar(
+          const SnackBar(content: Text('This call already ended.')),
+        );
+        service.dispose();
+        return;
+      }
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('$e')));
       service.dispose();

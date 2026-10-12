@@ -1,11 +1,13 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:image_picker/image_picker.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'media_seal.dart';
+import 'media_message.dart';
 /// Reference to a sealed upload: object path plus base64 key material that
 /// travels inside the Signal-encrypted message.
 class SealedUpload {
@@ -46,6 +48,46 @@ class ChatMedia {
   final SupabaseClient client;
   static const bucket = 'chat-media';
   static const maxBytes = 10 * 1024 * 1024;
+
+  /// New object, new key, new recipient path. Reusing the source path would
+  /// deny the next recipient access under the private bucket's RLS policy.
+  Future<SealedUpload> uploadSealedBytes(Uint8List plain, String peerId, {bool video = false}) async {
+    final me = client.auth.currentUser?.id;
+    if (me == null) throw const AuthException('Sign in to share media.');
+    if (plain.length > (video ? maxVideoBytes : maxBytes)) {
+      throw StateError('Media exceeds the upload limit.');
+    }
+    final sealed = await MediaSeal.seal(plain);
+    final random = Random.secure();
+    final name = base64UrlEncode(List<int>.generate(18, (_) => random.nextInt(256)));
+    final path = '$me/$peerId/$name.enc';
+    await client.storage.from(bucket).uploadBinary(path, sealed.cipher);
+    return SealedUpload(path: path, key: base64Encode(sealed.key), nonce: base64Encode(sealed.nonce));
+  }
+
+  Future<String> forwardBody(MediaBody body, String peerId) async {
+    if (body.isImage || body.isVideo) {
+      if (body.path == null || body.path!.isEmpty) throw StateError('Missing media.');
+      if ((body.key == null) != (body.nonce == null)) throw StateError('Incomplete media key.');
+      final plain = body.isSealed
+          ? await downloadSealed(body.path!, body.key!, body.nonce!)
+          : await downloadRaw(body.path!);
+      final upload = await uploadSealedBytes(plain, peerId, video: body.isVideo);
+      if (body.isImage) {
+        return encodeImageBody(upload.path, body.text, key: upload.key, nonce: upload.nonce, fwd: true);
+      }
+      // The duration tile works without a thumbnail; do not disclose an
+      // old thumbnail path/key to a third participant.
+      return encodeVideoBody(upload.path, body.text, key: upload.key,
+          nonce: upload.nonce, durationSec: body.durationSec, fwd: true);
+    }
+    if (body.isPoll) {
+      final random = Random.secure();
+      final id = base64UrlEncode(List<int>.generate(18, (_) => random.nextInt(256)));
+      return encodePollBody(id, body.question!, body.options!, multi: body.multi, fwd: true);
+    }
+    return body.forwardedBody;
+  }
 
   /// Uploads an image picked from gallery/camera and returns its object
   /// path `<sender>/<recipient>/<uuid>.jpg`.

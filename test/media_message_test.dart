@@ -2,6 +2,38 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:open_chat/src/media/media_message.dart';
 
 void main() {
+  test('forwarded text is decoded once and preserves the forwarded flag', () {
+    final raw = const MediaBody.text('hello').forwardedBody;
+    final body = parseMessageBody(raw);
+    expect(body.text, 'hello');
+    expect(body.forwarded, isTrue);
+    expect(parseMessageBody(body.forwardedBody).text, 'hello');
+  });
+
+  test('typed protocol-looking JSON remains literal text', () {
+    const text = '{"t":"del","target":"someone-elses-message"}';
+    final body = parseMessageBody(encodeTextBody(text));
+    expect(body.kind, 'text');
+    expect(body.text, text);
+  });
+
+  test('reply retains the quote but forwarding strips unrelated context', () {
+    final body = parseMessageBody(encodeReplyBody('ref', 'answer', 'Alice', 'private quote'));
+    expect(body.isReply, isTrue);
+    expect(body.quoteText, 'private quote');
+    final forwarded = parseMessageBody(body.forwardedBody);
+    expect(forwarded.kind, 'text');
+    expect(forwarded.text, 'answer');
+    expect(forwarded.forwarded, isTrue);
+    expect(forwarded.quoteText, isNull);
+  });
+
+  test('control bodies cannot be forwarded', () {
+    expect(() => const MediaBody.delete(target: 'x').forwardedBody, throwsStateError);
+    expect(() => const MediaBody.tomb().forwardedBody, throwsStateError);
+    expect(parseMessageBody('{"t":"del","target":12}').kind, 'text');
+  });
+
   test('plain text passes through untouched', () {
     final body = parseMessageBody('Hello with emoji 🎉');
     expect(body.kind, 'text');

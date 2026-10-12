@@ -1,5 +1,8 @@
+import 'dart:convert';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:open_chat/src/chat_store.dart';
+import 'package:open_chat/src/media/media_message.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 Future<ChatStore> secureStore() async {
@@ -8,6 +11,104 @@ Future<ChatStore> secureStore() async {
 }
 
 void main() {
+  final sentAt = DateTime.utc(2026, 10, 12, 12);
+
+  test('retraction is author-scoped and keeps position, ids and timestamps', () async {
+    final store = await secureStore();
+    await store.addSecureMessage('me', 'peer', 'mine', mine: true, clientId: 'shared', at: sentAt);
+    await store.addSecureMessage('me', 'peer', 'theirs', mine: false, peerClientId: 'shared', envelopeId: 'e1', at: sentAt);
+    await store.addSecureMessage('me', 'peer', 'later', mine: true, clientId: 'later', at: sentAt.add(const Duration(minutes: 2)));
+    await store.addSecureMessage('me', 'peer', encodeDeleteBody('shared'), mine: false, envelopeId: 'delete', at: sentAt.add(const Duration(minutes: 3)));
+    final messages = store.getSecureConversation('me', 'peer');
+    expect(messages, hasLength(3));
+    expect(messages.first.text, 'mine');
+    expect(parseMessageBody(messages[1].text).isTombstone, isTrue);
+    expect(messages[1].at, sentAt);
+    expect(messages[1].envelopeId, 'e1');
+    expect(messages[1].peerClientId, 'shared');
+    expect(messages.last.text, 'later');
+    expect(store.hasSecureEnvelope('me', 'peer', 'delete'), isTrue);
+  });
+
+  test('out-of-order delete persists until the matching author message arrives', () async {
+    final store = await secureStore();
+    await store.addSecureMessage('me', 'alice', encodeDeleteBody('original'), mine: false, envelopeId: 'delete', at: sentAt.add(const Duration(minutes: 1)));
+    await store.addSecureMessage('me', 'bob', 'other chat', mine: false, peerClientId: 'original', at: sentAt);
+    await store.addSecureMessage('me', 'alice', 'original content', mine: false, peerClientId: 'original', at: sentAt);
+    expect(parseMessageBody(store.getSecureConversation('me', 'alice').single.text).isTombstone, isTrue);
+    expect(store.getSecureConversation('me', 'bob').single.text, 'other chat');
+  });
+
+  test('deletes outside the hour or before the original are ignored', () async {
+    final store = await secureStore();
+    await store.addSecureMessage('me', 'peer', 'keep', mine: false, peerClientId: 'x', at: sentAt);
+    for (final minutes in [-1, 61]) {
+      await store.addSecureMessage('me', 'peer', encodeDeleteBody('x'), mine: false, envelopeId: '$minutes', at: sentAt.add(Duration(minutes: minutes)));
+    }
+    expect(store.getSecureConversation('me', 'peer').single.text, 'keep');
+  });
+
+  test('delete for me erases body but retains deduplication after restart', () async {
+    final store = await secureStore();
+    await store.addSecureMessage('me', 'peer', 'sensitive content', mine: false, peerClientId: 'x', envelopeId: 'env');
+    final ref = store.getSecureConversation('me', 'peer').single.ref;
+    await store.toggleSecureStar('me', 'peer', ref);
+    await store.pinSecureMessage('me', 'peer', ref);
+    expect(await store.removeSecureMessage('me', 'peer', ref), isTrue);
+    final restarted = ChatStore(store.preferences);
+    await restarted.addSecureMessage('me', 'peer', 'sensitive content', mine: false, peerClientId: 'x', envelopeId: 'env');
+    expect(restarted.getSecureConversation('me', 'peer'), isEmpty);
+    expect(restarted.hasSecureEnvelope('me', 'peer', 'env'), isTrue);
+    expect(await restarted.secureStars('me', 'peer'), isEmpty);
+    expect(await restarted.securePins('me', 'peer'), isEmpty);
+    expect(store.preferences.getString('openchat.secure.v1.me-peer'), isNot(contains('sensitive content')));
+  });
+
+  test('a corrupt history is preserved rather than overwritten on append', () async {
+    final store = await secureStore();
+    const key = 'openchat.secure.v1.me-peer';
+    await store.preferences.setString(key, '{corrupt');
+    await expectLater(store.addSecureMessage('me', 'peer', 'new', mine: true), throwsFormatException);
+    expect(store.preferences.getString(key), '{corrupt');
+  });
+
+  test('appending beyond 1000 messages does not silently prune history', () async {
+    final store = await secureStore();
+    await store.preferences.setString('openchat.secure.v1.me-peer', jsonEncode({'messages': List.generate(1000,
+      (i) => SecureMessage(text: 'message $i', mine: true, clientId: '$i', at: sentAt).toJson())}));
+    await store.addSecureMessage('me', 'peer', 'new', mine: true, clientId: '1000', at: sentAt.add(const Duration(seconds: 1)));
+    final history = store.getSecureConversation('me', 'peer');
+    expect(history, hasLength(1001));
+    expect(history.first.text, 'message 0');
+  });
+
+  test('receipts never regress and survive a retraction', () async {
+    final store = await secureStore();
+    await store.addSecureMessage('me', 'peer', 'text', mine: true, clientId: 'x', at: sentAt);
+    final time = sentAt.toIso8601String();
+    await store.updateSecureStatus('me', 'peer', 'x', 'read', deliveredAt: time, readAt: time);
+    await store.updateSecureStatus('me', 'peer', 'x', 'sent');
+    await store.addSecureMessage('me', 'peer', encodeDeleteBody('x'), mine: true, clientId: 'delete', at: sentAt.add(const Duration(minutes: 1)));
+    final msg = store.getSecureConversation('me', 'peer').single;
+    expect(msg.status, 'read');
+    expect(msg.deliveredAt, time);
+    expect(msg.readAt, time);
+    expect(msg.clientId, 'x');
+  });
+
+  test('concurrent pins stop at three without evicting existing pins', () async {
+    final store = await secureStore();
+    for (var i = 0; i < 4; i++) {
+      await store.addSecureMessage('me', 'peer', '$i', mine: true, clientId: '$i');
+    }
+    final refs = store.getSecureConversation('me', 'peer').map((m) => m.ref).toList();
+    final results = await Future.wait(refs.map((ref) => store.pinSecureMessage('me', 'peer', ref)));
+    expect(results, [true, true, true, false]);
+    expect(await store.securePins('me', 'peer'), refs.take(3));
+    await Future.wait(refs.map((ref) => store.toggleSecureStar('me', 'peer', ref)));
+    expect(await store.secureStars('me', 'peer'), refs.toSet());
+  });
+
   test('legacy rows without tick fields parse with safe defaults', () {
     final msg = SecureMessage.fromJson({
       'text': 'hello',

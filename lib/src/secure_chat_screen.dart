@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -9,6 +10,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:video_player/video_player.dart';
 
 import 'chat_store.dart';
+import 'contacts_repository.dart';
 import 'calling/call_flow.dart';
 import 'calling/call_screen.dart';
 import 'local_profile.dart';
@@ -46,9 +48,14 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
   final composer = TextEditingController();
   final scroll = ScrollController();
   final channel = const MethodChannel('dev.openchat/security');
-  final accountId = Supabase.instance.client.auth.currentUser!.id;
+  late final accountId = widget.client.auth.currentUser!.id;
 
-  StreamSubscription? _inboxPoll;
+  RealtimeChannel? _realtime;
+  Future<void> _receiveQueue = Future<void>.value();
+  final Set<String> _visibleReadIds = {};
+  final Set<String> _reportedReadIds = {};
+  bool _reading = false;
+  int _tickOffset = 0;
   Timer? _pollTimer;
   Timer? _tickTimer;
   bool _loading = true;
@@ -56,12 +63,27 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
   String? _ownFingerprint;
   String? _peerIdentityKey;
   bool _sendingMedia = false;
+  bool _sendingText = false;
   late final ChatMedia media = ChatMedia(widget.client);
+
+  /// Pending quoted reply: (message ref, display name, quoted summary).
+  ({String ref, String name, String quote})? _replyTo;
+
+  /// Pinned message refs for the banner. Refreshed on open + pin changes.
+  Future<List<String>>? _pinsFuture;
 
   @override
   void initState() {
     super.initState();
+    _pinsFuture = widget.store.securePins(accountId, widget.peerId);
     _bootstrap();
+  }
+
+  void _refreshPins() {
+    if (!mounted) return;
+    setState(() {
+      _pinsFuture = widget.store.securePins(accountId, widget.peerId);
+    });
   }
 
   Future<void> _bootstrap() async {
@@ -138,26 +160,30 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
     return value;
   }
 
-  Future<void> _ensureSession() async {
+  Future<void> _ensureSession() => _ensureSessionFor(widget.peerId);
+
+  Future<void> _ensureSessionFor(String peerId) async {
     // Native returns {'hasSession': bool}, not a bare bool.
     final sessionState =
         await channel.invokeMapMethod('signalHasSession', {
           'accountId': accountId,
-          'peerId': widget.peerId,
+          'peerId': peerId,
         });
     if (sessionState?['hasSession'] == true) return;
     // Server uses snake_case; the native bridge expects camelCase.
     final claimed =
         await widget.client.rpc(
               'claim_key_bundle',
-              params: {'p_user_id': widget.peerId},
+              params: {'p_user_id': peerId},
             )
             as Map<String, dynamic>;
-    _peerIdentityKey = claimed['identity_key'] as String?;
-    if (mounted) setState(() {});
+    if (peerId == widget.peerId) {
+      _peerIdentityKey = claimed['identity_key'] as String?;
+      if (mounted) setState(() {});
+    }
     await channel.invokeMethod('signalProcessBundle', {
       'accountId': accountId,
-      'peerId': widget.peerId,
+      'peerId': peerId,
       'bundle': {
         'registrationId': claimed['registration_id'],
         'identityKey': claimed['identity_key'],
@@ -174,7 +200,7 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
   }
 
   void _subscribeRealtime() {
-    widget.client.channel('envelopes:$accountId')
+    _realtime = widget.client.channel('envelopes:$accountId')
       ..onPostgresChanges(
         event: PostgresChangeEvent.insert,
         schema: 'public',
@@ -193,9 +219,18 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
   /// visible placeholder (and only then acknowledged).
   static const _maxEnvelopeFailures = 5;
 
-  Future<void> _onEnvelope(Map<String, dynamic> record) async {
+  Future<void> _onEnvelope(Map<String, dynamic> record) {
+    // Realtime and polling can deliver the same Signal packet concurrently.
+    // Serialize decryption as well as storage so the ratchet advances once.
+    _receiveQueue = _receiveQueue.catchError((_) {}).then((_) => _receiveEnvelope(record));
+    return _receiveQueue;
+  }
+
+  Future<void> _receiveEnvelope(Map<String, dynamic> record) async {
+    if (!mounted) return;
     final id = record['id'] as String? ?? '';
-    final sender = record['sender_id'] as String? ?? widget.peerId;
+    final sender = record['sender_id'] as String? ?? '';
+    if (sender.isEmpty || id.isEmpty) return;
     // Redelivered rows already stored locally are only missing their ack.
     if (id.isNotEmpty &&
         widget.store.hasSecureEnvelope(accountId, sender, id)) {
@@ -252,10 +287,13 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
         plainText,
         mine: false,
         envelopeId: id.isEmpty ? null : id,
+        peerClientId: record['client_message_id'] as String?,
+        at: DateTime.tryParse(record['created_at'] as String? ?? ''),
       );
       if (mounted) {
         setState(() {});
         _stickToBottom();
+        _refreshPins();
       }
       await _ack(id);
     } catch (_) {
@@ -272,7 +310,38 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
           'p_ids': [id],
         },
       );
+      _reportedReadIds.remove(id);
+      await _flushReadReceipts();
     } catch (_) {}
+  }
+
+  void _noticeVisible(SecureMessage message) {
+    if (message.mine || message.envelopeId == null) return;
+    if (!_visibleReadIds.add(message.envelopeId!)) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) => _flushReadReceipts());
+  }
+
+  Future<void> _flushReadReceipts() async {
+    if (_reading ||
+        !mounted ||
+        ModalRoute.of(context)?.isCurrent != true ||
+        WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
+      return;
+    }
+    final ids = _visibleReadIds.difference(_reportedReadIds).take(100).toList();
+    if (ids.isEmpty) {
+      return;
+    }
+    _reading = true;
+    try {
+      await widget.client.rpc('mark_messages_read', params: {'p_ids': ids});
+      _reportedReadIds.addAll(ids);
+    } catch (_) {
+      // Retry after connectivity resumes. Never infer a read from a fetch.
+      await Future<void>.delayed(const Duration(seconds: 5));
+    } finally {
+      _reading = false;
+    }
   }
 
   void _startPolling() {
@@ -288,11 +357,6 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
 
   Future<void> _pollInbox() async {
     try {
-      // The chat is open, so everything fetched here is being read.
-      await widget.client.rpc(
-        'mark_read',
-        params: {'p_sender_id': widget.peerId},
-      );
       // No clock cursor: fetch every unacked envelope and dedupe by id, so
       // an older undelivered message can never be skipped.
       final result = await widget.client.rpc(
@@ -302,6 +366,7 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
       for (final record in result.cast<Map<String, dynamic>>()) {
         await _onEnvelope(record);
       }
+      await _flushReadReceipts();
     } catch (_) {}
   }
 
@@ -313,10 +378,10 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
           .where((m) => m.mine && m.clientId.isNotEmpty && m.status != 'read')
           .toList();
       if (pending.isEmpty) return;
-      final ids = pending
-          .take(20)
-          .map((m) => m.clientId)
-          .toList();
+      final start = _tickOffset % pending.length;
+      final ids = List.generate(min(50, pending.length),
+          (i) => pending[(start + i) % pending.length].clientId);
+      _tickOffset = (start + ids.length) % pending.length;
       final result = await widget.client.rpc(
         'message_statuses',
         params: {'p_ids': ids},
@@ -330,6 +395,8 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
           widget.peerId,
           id,
           status,
+          deliveredAt: row['delivered_at'] as String?,
+          readAt: row['read_at'] as String?,
         );
       }
       if (mounted) setState(() {});
@@ -346,20 +413,34 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
 
   Future<void> _send() async {
     final text = composer.text.trim();
-    if (text.isEmpty || text.length > 4000) return;
-    composer.clear();
-    await _transmit(text);
+    if (_sendingText || text.isEmpty || text.length > 4000) return;
+    setState(() => _sendingText = true);
+    final reply = _replyTo;
+    final sent = await _transmit(reply == null ? encodeTextBody(text)
+        : encodeReplyBody(reply.ref, text, reply.name, reply.quote));
+    if (mounted) {
+      setState(() {
+        _sendingText = false;
+        if (sent && composer.text.trim() == text) {
+          composer.clear();
+          if (_replyTo == reply) _replyTo = null;
+        }
+      });
+    }
   }
 
-  /// Encrypts [plainText] (raw text or an encoded image body), enqueues it,
-  /// and stores the local copy. Shared by text and image sending.
-  Future<void> _transmit(String plainText) async {
+  /// Encrypts [plainText] (raw text or an encoded body), enqueues it for
+  /// [toPeer] (this chat's peer by default), and stores the local copy.
+  /// Shared by text, media, polls, votes, and forwarded content.
+  Future<bool> _transmit(String plainText, {String? toPeer}) async {
+    final peerId = toPeer ?? widget.peerId;
     try {
-      final localId =
-          '${DateTime.now().microsecondsSinceEpoch}-${DateTime.now().millisecond}';
+      final random = Random.secure();
+      final localId = base64UrlEncode(List<int>.generate(24, (_) => random.nextInt(256)));
+      await _ensureSessionFor(peerId);
       final result = await channel.invokeMethod('signalEncrypt', {
         'accountId': accountId,
-        'peerId': widget.peerId,
+        'peerId': peerId,
         'plain': base64Encode(utf8.encode(plainText)),
       }) as Map<dynamic, dynamic>;
       // Prefix the Signal message type; the envelope has no type column.
@@ -367,7 +448,7 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
           await widget.client.rpc(
                 'enqueue_message',
                 params: {
-                  'p_recipient_id': widget.peerId,
+                  'p_recipient_id': peerId,
                   'p_client_message_id': localId,
                   'p_ciphertext': EnvelopeCodec.encode(
                     result['type'] as int,
@@ -381,15 +462,19 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
         case 'duplicate':
           await widget.store.addSecureMessage(
             accountId,
-            widget.peerId,
+            peerId,
             plainText,
             mine: true,
             clientId: localId,
+            at: DateTime.tryParse(queued['created_at'] as String? ?? '') ??
+                DateTime.tryParse(queued['expires_at'] as String? ?? '')?.subtract(const Duration(days: 7)),
           );
           if (mounted) {
             setState(() {});
-            _stickToBottom();
+            if (toPeer == null) _stickToBottom();
+            _refreshPins();
           }
+          return true;
         case 'rate_limited':
           throw StateError('Daily send limit reached. Try again tomorrow.');
         case 'unavailable':
@@ -398,7 +483,8 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
           throw StateError('Message rejected by the server.');
       }
     } catch (e) {
-      if (mounted) setState(() => _error = 'Send failed: $e');
+      if (mounted) setState(() => _error = e is StateError ? e.message.toString() : 'Message could not be sent. Check your connection and try again.');
+      return false;
     }
   }
 
@@ -832,9 +918,438 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
     );
   }
 
+  String _quoteSummary(MediaBody body) {
+    if (body.isImage) return body.text.isEmpty ? 'Photo' : body.text;
+    if (body.isVideo) return body.text.isEmpty ? 'Video' : body.text;
+    if (body.isPoll) return body.question ?? 'Poll';
+    if (body.isReply) return body.text;
+    final t = body.text;
+    return t.length > 80 ? '${t.substring(0, 80)}…' : t;
+  }
+
+  void _beginReply(SecureMessage msg) {
+    final body = parseMessageBody(msg.text);
+    if (body.isDelete || body.isVote || body.isTombstone) return;
+    setState(() => _replyTo = (
+      ref: msg.ref,
+      name: msg.mine ? (widget.profile.name.isEmpty ? 'Sender' : widget.profile.name) : widget.peerName,
+      quote: _quoteSummary(body),
+    ));
+  }
+
+  /// WhatsApp-style long-press menu for one message.
+  Future<void> _messageActions(SecureMessage msg) async {
+    final body = parseMessageBody(msg.text);
+    if (body.isTombstone) return;
+    final stars = await widget.store.secureStars(
+      accountId,
+      widget.peerId,
+    );
+    final pins = await widget.store.securePins(accountId, widget.peerId);
+    if (!mounted) return;
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: SingleChildScrollView(child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (!body.isVote && !body.isDelete)
+              ListTile(
+                leading: const Icon(Icons.reply_outlined),
+                title: const Text('Reply'),
+                onTap: () => Navigator.pop(ctx, 'reply'),
+              ),
+            if (body.text.isNotEmpty || body.question != null)
+              ListTile(
+                leading: const Icon(Icons.copy_outlined),
+                title: const Text('Copy'),
+                onTap: () => Navigator.pop(ctx, 'copy'),
+              ),
+            ListTile(
+              leading: const Icon(Icons.forward_outlined),
+              title: const Text('Forward'),
+              onTap: () => Navigator.pop(ctx, 'forward'),
+            ),
+            ListTile(
+              leading: Icon(
+                stars.contains(msg.ref)
+                    ? Icons.star
+                    : Icons.star_outline,
+              ),
+              title: Text(
+                stars.contains(msg.ref) ? 'Unstar' : 'Star',
+              ),
+              onTap: () => Navigator.pop(ctx, 'star'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.push_pin_outlined),
+              title: Text(pins.contains(msg.ref) ? 'Unpin' : 'Pin'),
+              onTap: () => Navigator.pop(ctx, 'pin'),
+            ),
+            if (msg.mine) ListTile(
+              leading: const Icon(Icons.info_outline),
+              title: const Text('Info'),
+              onTap: () => Navigator.pop(ctx, 'info'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.delete_outline),
+              title: const Text('Delete for me'),
+              onTap: () => Navigator.pop(ctx, 'deleteme'),
+            ),
+            if (msg.canDeleteForEveryone(DateTime.now()))
+              ListTile(
+                leading: Icon(
+                  Icons.delete_forever_outlined,
+                  color: Theme.of(ctx).colorScheme.error,
+                ),
+                title: const Text('Delete for everyone'),
+                onTap: () => Navigator.pop(ctx, 'deleteall'),
+              ),
+          ],
+        )),
+      ),
+    );
+    if (action == null || !mounted) return;
+    switch (action) {
+      case 'reply':
+        _beginReply(msg);
+      case 'copy':
+        final copyText = body.isPoll
+            ? '${body.question ?? ''}\n${(body.options ?? []).join('\n')}'
+            : (body.isReply
+                  ? body.text
+                  : (body.text.isNotEmpty
+                        ? body.text
+                        : _quoteSummary(body)));
+        await Clipboard.setData(ClipboardData(text: copyText));
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Copied to clipboard')),
+          );
+        }
+      case 'forward':
+        await _forwardPicker(body);
+      case 'star':
+        await widget.store.toggleSecureStar(
+          accountId,
+          widget.peerId,
+          msg.ref,
+        );
+        final starred = (await widget.store.secureStars(accountId, widget.peerId)).contains(msg.ref);
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                starred
+                    ? 'Starred.'
+                    : 'Unstarred.',
+              ),
+            ),
+          );
+        }
+      case 'pin':
+        if (pins.contains(msg.ref)) {
+          await widget.store.unpinSecureMessage(
+            accountId,
+            widget.peerId,
+            msg.ref,
+          );
+        } else {
+          final ok = await widget.store.pinSecureMessage(
+            accountId,
+            widget.peerId,
+            msg.ref,
+          );
+          if (!ok && mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('Pin up to 3 messages.')),
+            );
+          }
+        }
+        _refreshPins();
+      case 'info':
+        _showInfo(msg);
+      case 'deleteme':
+        await widget.store.removeSecureMessage(
+          accountId,
+          widget.peerId,
+          msg.ref,
+        );
+        if (mounted) setState(() {});
+        _refreshPins();
+      case 'deleteall':
+        final confirmed = await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('Delete for everyone?'),
+            content: const Text(
+              'Ask recipients to remove this message. They may have already read or saved it.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                style: FilledButton.styleFrom(
+                  backgroundColor: Theme.of(ctx).colorScheme.error,
+                ),
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('Delete'),
+              ),
+            ],
+          ),
+        );
+        if (confirmed == true) {
+          if (!msg.canDeleteForEveryone(DateTime.now())) {
+            if (mounted) setState(() => _error = 'The one-hour deletion window has ended.');
+            return;
+          }
+          await _transmit(encodeDeleteBody(msg.clientId));
+        }
+    }
+  }
+
+  /// Contact picker for forwarding into another encrypted chat.
+  Future<void> _forwardPicker(MediaBody body) async {
+    List<CloudContact> contacts = [];
+    try {
+      contacts = (await SupabaseContactsRepository(
+            widget.client,
+          ).contacts())
+          .where((c) => c.status == 'accepted')
+          .toList();
+    } catch (_) {
+      if (mounted) setState(() => _error = 'Contacts could not be loaded. Try again.');
+      return;
+    }
+    if (!mounted) return;
+    final target = await showModalBottomSheet<CloudContact>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: SingleChildScrollView(child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Padding(
+              padding: EdgeInsets.all(16),
+              child: Text(
+                'Forward to…',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+              ),
+            ),
+            if (contacts.isEmpty)
+              const Padding(
+                padding: EdgeInsets.all(24),
+                child: Text('No connected contacts yet.'),
+              ),
+            for (final c in contacts)
+              ListTile(
+                leading: CircleAvatar(
+                  child: Text(
+                    c.name.isEmpty ? '?' : c.name[0].toUpperCase(),
+                  ),
+                ),
+                title: Text(c.name),
+                subtitle: Text('@${c.username}'),
+                onTap: () => Navigator.pop(ctx, c),
+              ),
+          ],
+        )),
+      ),
+    );
+    if (target == null || !mounted) return;
+    setState(() => _error = null);
+    try {
+      final forwarded = await media.forwardBody(body, target.userId);
+      final sent = await _transmit(forwarded, toPeer: target.userId);
+      if (sent && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Forwarded to ${target.name}.')),
+        );
+      }
+    } catch (e) {
+      if (mounted) setState(() => _error = 'The message could not be forwarded. Try again.');
+    }
+  }
+
+  /// Sent / delivered / read roster for one of our messages.
+  void _showInfo(SecureMessage msg) {
+    String fmt(String? iso) {
+      if (iso == null || iso.isEmpty) return '—';
+      try {
+        final at = DateTime.parse(iso).toLocal();
+        return '${at.day.toString().padLeft(2, '0')}/${at.month.toString().padLeft(2, '0')}/${at.year} '
+            '${at.hour.toString().padLeft(2, '0')}:${at.minute.toString().padLeft(2, '0')}';
+      } catch (_) {
+        return '—';
+      }
+    }
+
+    final sent = fmt(msg.at.toIso8601String());
+    showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Message info',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
+              ),
+              const SizedBox(height: 16),
+              _InfoRow(
+                icon: Icons.check,
+                label: 'Sent',
+                value: sent,
+              ),
+              _InfoRow(
+                icon: Icons.done_all,
+                label: 'Delivered',
+                value: msg.mine ? fmt(msg.deliveredAt) : '—',
+              ),
+              _InfoRow(
+                icon: Icons.done_all,
+                label: 'Read',
+                value: msg.mine ? fmt(msg.readAt) : '—',
+                accent: true,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Every starred message in this chat, newest last.
+  Future<void> _showStarred() async {
+    final stars = await widget.store.secureStars(
+      accountId,
+      widget.peerId,
+    );
+    if (!mounted) return;
+    final messages = widget.store.getSecureConversation(
+      accountId,
+      widget.peerId,
+    );
+    final starred = messages
+        .where((m) => stars.contains(m.ref))
+        .toList();
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Starred messages'),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: starred.isEmpty
+              ? const Text('Nothing starred yet. Long-press any message.')
+              : ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: starred.length,
+                  itemBuilder: (_, i) {
+                    final body = parseMessageBody(starred[i].text);
+                    return ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: const Icon(
+                        Icons.star,
+                        size: 18,
+                        color: Color(0xFFF59E0B),
+                      ),
+                      title: Text(
+                        _quoteSummary(body),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    );
+                  },
+                ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Every pinned message with per-row unpin.
+  Future<void> _showPinned(List<String> pins) async {
+    final messages = widget.store.getSecureConversation(
+      accountId,
+      widget.peerId,
+    );
+    SecureMessage? lookup(String ref) {
+      for (final m in messages) {
+        if (m.ref == ref || m.clientId == ref || m.envelopeId == ref) {
+          return m;
+        }
+      }
+      return null;
+    }
+
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialog) => AlertDialog(
+          title: const Text('Pinned messages'),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                for (final ref in pins)
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: const Icon(
+                      Icons.push_pin_outlined,
+                      size: 18,
+                    ),
+                    title: Text(
+                      _quoteSummary(
+                        parseMessageBody(lookup(ref)?.text ?? ''),
+                      ),
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    trailing: IconButton(
+                      tooltip: 'Unpin',
+                      icon: const Icon(Icons.close, size: 18),
+                      onPressed: () async {
+                        await widget.store.unpinSecureMessage(
+                          accountId,
+                          widget.peerId,
+                          ref,
+                        );
+                        pins.remove(ref);
+                        setDialog(() {});
+                        _refreshPins();
+                      },
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Close'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   void dispose() {
-    _inboxPoll?.cancel();
+    _realtime?.unsubscribe();
     _pollTimer?.cancel();
     _tickTimer?.cancel();
     composer.dispose();
@@ -876,6 +1391,8 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
             icon: const Icon(Icons.more_vert),
             onSelected: (value) async {
               switch (value) {
+                case 'starred':
+                  await _showStarred();
                 case 'verify':
                   _showVerification(context);
                 case 'refresh':
@@ -905,6 +1422,9 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
               }
             },
             itemBuilder: (context) => const [
+              PopupMenuItem(value: 'starred', child: ListTile(
+                contentPadding: EdgeInsets.zero, leading: Icon(Icons.star_outline), title: Text('Starred messages'),
+              )),
               PopupMenuItem(
                 value: 'verify',
                 child: ListTile(
@@ -953,11 +1473,15 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                         accountId,
                         widget.peerId,
                       );
-                      // Ballots travel as messages but never render as
-                      // bubbles; they only feed poll tallies.
+                      // Ballots and delete markers travel as messages but never
+                      // render as bubbles; ballots feed tallies, markers are
+                      // applied then dropped.
                       final visible = msgs
                           .where(
-                            (m) => !parseMessageBody(m.text).isVote,
+                            (m) {
+                              final kind = parseMessageBody(m.text);
+                              return !kind.isVote && !kind.isDelete;
+                            },
                           )
                           .toList();
                       if (visible.isEmpty) {
@@ -978,12 +1502,32 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                         itemCount: ordered.length,
                         itemBuilder: (context, i) {
                           final msg = ordered[i];
+                          _noticeVisible(msg);
                           final body = parseMessageBody(msg.text);
-                          if (body.isPoll &&
+                          Widget bubble;
+                          if (body.isTombstone) {
+                            bubble = _SecureBubble(
+                              text: 'This message was deleted',
+                              deleted: true,
+                              mine: msg.mine,
+                              time: msg.at.toLocal(),
+                            );
+                          } else if (body.isReply &&
+                              body.refId != null &&
+                              body.refId!.isNotEmpty) {
+                            bubble = _SecureBubble(
+                              text: body.text,
+                              quoteName: body.quoteName ?? '',
+                              quoteText: body.quoteText ?? '',
+                              mine: msg.mine,
+                              time: msg.at.toLocal(),
+                              status: msg.status,
+                            );
+                          } else if (body.isPoll &&
                               body.pollId != null &&
                               body.question != null &&
                               body.options != null) {
-                            return _SecurePollBubble(
+                            bubble = _SecurePollBubble(
                               pollId: body.pollId!,
                               question: body.question!,
                               options: body.options!,
@@ -994,15 +1538,14 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                                 records,
                               ),
                               mine: msg.mine,
-                              time: msg.at,
+                              time: msg.at.toLocal(),
                               status: msg.status,
                               onVote: (choices) => _transmit(
                                 encodeVoteBody(body.pollId!, choices),
                               ),
                             );
-                          }
-                          if (body.isVideo && body.path != null) {
-                            return _SecureVideoBubble(
+                          } else if (body.isVideo && body.path != null) {
+                            bubble = _SecureVideoBubble(
                               client: widget.client,
                               path: body.path!,
                               caption: body.text,
@@ -1013,38 +1556,168 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                               thumbNonce: body.thumbNonce,
                               durationSec: body.durationSec,
                               mine: msg.mine,
-                              time: msg.at,
+                              time: msg.at.toLocal(),
                               status: msg.status,
                             );
-                          }
-                          if (body.isImage && body.path != null) {
-                            return _SecureImageBubble(
+                          } else if (body.isImage && body.path != null) {
+                            bubble = _SecureImageBubble(
                               client: widget.client,
                               path: body.path!,
                               caption: body.text,
                               imageKey: body.key,
                               imageNonce: body.nonce,
                               mine: msg.mine,
-                              time: msg.at,
+                              time: msg.at.toLocal(),
+                              status: msg.status,
+                            );
+                          } else {
+                            bubble = _SecureBubble(
+                              text: body.text,
+                              mine: msg.mine,
+                              time: msg.at.toLocal(),
                               status: msg.status,
                             );
                           }
-                          return _SecureBubble(
-                            text: msg.text,
-                            mine: msg.mine,
-                            time: msg.at,
-                            status: msg.status,
+                          if (body.forwarded && !body.isTombstone) {
+                            bubble = Column(
+                              crossAxisAlignment: msg.mine
+                                  ? CrossAxisAlignment.end
+                                  : CrossAxisAlignment.start,
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Padding(
+                                  padding: const EdgeInsets.only(bottom: 2),
+                                  child: Text(
+                                    'Forwarded',
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      fontStyle: FontStyle.italic,
+                                      color: Theme.of(context)
+                                          .colorScheme
+                                          .onSurfaceVariant,
+                                    ),
+                                  ),
+                                ),
+                                bubble,
+                              ],
+                            );
+                          }
+                          return GestureDetector(
+                            key: ValueKey(msg.ref),
+                            onHorizontalDragEnd: body.isTombstone ? null : (details) {
+                              if ((details.primaryVelocity ?? 0) > 100) _beginReply(msg);
+                            },
+                            onLongPress: body.isTombstone
+                                ? null
+                                : () => _messageActions(msg),
+                            child: bubble,
                           );
                         },
                       );
                     },
                   ),
           ),
+          FutureBuilder<List<String>>(
+            future: _pinsFuture,
+            builder: (context, snapshot) {
+              final pins = snapshot.data ?? const <String>[];
+              if (pins.isEmpty) return const SizedBox.shrink();
+              return InkWell(
+                onTap: () => _showPinned(pins),
+                child: Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 20,
+                    vertical: 8,
+                  ),
+                  decoration: BoxDecoration(
+                    border: Border(
+                      left: BorderSide(
+                        color: Theme.of(context).colorScheme.primary,
+                        width: 4,
+                      ),
+                    ),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.push_pin_outlined, size: 16),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          '📌 Pinned (${pins.length}/3) — tap to view',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            },
+          ),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.end,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
               children: [
+                if (_replyTo != null)
+                  Container(
+                    margin: const EdgeInsets.only(bottom: 8),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 8,
+                    ),
+                    decoration: BoxDecoration(
+                      border: Border(
+                        left: BorderSide(
+                          color: Theme.of(context).colorScheme.primary,
+                          width: 4,
+                        ),
+                      ),
+                    ),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(
+                                _replyTo!.name,
+                                style: TextStyle(
+                                  fontWeight: FontWeight.w700,
+                                  fontSize: 12,
+                                  color: Theme.of(
+                                    context,
+                                  ).colorScheme.primary,
+                                ),
+                              ),
+                              Text(
+                                _replyTo!.quote,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(fontSize: 12),
+                              ),
+                            ],
+                          ),
+                        ),
+                        IconButton(
+                          tooltip: 'Cancel reply',
+                          visualDensity: VisualDensity.compact,
+                          icon: const Icon(Icons.close, size: 18),
+                          onPressed: () =>
+                              setState(() => _replyTo = null),
+                        ),
+                      ],
+                    ),
+                  ),
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
                 IconButton(
                   tooltip: 'Attach photo, video, or poll',
                   onPressed: _sendingMedia ? null : _pickAndSendImage,
@@ -1073,16 +1746,33 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                 const SizedBox(width: 8),
                 IconButton.filled(
                   tooltip: 'Send',
-                  onPressed: _send,
+                   onPressed: _sendingText ? null : _send,
                   icon: const Icon(Icons.send),
                 ),
               ],
+            ),
+            ],
             ),
           ),
         ],
       ),
     );
   }
+}
+
+class _InfoRow extends StatelessWidget {
+  const _InfoRow({required this.icon, required this.label, required this.value, this.accent = false});
+  final IconData icon;
+  final String label;
+  final String value;
+  final bool accent;
+
+  @override
+  Widget build(BuildContext context) => ListTile(
+    contentPadding: EdgeInsets.zero,
+    leading: Icon(icon, color: accent ? Theme.of(context).colorScheme.primary : null),
+    title: Text(label), subtitle: Text(value),
+  );
 }
 
 class _FingerprintRow extends StatelessWidget {
@@ -1734,11 +2424,17 @@ class _SecureBubble extends StatelessWidget {
     required this.mine,
     required this.time,
     this.status = 'sent',
+    this.quoteName,
+    this.quoteText,
+    this.deleted = false,
   });
   final String text;
   final bool mine;
   final DateTime time;
   final String status;
+  final String? quoteName;
+  final String? quoteText;
+  final bool deleted;
 
   @override
   Widget build(BuildContext context) => Align(
@@ -1757,10 +2453,25 @@ class _SecureBubble extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.end,
         children: [
-          SelectableText(
+          if (quoteText != null) Container(
+            width: double.infinity,
+            margin: const EdgeInsets.only(bottom: 8),
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: mine ? Colors.white12 : Colors.black12,
+              border: Border(left: BorderSide(color: mine ? Colors.white70 : const Color(0xFF245CDB), width: 3)),
+              borderRadius: BorderRadius.circular(4),
+            ),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(quoteName ?? '', style: TextStyle(fontWeight: FontWeight.bold, color: mine ? Colors.white : const Color(0xFF22334E))),
+              Text(quoteText!, maxLines: 3, overflow: TextOverflow.ellipsis, style: TextStyle(color: mine ? Colors.white70 : const Color(0xFF22334E))),
+            ]),
+          ),
+          Text(
             text,
             style: TextStyle(
               color: mine ? Colors.white : const Color(0xFF22334E),
+              fontStyle: deleted ? FontStyle.italic : FontStyle.normal,
               fontSize: 15,
               height: 1.45,
             ),
@@ -1779,7 +2490,7 @@ class _SecureBubble extends StatelessWidget {
                         : const Color(0xFF66748A),
                   ),
                 ),
-                if (mine)
+                if (mine && !deleted)
                   TextSpan(
                     text: _Ticks.glyph(status),
                     style: TextStyle(
