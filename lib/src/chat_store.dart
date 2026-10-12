@@ -105,6 +105,17 @@ class SecureMessage {
     if (id.isNotEmpty) return '${mine ? 'out' : 'in'}:$id';
     return '${mine ? 'out' : 'in'}:${at.toIso8601String()}:$text';
   }
+
+  /// Correctable within 15 minutes of sending: own text/reply rows with a
+  /// sender key, never tombstones or hidden rows.
+  static const editWindow = Duration(minutes: 15);
+
+  bool canEdit(DateTime now) {
+    if (!mine || clientId.isEmpty || hidden) return false;
+    if (!parseMessageBody(text).isEditable) return false;
+    final age = now.difference(at);
+    return age >= Duration.zero && age <= editWindow;
+  }
 }
 
 class Conversation {
@@ -474,19 +485,30 @@ class ChatStore extends ChangeNotifier {
           peerClientId: peerClientId,
         ),
       );
-      // Keep delete controls for idempotency and out-of-order delivery.
-      // Only the author can retract their own message, within one hour of
-      // its send timestamp. Replacing in place preserves receipt metadata.
-      for (final control in messages.where((m) => parseMessageBody(m.text).isDelete)) {
-        final target = parseMessageBody(control.text).target;
+      // Keep delete/edit controls for idempotency and out-of-order
+      // delivery. Only the author can retract or correct their own
+      // message: deletes within one hour, edits within 15 minutes of the
+      // send timestamp. Replacing in place preserves receipt metadata.
+      for (final control in messages.where((m) => parseMessageBody(m.text).isDelete || parseMessageBody(m.text).isEdit)) {
+        final body = parseMessageBody(control.text);
+        final target = body.target;
+        if (target == null || target.isEmpty) continue;
+        final window = body.isDelete ? SecureMessage.deleteWindow : SecureMessage.editWindow;
         for (var i = 0; i < messages.length; i++) {
           final m = messages[i];
           final id = m.mine ? m.clientId : m.peerClientId;
           final age = control.at.difference(m.at);
           if (m.mine == control.mine && id == target &&
-              age >= Duration.zero && age <= SecureMessage.deleteWindow &&
-              !parseMessageBody(m.text).isDelete) {
-            messages[i] = m.withBody(encodeTombstoneBody());
+              age >= Duration.zero && age <= window) {
+            final original = parseMessageBody(m.text);
+            if (original.isControl) continue;
+            if (body.isDelete) {
+              messages[i] = m.withBody(encodeTombstoneBody());
+            } else if (original.isEditable) {
+              // Media/poll bodies reject correction; the control is kept
+              // for idempotency but changes nothing.
+              messages[i] = m.withBody(original.editedBody(body.text));
+            }
           }
         }
       }
@@ -511,7 +533,13 @@ class ChatStore extends ChangeNotifier {
       jsonEncode({'messages': messages.map((m) => m.toJson()).toList()}));
     if (!ok) throw StateError('Secure save failed');
     _syncSecureConversation(accountId, peerId,
-      messages.where((m) => !m.hidden && !parseMessageBody(m.text).isDelete).toList());
+      messages.where((m) {
+        if (m.hidden) return false;
+        final kind = parseMessageBody(m.text);
+        // Ballots stay for tallies; tombstones render. Delete, reaction
+        // and edit markers are applied-then-dropped transport only.
+        return !kind.isDelete && !kind.isReact && !kind.isEdit;
+      }).toList());
     notifyListeners();
   }
 
@@ -546,7 +574,11 @@ class ChatStore extends ChangeNotifier {
     if (saved == null) return [];
     try {
       return _readSecureMessages(key)
-          .where((m) => !m.hidden && !parseMessageBody(m.text).isDelete)
+          .where((m) {
+            if (m.hidden) return false;
+            final kind = parseMessageBody(m.text);
+            return !kind.isDelete && !kind.isReact && !kind.isEdit;
+          })
           .toList();
     } catch (_) {
       storageWarning = 'Saved encrypted-chat history could not be read. The original data has been preserved.';
@@ -714,6 +746,150 @@ class ChatStore extends ChangeNotifier {
       if (m.ref == ref || m.clientId == ref || m.envelopeId == ref) return m;
     }
     return null;
+  }
+
+  static String _reactKey(String accountId, String peerId) =>
+      'openchat.reacts.v1.$accountId-$peerId';
+
+  /// Reactions per message ref: `{ref: {emoji: 'mine'|'peer'|'both'}}`.
+  /// Corrupt maps reset to empty; a corrupt map must never crash the build.
+  Map<String, Map<String, String>> secureReactions(
+    String accountId,
+    String peerId,
+  ) {
+    final saved = preferences.getString(_reactKey(accountId, peerId));
+    if (saved == null || saved.isEmpty) return {};
+    try {
+      final decoded = jsonDecode(saved) as Map<String, dynamic>;
+      return {
+        for (final entry in decoded.entries)
+          entry.key: {
+            for (final vote in (entry.value as Map).entries)
+              vote.key.toString(): vote.value.toString(),
+          },
+      };
+    } catch (_) {
+      return {};
+    }
+  }
+
+  /// Applies an explicit reaction state (not a toggle), so redelivered
+  /// markers converge instead of flapping.
+  Future<void> applySecureReaction(
+    String accountId,
+    String peerId,
+    String ref,
+    String emoji, {
+    required bool mine,
+    required bool remove,
+  }) async {
+    if (ref.isEmpty || emoji.isEmpty) return;
+    await _queueSecureWrite(_secureKey(accountId, peerId), () async {
+      final all = secureReactions(accountId, peerId);
+      final votes = Map<String, String>.from(all[ref] ?? {});
+      final side = votes[emoji];
+      final own = mine
+          ? (side == 'mine' || side == 'both')
+          : (side == 'peer' || side == 'both');
+      final other = mine
+          ? (side == 'peer' || side == 'both')
+          : (side == 'mine' || side == 'both');
+      if (remove) {
+        if (!own) {
+          votes.remove(emoji);
+        } else if (other) {
+          votes[emoji] = mine ? 'peer' : 'mine';
+        } else {
+          votes.remove(emoji);
+        }
+      } else if (!own && !other) {
+        votes[emoji] = mine ? 'mine' : 'peer';
+      } else if (own != other) {
+        votes[emoji] = 'both';
+      }
+      if (votes.isEmpty) {
+        all.remove(ref);
+      } else {
+        all[ref] = votes;
+      }
+      await preferences.setString(_reactKey(accountId, peerId), jsonEncode(all));
+      notifyListeners();
+    });
+  }
+
+  static String _draftKey(String accountId, String peerId) =>
+      'openchat.drafts.v1.$accountId-$peerId';
+
+  /// Unsent composer text per encrypted chat. Synchronous so every build
+  /// can show the Draft prefix without a FutureBuilder.
+  String secureDraft(String accountId, String peerId) =>
+      preferences.getString(_draftKey(accountId, peerId)) ?? '';
+
+  Future<void> setSecureDraft(
+    String accountId,
+    String peerId,
+    String value,
+  ) async {
+    final wasEmpty = secureDraft(accountId, peerId).isEmpty;
+    if (value.isEmpty) {
+      await preferences.remove(_draftKey(accountId, peerId));
+    } else {
+      await preferences.setString(_draftKey(accountId, peerId), value);
+    }
+    // Only empty<->non-empty transitions change any UI (the home preview).
+    if (wasEmpty == value.isEmpty) return;
+    notifyListeners();
+  }
+
+  static String _unreadKey(String accountId) =>
+      'openchat.unread.v1.$accountId';
+
+  /// Manual mark-unread flags per peer. Incoming messages in the open chat
+  /// are read; anything else is the user's explicit reminder.
+  bool secureUnread(String accountId, String peerId) =>
+      preferences.getStringList(_unreadKey(accountId))?.contains(peerId) ??
+      false;
+
+  Future<void> setSecureUnread(
+    String accountId,
+    String peerId,
+    bool value,
+  ) async {
+    final list = preferences.getStringList(_unreadKey(accountId)) ?? [];
+    final has = list.contains(peerId);
+    if (has == value) return;
+    if (value) {
+      list.add(peerId);
+    } else {
+      list.remove(peerId);
+    }
+    await preferences.setStringList(_unreadKey(accountId), list);
+    notifyListeners();
+  }
+
+  /// Personal notes thread. Local-only: the server forbids sender ==
+  /// recipient, so this never touches the encrypted transport.
+  static const selfChatId = '_self_notes';
+
+  Future<Conversation> ensureSelfChat() async {
+    for (final c in conversations) {
+      if (c.id == selfChatId) return c;
+    }
+    final chat = Conversation(
+      id: selfChatId,
+      name: 'Message yourself',
+      color: 0xFFD2EEE5,
+      messages: [
+        ChatMessage(
+          text: 'Your personal notes. Only you can see this conversation.',
+          mine: false,
+          at: DateTime.now(),
+        ),
+      ],
+    );
+    conversations.insert(0, chat);
+    await _save();
+    return chat;
   }
 
   static const _failPrefix = 'openchat.envelopeFails.v1.';

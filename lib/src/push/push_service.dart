@@ -5,16 +5,54 @@ import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/foundation.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import 'notify_service.dart';
+
 /// Background messages must be handled in a top-level function.
-/// Pilot behavior: wake the plugin; payload handling lands with messaging.
+/// Data-only nudges from the notify-send Edge Function render here via the
+/// same local-notification stack as the foreground watchers. Payloads carry
+/// routing ids and display names only — never message content or keys.
 @pragma('vm:entry-point')
 Future<void> pushBackgroundHandler(RemoteMessage message) async {
   try {
     await Firebase.initializeApp();
   } catch (_) {
-    // A failed background init must never crash the isolate.
+    return;
+  }
+  try {
+    await NotifyService.instance.init();
+    final data = message.data;
+    switch (data['kind']) {
+      case 'message':
+        final peer = data['peer'] as String? ?? '';
+        if (peer.isEmpty) return;
+        await NotifyService.instance.showMessage(
+          peerId: peer,
+          name: _orContact(data['name'] as String?),
+        );
+      case 'call':
+        final invite = data['invite'] as String? ?? '';
+        if (invite.isEmpty) return;
+        await NotifyService.instance.showCall(
+          inviteId: invite,
+          name: _orContact(data['name'] as String?),
+          video: data['video'] == 'true',
+        );
+      case 'status':
+        final author = data['peer'] as String? ?? '';
+        if (author.isEmpty) return;
+        await NotifyService.instance.showStatus(
+          authorId: author,
+          name: _orContact(data['name'] as String?),
+          snippet: data['snippet'] as String? ?? '',
+        );
+    }
+  } catch (_) {
+    // A failed background render must never crash the isolate.
   }
 }
+
+String _orContact(String? name) =>
+    (name == null || name.trim().isEmpty) ? 'New contact' : name;
 
 enum PushState { disabled, ready, denied }
 

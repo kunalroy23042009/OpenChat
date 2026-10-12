@@ -6,6 +6,7 @@ import 'dart:convert';
 class MediaBody {
   const MediaBody.text(this.text, {this.forwarded = false})
     : kind = 'text',
+      removed = false,
       path = null,
       key = null,
       nonce = null,
@@ -24,6 +25,7 @@ class MediaBody {
       target = null;
   const MediaBody.image({required this.path, this.text = '', this.key, this.nonce, this.forwarded = false})
     : kind = 'image',
+      removed = false,
       thumbPath = null,
       thumbKey = null,
       thumbNonce = null,
@@ -48,6 +50,7 @@ class MediaBody {
     this.durationSec = 0,
     this.forwarded = false,
   }) : kind = 'video',
+      removed = false,
        pollId = null,
        question = null,
        options = null,
@@ -64,6 +67,7 @@ class MediaBody {
     this.multi = false,
     this.forwarded = false,
   }) : kind = 'poll',
+      removed = false,
        text = '',
        path = null,
        key = null,
@@ -79,6 +83,7 @@ class MediaBody {
        target = null;
   const MediaBody.vote({required this.pollId, required this.choices})
     : kind = 'vote',
+      removed = false,
       forwarded = false,
       text = '',
       path = null,
@@ -102,6 +107,7 @@ class MediaBody {
     required this.quoteText,
     this.forwarded = false,
   }) : kind = 'reply',
+      removed = false,
        path = null,
        key = null,
        nonce = null,
@@ -117,6 +123,7 @@ class MediaBody {
        target = null;
   const MediaBody.delete({required this.target})
     : kind = 'del',
+      removed = false,
       forwarded = false,
       text = '',
       path = null,
@@ -136,6 +143,7 @@ class MediaBody {
       quoteText = null;
   const MediaBody.tomb()
     : kind = 'tomb',
+      removed = false,
       forwarded = false,
       text = '',
       path = null,
@@ -154,6 +162,43 @@ class MediaBody {
       quoteName = null,
       quoteText = null,
       target = null;
+  const MediaBody.react({required this.target, required this.text, this.removed = false})
+    : kind = 'react',
+      forwarded = false,
+      path = null,
+      key = null,
+      nonce = null,
+      thumbPath = null,
+      thumbKey = null,
+      thumbNonce = null,
+      durationSec = 0,
+      pollId = null,
+      question = null,
+      options = null,
+      multi = false,
+      choices = null,
+      refId = null,
+      quoteName = null,
+      quoteText = null;
+  const MediaBody.edit({required this.target, required this.text})
+    : kind = 'edit',
+      removed = false,
+      forwarded = false,
+      path = null,
+      key = null,
+      nonce = null,
+      thumbPath = null,
+      thumbKey = null,
+      thumbNonce = null,
+      durationSec = 0,
+      pollId = null,
+      question = null,
+      options = null,
+      multi = false,
+      choices = null,
+      refId = null,
+      quoteName = null,
+      quoteText = null;
   final String kind;
   final String text;
   final String? path;
@@ -185,6 +230,9 @@ class MediaBody {
 
   /// Forwarded marker, authenticated inside the encrypted body.
   final bool forwarded;
+
+  /// Reaction clear flag (kind 'react' only).
+  final bool removed;
   bool get isImage => kind == 'image';
   bool get isVideo => kind == 'video';
   bool get isPoll => kind == 'poll';
@@ -192,6 +240,15 @@ class MediaBody {
   bool get isReply => kind == 'reply';
   bool get isDelete => kind == 'del';
   bool get isTombstone => kind == 'tomb';
+  bool get isReact => kind == 'react';
+  bool get isEdit => kind == 'edit';
+
+  /// Text and quoted replies support in-place correction.
+  bool get isEditable => kind == 'text' || kind == 'reply';
+
+  /// Control rows travel the transport but never render as bubbles.
+  bool get isControl =>
+      isVote || isDelete || isTombstone || isReact || isEdit;
   bool get isSealed => key != null && nonce != null;
 
   /// Re-encodes this body with the forwarded flag set (WhatsApp
@@ -234,10 +291,34 @@ class MediaBody {
       case 'vote':
       case 'del':
       case 'tomb':
+      case 'react':
+      case 'edit':
         throw StateError('Control messages cannot be forwarded.');
       default:
         return encodeTextBody(text, fwd: true);
     }
+  }
+
+  /// Re-encodes an editable body with replacement text, preserving the
+  /// quote context and forwarded flag.
+  String editedBody(String newText) {
+    final clean = newText.trim();
+    if (clean.isEmpty || clean.length > 4000) {
+      throw StateError('Edited text must contain 1–4000 characters.');
+    }
+    if (kind == 'reply') {
+      return encodeReplyBody(
+        refId ?? '',
+        clean,
+        quoteName ?? '',
+        quoteText ?? '',
+        fwd: forwarded,
+      );
+    }
+    if (kind == 'text') {
+      return encodeTextBody(clean, fwd: forwarded);
+    }
+    throw StateError('Only text messages can be edited.');
   }
 }
 
@@ -267,6 +348,23 @@ String encodeReplyBody(
 String encodeDeleteBody(String target) => jsonEncode({
   't': 'del',
   'target': target,
+});
+
+/// Reaction set/remove: [remove] true clears [emoji] from the target.
+/// Explicit state (not a toggle) so redelivery is idempotent.
+String encodeReactBody(String target, String emoji, {bool remove = false}) =>
+    jsonEncode({
+      't': 'react',
+      'target': target,
+      'e': emoji,
+      if (remove) 'rm': true,
+    });
+
+/// In-place correction naming the original message id.
+String encodeEditBody(String target, String text) => jsonEncode({
+  't': 'edit',
+  'target': target,
+  'b': text,
 });
 
 /// Local tombstone rendered where a deleted message stood.
@@ -495,6 +593,32 @@ MediaBody parseMessageBody(String raw) {
       final target = decoded['target'];
       if (target is String && target.isNotEmpty) {
         return MediaBody.delete(target: target);
+      }
+    }
+    if (decoded is Map<String, dynamic> && decoded['t'] == 'react') {
+      final target = decoded['target'];
+      final emoji = decoded['e'];
+      if (target is String &&
+          target.isNotEmpty &&
+          emoji is String &&
+          emoji.isNotEmpty &&
+          emoji.runes.length <= 8) {
+        return MediaBody.react(
+          target: target,
+          text: emoji,
+          removed: decoded['rm'] == true,
+        );
+      }
+    }
+    if (decoded is Map<String, dynamic> && decoded['t'] == 'edit') {
+      final target = decoded['target'];
+      final b = decoded['b'];
+      if (target is String &&
+          target.isNotEmpty &&
+          b is String &&
+          b.trim().isNotEmpty &&
+          b.length <= 4000) {
+        return MediaBody.edit(target: target, text: b);
       }
     }
     if (decoded is Map<String, dynamic> && decoded['t'] == 'tomb') {

@@ -34,6 +34,47 @@ void main() {
     expect(parseMessageBody('{"t":"del","target":12}').kind, 'text');
   });
 
+  test('reaction set/remove round-trips and stays a control', () {
+    final set = parseMessageBody(encodeReactBody('ref-1', '❤️'));
+    expect(set.isReact, isTrue);
+    expect(set.isControl, isTrue);
+    expect(set.target, 'ref-1');
+    expect(set.text, '❤️');
+    expect(set.removed, isFalse);
+    final clear = parseMessageBody(encodeReactBody('ref-1', '❤️', remove: true));
+    expect(clear.removed, isTrue);
+    expect(() => set.forwardedBody, throwsStateError);
+    // Oversized emoji payloads stay literal text, never controls.
+    expect(parseMessageBody('{"t":"react","target":"x","e":"toolongemoji!!"}').kind, 'text');
+    expect(parseMessageBody('{"t":"react","target":"","e":"❤️"}').kind, 'text');
+  });
+
+  test('edit body round-trips and only text can be re-encoded', () {
+    final edit = parseMessageBody(encodeEditBody('ref-2', 'corrected'));
+    expect(edit.isEdit, isTrue);
+    expect(edit.isControl, isTrue);
+    expect(edit.target, 'ref-2');
+    expect(edit.text, 'corrected');
+    expect(() => edit.forwardedBody, throwsStateError);
+    expect(parseMessageBody('{"t":"edit","target":"x","b":""}').kind, 'text');
+    expect(parseMessageBody('{"t":"edit","target":"x","b":"${'y' * 4001}"}').kind, 'text');
+  });
+
+  test('editedBody preserves quotes and flags, rejects empties', () {
+    expect(const MediaBody.text('old').editedBody('new'), 'new');
+    expect(
+      parseMessageBody(const MediaBody.text('old', forwarded: true).editedBody('new')).forwarded,
+      isTrue,
+    );
+    final reply = parseMessageBody(encodeReplyBody('r', 'old', 'Al', 'quote'));
+    final changed = parseMessageBody(reply.editedBody('new answer'));
+    expect(changed.isReply, isTrue);
+    expect(changed.text, 'new answer');
+    expect(changed.quoteText, 'quote');
+    expect(() => const MediaBody.text('old').editedBody('  '), throwsStateError);
+    expect(() => const MediaBody.poll(pollId: 'p', question: 'q', options: ['a', 'b']).editedBody('x'), throwsStateError);
+  });
+
   test('plain text passes through untouched', () {
     final body = parseMessageBody('Hello with emoji 🎉');
     expect(body.kind, 'text');

@@ -74,6 +74,17 @@ void main() {
     await tester.pumpAndSettle();
   }
 
+  Future<void> disposeScreen(WidgetTester tester) async {
+    await tester.pumpWidget(const SizedBox());
+    await tester.pumpAndSettle();
+    // Cancels realtime's deferred disconnect timer; no clock pump after
+    // this point, so no retry/backoff timer can fire and hang the test.
+    unawaited(client.realtime.disconnect());
+    // Flush the socket close-handshake timeout (6s) and any poke timeout
+    // (8s): connState is disconnected, so no reconnect timer is armed.
+    await tester.pump(const Duration(seconds: 10));
+  }
+
   testWidgets('long press replies with a quote and clears the composer on success', (tester) async {
     await open(tester);
     await tester.longPress(find.text('Original message'));
@@ -84,7 +95,7 @@ void main() {
     await tester.enterText(find.byType(TextField), 'My reply');
     await tester.tap(find.byTooltip('Send'));
     await tester.pumpAndSettle();
-    expect(store.getSecureConversation(me, peer), hasLength(2), reason: tester.widgetList<Text>(find.byType(Text)).map((t) => t.data).join(' | '));
+    expect(store.getSecureConversation(me, peer), hasLength(2));
     final body = parseMessageBody(encryptedPlaintexts.single);
     expect(body.isReply, isTrue);
     expect(body.text, 'My reply');
@@ -92,14 +103,7 @@ void main() {
     expect(find.byTooltip('Cancel reply'), findsNothing);
     expect(tester.widget<TextField>(find.byType(TextField)).controller!.text, isEmpty);
     expect(tester.takeException(), isNull);
-    await tester.pumpWidget(const SizedBox());
-    await tester.pumpAndSettle();
-    // Cancels realtime's deferred disconnect timer; no clock pump after
-    // this point, so no retry/backoff timer can fire and hang the test.
-    unawaited(client.realtime.disconnect());
-    // Flush the socket close-handshake timeout (connState is disconnected,
-    // so no reconnect timer is armed by _onConnClose).
-    await tester.pump(const Duration(seconds: 7));
+    await disposeScreen(tester);
   });
 
   testWidgets('failed deletion leaves history unchanged and failed sends retain drafts', (tester) async {
@@ -118,13 +122,51 @@ void main() {
     await tester.pumpAndSettle();
     expect(tester.widget<TextField>(find.byType(TextField)).controller!.text, 'Keep my draft');
     expect(tester.takeException(), isNull);
-    await tester.pumpWidget(const SizedBox());
+    await disposeScreen(tester);
+  });
+
+  testWidgets('reacting adds a chip and transmits explicit state', (tester) async {
+    await open(tester);
+    await tester.longPress(find.text('Original message'));
     await tester.pumpAndSettle();
-    // Cancels realtime's deferred disconnect timer; no clock pump after
-    // this point, so no retry/backoff timer can fire and hang the test.
-    unawaited(client.realtime.disconnect());
-    // Flush the socket close-handshake timeout (connState is disconnected,
-    // so no reconnect timer is armed by _onConnClose).
-    await tester.pump(const Duration(seconds: 7));
+    await tester.tap(find.text('React'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('❤️'));
+    await tester.pumpAndSettle();
+    final reacted = parseMessageBody(encryptedPlaintexts.single);
+    expect(reacted.isReact, isTrue);
+    expect(reacted.text, '❤️');
+    expect(reacted.removed, isFalse);
+    expect(find.text('❤️'), findsWidgets);
+    // Tapping the chip again removes the reaction.
+    await tester.tap(find.text('❤️').first);
+    await tester.pumpAndSettle();
+    final cleared = parseMessageBody(encryptedPlaintexts.last);
+    expect(cleared.removed, isTrue);
+    expect(store.secureReactions(me, peer), isEmpty);
+    expect(tester.takeException(), isNull);
+    await disposeScreen(tester);
+  });
+
+  testWidgets('editing replaces the message without adding a row', (tester) async {
+    await open(tester);
+    await tester.longPress(find.text('Original message'));
+    await tester.pumpAndSettle();
+    await tester.scrollUntilVisible(find.text('Edit'), 150, scrollable: find.byType(Scrollable).last);
+    await tester.tap(find.text('Edit'));
+    await tester.pumpAndSettle();
+    expect(find.text('Editing message'), findsOneWidget);
+    await tester.enterText(find.byType(TextField), 'Corrected message');
+    await tester.tap(find.byTooltip('Send'));
+    await tester.pumpAndSettle();
+    final edited = parseMessageBody(encryptedPlaintexts.single);
+    expect(edited.isEdit, isTrue);
+    expect(edited.text, 'Corrected message');
+    final history = store.getSecureConversation(me, peer);
+    expect(history, hasLength(1));
+    expect(history.single.text, 'Corrected message');
+    expect(find.text('Editing message'), findsNothing);
+    expect(tester.takeException(), isNull);
+    await disposeScreen(tester);
   });
 }

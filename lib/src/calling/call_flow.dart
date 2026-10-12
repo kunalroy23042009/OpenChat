@@ -7,6 +7,7 @@ import 'call_repository.dart';
 import 'call_screen.dart';
 import 'call_service.dart';
 import 'call_signaling.dart';
+import '../push/notify_service.dart';
 
 /// Outgoing 1:1 call: permissions → token → join room → ring peer → live
 /// screen. Callee accept/decline arrives over Realtime; unanswered rings
@@ -53,6 +54,17 @@ Future<void> startOutgoingCall(
       callType: type == CallType.video ? 'video' : 'voice',
     );
     inviteId = invite.inviteId;
+    // Ring a killed/background callee via FCM; foreground callees ring
+    // through their realtime invite watcher instead.
+    unawaited(
+      NotifyService.poke(
+        client,
+        kind: 'call',
+        peer: peerId,
+        invite: inviteId,
+        video: type == CallType.video,
+      ),
+    );
   } catch (e) {
     messenger.showSnackBar(SnackBar(content: Text('$e')));
     service.dispose();

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -6,6 +7,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'status_repository.dart';
 import 'video_status_view.dart';
+import '../push/notify_service.dart';
 
 class StatusItem {
   const StatusItem({
@@ -91,6 +93,8 @@ class _StatusPageState extends State<StatusPage> {
     try {
       await StatusRepository(client!)
           .publishText(text, backgroundColor: color.toARGB32());
+      // Fan out to contacts' devices; foreground ones alert via realtime.
+      unawaited(NotifyService.poke(client, kind: 'status'));
     } catch (_) {
       // The locally-created status remains visible while offline.
     }

@@ -95,7 +95,6 @@ void main() {
     expect(msg.readAt, time);
     expect(msg.clientId, 'x');
   });
-
   test('concurrent pins stop at three without evicting existing pins', () async {
     final store = await secureStore();
     for (var i = 0; i < 4; i++) {
@@ -107,6 +106,72 @@ void main() {
     expect(await store.securePins('me', 'peer'), refs.take(3));
     await Future.wait(refs.map((ref) => store.toggleSecureStar('me', 'peer', ref)));
     expect(await store.secureStars('me', 'peer'), refs.toSet());
+  });
+
+  test('edits replace in place inside 15 minutes, keep receipts', () async {
+    final store = await secureStore();
+    final sentAt = DateTime.utc(2026, 10, 12, 12);
+    await store.addSecureMessage('me', 'peer', 'Helow', mine: true, clientId: 'x', at: sentAt);
+    await store.updateSecureStatus('me', 'peer', 'x', 'read', deliveredAt: sentAt.toIso8601String(), readAt: sentAt.toIso8601String());
+    await store.addSecureMessage('me', 'peer', encodeEditBody('x', 'Hello'), mine: true, clientId: 'edit-1', at: sentAt.add(const Duration(minutes: 5)));
+    final messages = store.getSecureConversation('me', 'peer');
+    expect(messages, hasLength(1));
+    expect(messages.single.text, 'Hello');
+    expect(messages.single.clientId, 'x');
+    expect(messages.single.status, 'read');
+    expect(messages.single.canEdit(sentAt.add(const Duration(minutes: 10))), isTrue);
+    expect(messages.single.canEdit(sentAt.add(const Duration(minutes: 16))), isFalse);
+  });
+
+  test('late, early, foreign and non-text edits are ignored', () async {
+    final store = await secureStore();
+    final sentAt = DateTime.utc(2026, 10, 12, 12);
+    await store.addSecureMessage('me', 'peer', 'Keep', mine: false, peerClientId: 'x', at: sentAt);
+    await store.addSecureMessage('me', 'peer', encodeImageBody('a/b.jpg', 'cap'), mine: false, peerClientId: 'img', at: sentAt);
+    await store.addSecureMessage('me', 'peer', encodeEditBody('x', 'Changed'), mine: false, envelopeId: 'late', at: sentAt.add(const Duration(minutes: 16)));
+    await store.addSecureMessage('me', 'peer', encodeEditBody('x', 'Changed'), mine: true, clientId: 'foreign', at: sentAt.add(const Duration(minutes: 1)));
+    await store.addSecureMessage('me', 'peer', encodeEditBody('img', 'new cap'), mine: false, envelopeId: 'imgedit', at: sentAt.add(const Duration(minutes: 1)));
+    final texts = store.getSecureConversation('me', 'peer').map((m) => m.text).toList();
+    expect(texts.first, 'Keep');
+    expect(parseMessageBody(texts[1]).text, 'cap');
+  });
+
+  test('reactions converge on explicit state, never flap', () async {
+    final store = await secureStore();
+    await store.applySecureReaction('me', 'peer', 'ref', '❤️', mine: true, remove: false);
+    await store.applySecureReaction('me', 'peer', 'ref', '❤️', mine: false, remove: false);
+    expect(store.secureReactions('me', 'peer'), {'ref': {'❤️': 'both'}});
+    // Redelivery of the same state changes nothing.
+    await store.applySecureReaction('me', 'peer', 'ref', '❤️', mine: false, remove: false);
+    expect(store.secureReactions('me', 'peer'), {'ref': {'❤️': 'both'}});
+    await store.applySecureReaction('me', 'peer', 'ref', '❤️', mine: true, remove: true);
+    expect(store.secureReactions('me', 'peer'), {'ref': {'❤️': 'peer'}});
+    await store.applySecureReaction('me', 'peer', 'ref', '❤️', mine: false, remove: true);
+    expect(store.secureReactions('me', 'peer'), isEmpty);
+    expect(store.secureReactions('me', 'nobody'), isEmpty);
+  });
+
+  test('drafts and unread flags round-trip per peer', () async {
+    final store = await secureStore();
+    expect(store.secureDraft('me', 'peer'), isEmpty);
+    expect(store.secureUnread('me', 'peer'), isFalse);
+    await store.setSecureDraft('me', 'peer', 'half-typed');
+    await store.setSecureUnread('me', 'peer', true);
+    expect(store.secureDraft('me', 'peer'), 'half-typed');
+    expect(store.secureUnread('me', 'peer'), isTrue);
+    expect(store.secureDraft('me', 'other'), isEmpty);
+    await store.setSecureDraft('me', 'peer', '');
+    await store.setSecureUnread('me', 'peer', false);
+    expect(store.secureDraft('me', 'peer'), isEmpty);
+    expect(store.secureUnread('me', 'peer'), isFalse);
+  });
+
+  test('self-notes chat is local-only and reusable', () async {
+    final store = await secureStore();
+    final first = await store.ensureSelfChat();
+    expect(first.id, ChatStore.selfChatId);
+    await store.send(first, 'note to self');
+    expect((await store.ensureSelfChat()).messages.last.text, 'note to self');
   });
 
   test('legacy rows without tick fields parse with safe defaults', () {

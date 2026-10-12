@@ -7,6 +7,8 @@
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <!-- Requested at runtime on Android 13+ for message notifications. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Full-screen incoming-call notifications (Android 14+ install-time). -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
     <application
         android:allowBackup="false"
         android:label="OpenChat"

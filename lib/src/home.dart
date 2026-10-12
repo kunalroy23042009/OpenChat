@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
 import 'dart:async';
 
 import 'chat_store.dart';
@@ -9,6 +10,7 @@ import 'local_profile.dart';
 import 'media/media_message.dart';
 import 'profile_page.dart';
 import 'push/push_service.dart';
+import 'push/notify_service.dart';
 import 'secure_chat_screen.dart';
 import 'settings.dart';
 import 'theme/app_theme.dart';
@@ -51,6 +53,9 @@ class _ChatHomeState extends State<ChatHome> {
   RealtimeChannel? _callWatch;
   String? _callWatchUid;
   bool _incomingOpen = false;
+  RealtimeChannel? _notifyWatch;
+  String? _notifyUid;
+  Map<String, String> _notifyNames = {};
   int activeTab = 0;
   void open(Conversation chat, bool wide) {
     widget.store.markRead(chat);
@@ -74,8 +79,179 @@ class _ChatHomeState extends State<ChatHome> {
   }
 
   @override
+  void initState() {
+    super.initState();
+    NotifyService.instance.init();
+    NotifyService.instance.onTap = _onNotifyTap;
+    NotifyService.instance.ensurePermission();
+    widget.store.ensureSelfChat();
+    _watchNotify();
+    // Cold start from a notification tap (killed app): route once Firebase
+    // delivers the launch intent. Foreground FCM stays silent because the
+    // realtime watchers already render those events. Never runs without a
+    // Firebase app (widget tests, unsupported platforms).
+    try {
+      FirebaseMessaging.instance.getInitialMessage().then((message) {
+      final data = message?.data;
+      if (data == null || !mounted) return;
+      final kind = data['kind'];
+      final peer = data['peer'];
+      if ((kind != 'msg' && kind != 'status' && kind != 'call') ||
+          peer is! String ||
+          peer.isEmpty) {
+        return;
+      }
+      _onNotifyTap(
+        NotifyTap(
+          kind: kind,
+          peer: peer,
+          name: (data['name'] as String?) ?? 'Contact',
+        ),
+      );
+      });
+    } catch (_) {
+      // No Firebase app on this device/test run: cold-start routing is
+      // unavailable, everything else works.
+    }
+  }
+
+  /// Foreground fan-in for message + status notifications. Never decrypts
+  /// here: decoding anywhere but the open chat would fork the Signal
+  /// ratchet, so message nudges carry the sender name only.
+  void _watchNotify() {
+    final client = widget.client;
+    final uid = client?.auth.currentUser?.id;
+    if (uid == null) {
+      _notifyWatch?.unsubscribe();
+      _notifyWatch = null;
+      _notifyUid = null;
+      return;
+    }
+    if (_notifyUid == uid && _notifyWatch != null) return;
+    _notifyWatch?.unsubscribe();
+    _notifyUid = uid;
+    _refreshNotifyNames();
+    _notifyWatch =
+        client!.channel('notify:$uid')
+          ..onPostgresChanges(
+            event: PostgresChangeEvent.insert,
+            schema: 'public',
+            table: 'message_envelopes',
+            filter: PostgresChangeFilter(
+              type: PostgresChangeFilterType.eq,
+              column: 'recipient_id',
+              value: uid,
+            ),
+            callback: (payload) => _onNotifyMessage(payload.newRecord),
+          )
+          ..onPostgresChanges(
+            event: PostgresChangeEvent.insert,
+            schema: 'public',
+            table: 'status_updates',
+            callback: (payload) => _onNotifyStatus(payload.newRecord),
+          )
+          ..subscribe();
+  }
+
+  Future<void> _refreshNotifyNames() async {
+    final client = widget.client;
+    if (client == null) return;
+    try {
+      final contacts = await SupabaseContactsRepository(client).contacts();
+      _notifyNames = {
+        for (final c in contacts.where((c) => c.status == 'accepted'))
+          c.userId: c.name,
+      };
+    } catch (_) {}
+  }
+
+  Future<void> _onNotifyMessage(Map<String, dynamic> record) async {
+    final uid = widget.client?.auth.currentUser?.id;
+    final sender = record['sender_id'] as String? ?? '';
+    if (uid == null ||
+        !NotifyService.shouldNotifyMessage(
+          myId: uid,
+          senderId: sender,
+          openPeers: NotifyService.instance.openChats,
+        )) {
+      return;
+    }
+    var name = _notifyNames[sender];
+    if (name == null) {
+      await _refreshNotifyNames();
+      name = _notifyNames[sender] ?? 'New contact';
+    }
+    await NotifyService.instance.showMessage(peerId: sender, name: name);
+  }
+
+  Future<void> _onNotifyStatus(Map<String, dynamic> record) async {
+    final uid = widget.client?.auth.currentUser?.id;
+    final author = record['author_id'] as String? ?? '';
+    if (uid == null || author.isEmpty || author == uid) return;
+    var name = _notifyNames[author];
+    if (name == null) {
+      await _refreshNotifyNames();
+      name = _notifyNames[author];
+    }
+    // Only accepted contacts resolve to a name; strangers stay silent.
+    if (name == null) return;
+    final type = record['type'] as String? ?? 'text';
+    final content = (record['content'] as String? ?? '').trim();
+    await NotifyService.instance.showStatus(
+      authorId: author,
+      name: name,
+      snippet: type == 'text' && content.isNotEmpty
+          ? (content.length > 80 ? '${content.substring(0, 80)}…' : content)
+          : (type == 'image' ? 'Shared a photo status' : 'Shared a video status'),
+    );
+  }
+
+  /// Notification tap routing: messages open the encrypted chat, status
+  /// jumps to the Status tab. Calls are owned by the ringing dialog.
+  Future<void> _onNotifyTap(NotifyTap tap) async {
+    if (!mounted) return;
+    final client = widget.client;
+    if (client == null) return;
+    switch (tap.kind) {
+      case 'msg':
+        try {
+          final contacts = await SupabaseContactsRepository(client).contacts();
+          CloudContact? match;
+          for (final c in contacts) {
+            if (c.userId == tap.peer) {
+              match = c;
+              break;
+            }
+          }
+          if (!mounted) return;
+          setState(() => activeTab = 0);
+          Navigator.of(context).push(
+            MaterialPageRoute<void>(
+              builder: (_) => SecureChatScreen(
+                profile: widget.profile,
+                store: widget.store,
+                push: widget.push,
+                client: client,
+                peerId: tap.peer,
+                peerName: match?.name ?? tap.name,
+                peerUsername: match?.username ?? '',
+              ),
+            ),
+          );
+        } catch (_) {}
+      case 'status':
+        if (mounted) setState(() => activeTab = 1);
+      case 'call':
+        // The ring is gone on a cold start; land on the Calls tab where
+        // the missed entry lives.
+        if (mounted) setState(() => activeTab = 2);
+    }
+  }
+
+  @override
   void dispose() {
     _callWatch?.unsubscribe();
+    _notifyWatch?.unsubscribe();
     super.dispose();
   }
 
@@ -137,6 +313,16 @@ class _ChatHomeState extends State<ChatHome> {
     } catch (_) {}
     if (!mounted || _incomingOpen) return;
     _incomingOpen = true;
+    // Ring on the lock screen too: the dialog only exists in-foreground.
+    await NotifyService.instance.showCall(
+      inviteId: inviteId,
+      name: peerName,
+      video: callType == 'video',
+    );
+    if (!mounted) {
+      _incomingOpen = false;
+      return;
+    }
     var expired = false;
     final dialogNavigator = Navigator.of(context, rootNavigator: true);
     final dialogRoute = DialogRoute<bool>(
@@ -164,6 +350,7 @@ class _ChatHomeState extends State<ChatHome> {
     final remaining = const Duration(seconds: 60) - age;
     final expiry = Timer(remaining.isNegative ? Duration.zero : remaining, () {
       expired = true;
+      NotifyService.instance.cancelCall(inviteId);
       if (mounted && dialogRoute.isActive) dialogNavigator.removeRoute(dialogRoute);
     });
     bool? accept;
@@ -172,6 +359,7 @@ class _ChatHomeState extends State<ChatHome> {
     } finally {
       expiry.cancel();
       _incomingOpen = false;
+      await NotifyService.instance.cancelCall(inviteId);
     }
     if (!mounted || expired) return;
     if (accept != true) {
@@ -407,6 +595,11 @@ class _ChatHomeState extends State<ChatHome> {
         );
         if (confirmed == true) {
           await store.deleteConversation(chat.id);
+          // The personal thread is infrastructure, not data: it returns
+          // empty rather than staying deleted.
+          if (chat.id == ChatStore.selfChatId) {
+            await store.ensureSelfChat();
+          }
         }
     }
   }
@@ -417,6 +610,7 @@ class _ChatHomeState extends State<ChatHome> {
     builder: (context, _) => LayoutBuilder(
       builder: (context, constraints) {
         _watchIncomingCalls(context);
+        _watchNotify();
         final wide = constraints.maxWidth >= 850;
         final base = widget.store.conversations.where((c) {
           if (!c.name.toLowerCase().contains(query.toLowerCase())) {
@@ -1047,10 +1241,18 @@ class _SecureSection extends StatefulWidget {
 }
 
 class _SecureRow {
-  const _SecureRow({required this.contact, required this.preview, this.at});
+  const _SecureRow({
+    required this.contact,
+    required this.preview,
+    this.at,
+    this.unread = false,
+    this.hasDraft = false,
+  });
   final CloudContact contact;
   final String preview;
   final DateTime? at;
+  final bool unread;
+  final bool hasDraft;
 }
 
 class _SecureSectionState extends State<_SecureSection> {
@@ -1093,21 +1295,62 @@ class _SecureSectionState extends State<_SecureSection> {
       preview = '📊 ${body.question ?? 'Poll'}';
     } else if (body.isVote) {
       preview = '🗳️ Voted in a poll';
+    } else if (body.isTombstone) {
+      preview = 'This message was deleted';
+    } else if (body.isReply) {
+      preview = body.text;
     } else if (body.text.length > 60) {
       preview = '${body.text.substring(0, 60)}…';
     } else {
       preview = body.text;
     }
+    final draft = widget.store.secureDraft(me, contact.userId);
     return _SecureRow(
       contact: contact,
-      preview: '${last.mine ? 'You: ' : ''}$preview',
+      preview: draft.isNotEmpty
+          ? '✏️ Draft: $draft'
+          : '${last.mine ? 'You: ' : ''}$preview',
       at: last.at,
+      unread: widget.store.secureUnread(me, contact.userId),
+      hasDraft: draft.isNotEmpty,
     );
   }
 
   void _refresh() => setState(() => _future = _load());
 
+  Future<void> _rowActions(_SecureRow row) async {
+    final me = widget.client.auth.currentUser?.id;
+    if (me == null) return;
+    final unread = widget.store.secureUnread(me, row.contact.userId);
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: Icon(
+                unread ? Icons.mark_chat_read_outlined : Icons.mark_chat_unread_outlined,
+              ),
+              title: Text(unread ? 'Mark as read' : 'Mark as unread'),
+              onTap: () => Navigator.pop(ctx, 'read'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (action == 'read') {
+      await widget.store.setSecureUnread(me, row.contact.userId, !unread);
+      _refresh();
+    }
+  }
+
   void _open(CloudContact contact) {
+    final me = widget.client.auth.currentUser?.id;
+    if (me != null) {
+      widget.store.setSecureUnread(me, contact.userId, false);
+    }
     Navigator.push(
       context,
       MaterialPageRoute<void>(
@@ -1184,7 +1427,9 @@ class _SecureSectionState extends State<_SecureSection> {
             }
             // Shrink-wrapped (never a fixed height): rows can grow with
             // large fonts or long previews without overflowing.
-            return ListView.builder(
+            return ListenableBuilder(
+              listenable: widget.store,
+              builder: (context, _) => ListView.builder(
               shrinkWrap: true,
               physics: const NeverScrollableScrollPhysics(),
               padding: EdgeInsets.zero,
@@ -1214,6 +1459,11 @@ class _SecureSectionState extends State<_SecureSection> {
                       row.preview,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: row.hasDraft
+                            ? const Color(0xFF245CDB)
+                            : null,
+                      ),
                     ),
                     trailing: Column(
                       mainAxisAlignment: MainAxisAlignment.center,
@@ -1227,13 +1477,26 @@ class _SecureSectionState extends State<_SecureSection> {
                               color: Color(0xFF66748A),
                             ),
                           ),
-                        const Icon(Icons.chevron_right),
+                        if (row.unread)
+                          Container(
+                            margin: const EdgeInsets.only(top: 4),
+                            width: 10,
+                            height: 10,
+                            decoration: const BoxDecoration(
+                              color: Color(0xFF245CDB),
+                              shape: BoxShape.circle,
+                            ),
+                          )
+                        else
+                          const Icon(Icons.chevron_right),
                       ],
                     ),
                     onTap: () => _open(contact),
+                    onLongPress: () => _rowActions(row),
                   );
                 },
-              );
+              ),
+            );
             },
           ),
         const Divider(height: 16),

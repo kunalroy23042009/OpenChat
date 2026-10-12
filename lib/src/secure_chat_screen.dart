@@ -18,6 +18,8 @@ import 'media/chat_media.dart';
 import 'media/media_message.dart';
 import 'media/video_player_screen.dart';
 import 'push/push_service.dart';
+import 'push/notify_service.dart';
+import 'widgets/message_format.dart';
 import 'security/envelope_codec.dart';
 import 'security/safety_number.dart';
 
@@ -69,14 +71,33 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
   /// Pending quoted reply: (message ref, display name, quoted summary).
   ({String ref, String name, String quote})? _replyTo;
 
+  /// Pending in-place correction: (target ref, original text).
+  ({String ref, String text})? _editing;
+
+  /// In-chat search state. Filters the rendered list; history untouched.
+  bool _searching = false;
+  String _searchQuery = '';
+  final searchBox = TextEditingController();
+
   /// Pinned message refs for the banner. Refreshed on open + pin changes.
   Future<List<String>>? _pinsFuture;
 
   @override
   void initState() {
     super.initState();
+    // This chat is visible: suppress its notifications, clear its badge
+    // and unread flag, and restore any unsent draft.
+    NotifyService.instance.openChats.add(widget.peerId);
+    NotifyService.instance.cancelChat(widget.peerId);
+    widget.store.setSecureUnread(accountId, widget.peerId, false);
+    composer.text = widget.store.secureDraft(accountId, widget.peerId);
+    composer.addListener(_saveDraft);
     _pinsFuture = widget.store.securePins(accountId, widget.peerId);
     _bootstrap();
+  }
+
+  void _saveDraft() {
+    widget.store.setSecureDraft(accountId, widget.peerId, composer.text);
   }
 
   void _refreshPins() {
@@ -281,6 +302,21 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
       return;
     }
     try {
+      final body = parseMessageBody(plainText);
+      if (body.isReact && body.target != null) {
+        // Explicit set/remove state converges on redelivery; no row stored.
+        await widget.store.applySecureReaction(
+          accountId,
+          sender,
+          body.target!,
+          body.text,
+          mine: false,
+          remove: body.removed,
+        );
+        if (mounted) setState(() {});
+        await _ack(id);
+        return;
+      }
       await widget.store.addSecureMessage(
         accountId,
         sender,
@@ -416,16 +452,33 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
     if (_sendingText || text.isEmpty || text.length > 4000) return;
     setState(() => _sendingText = true);
     final reply = _replyTo;
-    final sent = await _transmit(reply == null ? encodeTextBody(text)
-        : encodeReplyBody(reply.ref, text, reply.name, reply.quote));
+    final edit = _editing;
+    final bool sent;
+    if (edit != null) {
+      sent = await _transmit(encodeEditBody(edit.ref, text));
+    } else if (reply != null) {
+      sent = await _transmit(
+        encodeReplyBody(reply.ref, text, reply.name, reply.quote),
+      );
+    } else {
+      sent = await _transmit(encodeTextBody(text));
+    }
     if (mounted) {
       setState(() {
         _sendingText = false;
         if (sent && composer.text.trim() == text) {
           composer.clear();
+          // The listener persists the clear, dropping the draft flag.
           if (_replyTo == reply) _replyTo = null;
+          if (_editing == edit) _editing = null;
         }
       });
+      // Corrections are not new arrivals; only fresh text/replies poke.
+      if (sent && edit == null) {
+        unawaited(
+          NotifyService.poke(widget.client, kind: 'message', peer: widget.peerId),
+        );
+      }
     }
   }
 
@@ -608,7 +661,7 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
         File(picked.path),
         widget.peerId,
       );
-      await _transmit(
+      final sent = await _transmit(
         encodeImageBody(
           sealed.path,
           caption.text.trim(),
@@ -616,6 +669,11 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
           nonce: sealed.nonce,
         ),
       );
+      if (sent && mounted) {
+        unawaited(
+          NotifyService.poke(widget.client, kind: 'message', peer: widget.peerId),
+        );
+      }
     } catch (e) {
       if (mounted) {
         setState(() => _error = 'Image failed: $e');
@@ -726,7 +784,12 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
     }
     final pollId =
         '${DateTime.now().microsecondsSinceEpoch}-${accountId.hashCode}';
-    await _transmit(encodePollBody(pollId, q, opts, multi: multi));
+    final sent = await _transmit(encodePollBody(pollId, q, opts, multi: multi));
+    if (sent && mounted) {
+      unawaited(
+        NotifyService.poke(widget.client, kind: 'message', peer: widget.peerId),
+      );
+    }
   }
 
   Future<void> _pickAndSendVideo(bool fromCamera) async {
@@ -806,7 +869,7 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
     });
     try {
       final sealed = await media.uploadSealedVideo(file, widget.peerId);
-      await _transmit(
+      final sent = await _transmit(
         encodeVideoBody(
           sealed.path,
           caption.text.trim(),
@@ -818,6 +881,11 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
           durationSec: durationSec,
         ),
       );
+      if (sent && mounted) {
+        unawaited(
+          NotifyService.poke(widget.client, kind: 'message', peer: widget.peerId),
+        );
+      }
     } catch (e) {
       if (mounted) {
         setState(() => _error = 'Video failed: $e');
@@ -918,6 +986,19 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
     );
   }
 
+  /// Lowercased searchable text for in-chat search: bodies, captions,
+  /// poll questions, quotes. Control rows never match.
+  String _searchText(SecureMessage msg) {
+    final body = parseMessageBody(msg.text);
+    if (body.isVote || body.isDelete || body.isReact || body.isEdit) return '';
+    if (body.isPoll) {
+      return '${body.question ?? ''} ${(body.options ?? []).join(' ')}'
+          .toLowerCase();
+    }
+    if (body.isTombstone) return 'deleted message';
+    return '${body.text} ${body.quoteText ?? ''}'.toLowerCase();
+  }
+
   String _quoteSummary(MediaBody body) {
     if (body.isImage) return body.text.isEmpty ? 'Photo' : body.text;
     if (body.isVideo) return body.text.isEmpty ? 'Video' : body.text;
@@ -960,11 +1041,27 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                 title: const Text('Reply'),
                 onTap: () => Navigator.pop(ctx, 'reply'),
               ),
+            if (!body.isVote &&
+                !body.isDelete &&
+                !body.isReact &&
+                !body.isEdit)
+              ListTile(
+                leading: const Icon(Icons.emoji_emotions_outlined),
+                title: const Text('React'),
+                onTap: () => Navigator.pop(ctx, 'react'),
+              ),
             if (body.text.isNotEmpty || body.question != null)
               ListTile(
                 leading: const Icon(Icons.copy_outlined),
                 title: const Text('Copy'),
                 onTap: () => Navigator.pop(ctx, 'copy'),
+              ),
+            if (msg.canEdit(DateTime.now()))
+              ListTile(
+                leading: const Icon(Icons.edit_outlined),
+                title: const Text('Edit'),
+                subtitle: const Text('Within 15 minutes of sending'),
+                onTap: () => Navigator.pop(ctx, 'edit'),
               ),
             ListTile(
               leading: const Icon(Icons.forward_outlined),
@@ -1027,6 +1124,22 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(content: Text('Copied to clipboard')),
           );
+        }
+      case 'react':
+        await _reactPicker(msg);
+      case 'edit':
+        if (!msg.canEdit(DateTime.now())) {
+          if (mounted) {
+            setState(() => _error = 'The 15-minute edit window has ended.');
+          }
+          return;
+        }
+        if (mounted) {
+          setState(() {
+            _editing = (ref: msg.clientId, text: body.text);
+            _replyTo = null;
+            composer.text = body.text;
+          });
         }
       case 'forward':
         await _forwardPicker(body);
@@ -1165,12 +1278,106 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
       final forwarded = await media.forwardBody(body, target.userId);
       final sent = await _transmit(forwarded, toPeer: target.userId);
       if (sent && mounted) {
+        unawaited(
+          NotifyService.poke(widget.client, kind: 'message', peer: target.userId),
+        );
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Forwarded to ${target.name}.')),
         );
       }
     } catch (e) {
       if (mounted) setState(() => _error = 'The message could not be forwarded. Try again.');
+    }
+  }
+
+  /// Emoji picker for reactions. Sends explicit set/remove state (never a
+  /// toggle) and applies it optimistically; a failed send reverts.
+  static const _quickEmojis = [
+    '❤️',
+    '😂',
+    '😮',
+    '😢',
+    '🙏',
+    '👍',
+    '👎',
+    '🔥',
+    '🎉',
+    '✅',
+  ];
+
+  Future<void> _reactPicker(SecureMessage msg) async {
+    final votes =
+        widget.store.secureReactions(accountId, widget.peerId)[msg.ref] ?? {};
+    final emoji = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(8, 8, 8, 24),
+          child: Wrap(
+            alignment: WrapAlignment.center,
+            spacing: 4,
+            children: [
+              for (final e in _quickEmojis)
+                IconButton(
+                  tooltip: (votes[e] == 'mine' || votes[e] == 'both')
+                      ? 'Remove $e'
+                      : 'React $e',
+                  style: IconButton.styleFrom(
+                    backgroundColor:
+                        (votes[e] == 'mine' || votes[e] == 'both')
+                        ? Theme.of(
+                            ctx,
+                          ).colorScheme.primaryContainer
+                        : null,
+                  ),
+                  onPressed: () => Navigator.pop(ctx, e),
+                  icon: Text(e, style: const TextStyle(fontSize: 26)),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+    if (emoji == null || !mounted) return;
+    final side = votes[emoji];
+    await _toggleReaction(msg, emoji, side == 'mine' || side == 'both');
+  }
+
+  /// Sends explicit set/remove reaction state with an optimistic local
+  /// apply; a failed send reverts so the UI never lies.
+  Future<void> _toggleReaction(
+    SecureMessage msg,
+    String emoji,
+    bool mineNow,
+  ) async {
+    await widget.store.applySecureReaction(
+      accountId,
+      widget.peerId,
+      msg.ref,
+      emoji,
+      mine: true,
+      remove: mineNow,
+    );
+    final sent = await _transmit(
+      encodeReactBody(
+        msg.mine ? msg.clientId : (msg.peerClientId ?? msg.envelopeId ?? ''),
+        emoji,
+        remove: mineNow,
+      ),
+    );
+    // Revert the optimistic apply when nothing left the device. Unknown
+    // legacy rows have no sender key and cannot be targeted remotely.
+    if (!sent && mounted) {
+      await widget.store.applySecureReaction(
+        accountId,
+        widget.peerId,
+        msg.ref,
+        emoji,
+        mine: true,
+        remove: !mineNow,
+      );
+      setState(() => _error = 'Reaction failed. Check your connection.');
     }
   }
 
@@ -1349,10 +1556,15 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
 
   @override
   void dispose() {
+    composer.removeListener(_saveDraft);
+    // Persist the draft even if the listener missed the last keystroke.
+    widget.store.setSecureDraft(accountId, widget.peerId, composer.text);
+    NotifyService.instance.openChats.remove(widget.peerId);
     _realtime?.unsubscribe();
     _pollTimer?.cancel();
     _tickTimer?.cancel();
     composer.dispose();
+    searchBox.dispose();
     scroll.dispose();
     super.dispose();
   }
@@ -1361,9 +1573,30 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(widget.peerName),
+        title: _searching
+            ? TextField(
+                controller: searchBox,
+                autofocus: true,
+                decoration: const InputDecoration(
+                  hintText: 'Search in conversation…',
+                  border: InputBorder.none,
+                ),
+                onChanged: (v) => setState(
+                  () => _searchQuery = v.trim().toLowerCase(),
+                ),
+              )
+            : Text(widget.peerName),
 
         actions: [
+          IconButton(
+            tooltip: _searching ? 'Close search' : 'Search in conversation',
+            onPressed: () => setState(() {
+              _searching = !_searching;
+              _searchQuery = '';
+              searchBox.clear();
+            }),
+            icon: Icon(_searching ? Icons.close : Icons.search),
+          ),
           IconButton(
             tooltip: 'Voice call',
             onPressed: () => startOutgoingCall(
@@ -1480,13 +1713,22 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                           .where(
                             (m) {
                               final kind = parseMessageBody(m.text);
-                              return !kind.isVote && !kind.isDelete;
+                              if (kind.isVote || kind.isDelete) return false;
+                              if (_searchQuery.isNotEmpty &&
+                                  !_searchText(m).contains(_searchQuery)) {
+                                return false;
+                              }
+                              return true;
                             },
                           )
                           .toList();
                       if (visible.isEmpty) {
-                        return const Center(
-                          child: Text('No messages yet. Say hello!'),
+                        return Center(
+                          child: Text(
+                            _searchQuery.isNotEmpty
+                                ? 'No matches for "$_searchQuery".'
+                                : 'No messages yet. Say hello!',
+                          ),
                         );
                       }
                       final records = msgs
@@ -1495,6 +1737,10 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                       // Newest at the bottom: the reversed list lays index
                       // 0 at the bottom edge, so feed newest-first.
                       final ordered = visible.reversed.toList();
+                      final reactions = widget.store.secureReactions(
+                        accountId,
+                        widget.peerId,
+                      );
                       return ListView.builder(
                         controller: scroll,
                         reverse: true,
@@ -1610,7 +1856,71 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                             onLongPress: body.isTombstone
                                 ? null
                                 : () => _messageActions(msg),
-                            child: bubble,
+                            child: Column(
+                              crossAxisAlignment: msg.mine
+                                  ? CrossAxisAlignment.end
+                                  : CrossAxisAlignment.start,
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                bubble,
+                                if ((reactions[msg.ref] ?? {}).isNotEmpty)
+                                  Padding(
+                                    padding: const EdgeInsets.only(
+                                      top: 2,
+                                      bottom: 10,
+                                    ),
+                                    child: Wrap(
+                                      spacing: 4,
+                                      children: [
+                                        for (final entry
+                                            in (reactions[msg.ref] ?? {})
+                                                .entries)
+                                          GestureDetector(
+                                            onTap: () => _toggleReaction(
+                                              msg,
+                                              entry.key,
+                                              entry.value == 'mine' ||
+                                                  entry.value == 'both',
+                                            ),
+                                            child: Container(
+                                              padding:
+                                                  const EdgeInsets.symmetric(
+                                                    horizontal: 8,
+                                                    vertical: 2,
+                                                  ),
+                                              decoration: BoxDecoration(
+                                                color: Theme.of(context)
+                                                    .colorScheme
+                                                    .surfaceContainerHighest,
+                                                borderRadius:
+                                                    BorderRadius.circular(12),
+                                                border:
+                                                    (entry.value == 'mine' ||
+                                                            entry.value ==
+                                                                'both')
+                                                        ? Border.all(
+                                                            color:
+                                                                Theme.of(
+                                                                      context,
+                                                                    )
+                                                                    .colorScheme
+                                                                    .primary,
+                                                          )
+                                                        : null,
+                                              ),
+                                              child: Text(
+                                                entry.key,
+                                                style: const TextStyle(
+                                                  fontSize: 13,
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                      ],
+                                    ),
+                                  ),
+                              ],
+                            ),
                           );
                         },
                       );
@@ -1711,6 +2021,59 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                           icon: const Icon(Icons.close, size: 18),
                           onPressed: () =>
                               setState(() => _replyTo = null),
+                        ),
+                      ],
+                    ),
+                  ),
+                if (_editing != null)
+                  Container(
+                    margin: const EdgeInsets.only(bottom: 8),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 8,
+                    ),
+                    decoration: BoxDecoration(
+                      border: Border(
+                        left: BorderSide(
+                          color: Theme.of(context).colorScheme.tertiary,
+                          width: 4,
+                        ),
+                      ),
+                    ),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(
+                                'Editing message',
+                                style: TextStyle(
+                                  fontWeight: FontWeight.w700,
+                                  fontSize: 12,
+                                  color: Theme.of(
+                                    context,
+                                  ).colorScheme.tertiary,
+                                ),
+                              ),
+                              Text(
+                                _editing!.text,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(fontSize: 12),
+                              ),
+                            ],
+                          ),
+                        ),
+                        IconButton(
+                          tooltip: 'Cancel edit',
+                          visualDensity: VisualDensity.compact,
+                          icon: const Icon(Icons.close, size: 18),
+                          onPressed: () => setState(() {
+                            _editing = null;
+                            composer.clear();
+                          }),
                         ),
                       ],
                     ),
@@ -2464,18 +2827,45 @@ class _SecureBubble extends StatelessWidget {
             ),
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Text(quoteName ?? '', style: TextStyle(fontWeight: FontWeight.bold, color: mine ? Colors.white : const Color(0xFF22334E))),
-              Text(quoteText!, maxLines: 3, overflow: TextOverflow.ellipsis, style: TextStyle(color: mine ? Colors.white70 : const Color(0xFF22334E))),
+              Text.rich(
+                TextSpan(
+                  children: formatMessageSpans(
+                    quoteText!,
+                    TextStyle(color: mine ? Colors.white70 : const Color(0xFF22334E)),
+                  ),
+                ),
+                maxLines: 3,
+                overflow: TextOverflow.ellipsis,
+              ),
             ]),
           ),
-          Text(
-            text,
-            style: TextStyle(
-              color: mine ? Colors.white : const Color(0xFF22334E),
-              fontStyle: deleted ? FontStyle.italic : FontStyle.normal,
-              fontSize: 15,
-              height: 1.45,
+          // Plain Text, not SelectableText: in-place selection registers
+          // competing long-press recognizers that swallow the message
+          // action sheet (on device and in tests). Copy lives in the
+          // long-press menu, WhatsApp-style.
+          if (deleted)
+            Text(
+              text,
+              style: TextStyle(
+                color: mine ? Colors.white : const Color(0xFF22334E),
+                fontStyle: FontStyle.italic,
+                fontSize: 15,
+                height: 1.45,
+              ),
+            )
+          else
+            Text.rich(
+              TextSpan(
+                children: formatMessageSpans(
+                  text,
+                  TextStyle(
+                    color: mine ? Colors.white : const Color(0xFF22334E),
+                    fontSize: 15,
+                    height: 1.45,
+                  ),
+                ),
+              ),
             ),
-          ),
           const SizedBox(height: 6),
           Text.rich(
             TextSpan(

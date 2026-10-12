@@ -13,39 +13,51 @@ in-place tombstone), durable receipts migration
 `202610090021_durable_receipts.sql` (ACK creates the delivery receipt;
 reads are per-envelope and visible-only; receipts survive ACK).
 
+Shipped next: emoji reactions with explicit set/remove state, in-place
+editing (15-minute author window), in-chat search, inline formatting
+(bold/italic/strikethrough/monospace/code), per-chat drafts (with home
+preview + failed-send retention), manual mark-unread for encrypted chats,
+a local-only Message-Yourself thread, and the WhatsApp-style notification
+stack: runtime permission, message/status/call channels, foreground
+realtime watchers (name-only nudges, no decryption outside the open chat),
+full-screen call ringing, tap routing (chat/status/calls), background FCM
+rendering, poke-on-send, and the `notify-send` Edge Function (data-only
+payloads; NEEDS the `FCM_SERVICE_ACCOUNT` secret before background
+delivery works).
+
 ## Basic messaging & text formatting (1–31)
 
 | # | Feature | Status | Note |
 |---|---------|--------|------|
 | 1 | Text messaging | Done | 1:1 E2EE, realtime + polled inbox, 500/day quota |
-| 2 | Bold | Queued | No rich-text rendering |
-| 3 | Italic | Queued | — |
-| 4 | Strikethrough | Queued | — |
-| 5 | Monospace | Queued | — |
+| 2 | Bold | Done | `*bold*` renders in bubbles |
+| 3 | Italic | Done | `_italic_` renders in bubbles |
+| 4 | Strikethrough | Done | `~strike~` renders in bubbles |
+| 5 | Monospace | Done | Triple-backtick blocks render monospace |
 | 6 | Bulleted lists | Queued | — |
 | 7 | Numbered lists | Queued | — |
 | 8 | Block quotes | Partial | Reply quotes exist; no `>` syntax |
-| 9 | Inline code | Queued | — |
-| 10 | Edit sent messages | Queued | — |
+| 9 | Inline code | Done | Single-backtick spans render monospace |
+| 10 | Edit sent messages | Done | 15-minute author window, in-place |
 | 11 | Delete for everyone | Done | 1-hour author window, tombstone |
 | 12 | Delete for me | Done | Body erased, dedupe retained |
 | 13 | Star messages | Done | Per-chat Starred dialog |
-| 14 | Message yourself | Queued | — |
+| 14 | Message yourself | Done | Local-only personal notes thread |
 | 15 | Message unsaved numbers | Partial | Phone lookup/invite; numbers self-asserted, no SMS verify |
-| 16 | Reactions | Queued | `message_reactions` table exists, no UI |
+| 16 | Reactions | Done | 1:1 emoji reactions, tap chip to toggle |
 | 17 | Quoting | Done | Swipe-right + long-press reply |
 | 18 | Forwarding | Done | One contact picker; media re-sealed for recipient |
 | 19 | Forwarding limits | Partial | Single-target picker only; no viral flag |
 | 20 | Search chats | Partial | Conversation-name search; no message-content search |
-| 21 | Search inside a chat | Queued | — |
+| 21 | Search inside a chat | Done | Filter + empty-state counts in encrypted chats |
 | 22 | Search by date | Queued | — |
 | 23 | Copy text | Done | — |
 | 24 | Pin chats (3) | Done | Local pins + 3-slot message pins |
 | 25 | Archive chats | Done | Local archive + filter |
 | 26 | Keep chats archived | Queued | New-message behavior unverified |
-| 27 | Mark as unread | Queued | — |
+| 27 | Mark as unread | Done | Manual flag on encrypted chats + home dot |
 | 28 | Mark as read | Done | Local + auto-read on open chat |
-| 29 | Draft indicators | Queued | Failed sends keep the draft; no "Draft" tag |
+| 29 | Draft indicators | Done | Per-chat drafts with home "Draft" prefix; failed sends keep text |
 | 30 | Typing indicators | Partial | Local AI typing only |
 | 31 | Online status | Queued | No presence system by design (pilot) |
 
@@ -161,9 +173,9 @@ pipelines yet (132–134); no transfer tools (135–136).
 | 138 | Chat wallpapers | Queued | — |
 | 139 | Doodle overlay | Queued | — |
 | 140 | Font sizing | Queued | — |
-| 141 | Custom tones | Queued | — |
-| 142 | Vibration controls | Queued | — |
-| 143 | Pop-up notifications | Queued | Push is token-registration only |
+| 141 | Custom tones | Queued | Channels exist; per-chat tones not wired |
+| 142 | Vibration controls | Queued | Call channel vibrates; no user controls |
+| 143 | Pop-up notifications | Partial | Heads-up message/call/status notifications; no lock-screen toggle |
 | 144 | Homescreen shortcuts | Queued | — |
 | 145 | Multi-account | Queued | Single account per install |
 | 146 | Change number | Queued | — |
@@ -188,6 +200,10 @@ All Queued. No business profiles, catalogs, automation, payments, or API.
 
 Queued except: 191 Partial (server timestamps, local rendering; no TZ sync
 test), 197 Partial (username/phone lookup; no address-book scan), 199 Done
-(`delete_account` RPC). Biometric lock (184), share sheet (185),
-notification actions (179), badges (181), and desktop/watch clients are all
-Queued; push remains token-registration only (no sender, no tap routing).
+(`delete_account` RPC). Push stack: foreground realtime watchers, channels,
+tap routing, background FCM handler, and `notify-send` sender are Done;
+background delivery additionally needs the `FCM_SERVICE_ACCOUNT` secret
+(not yet provided). Inline notification actions/reply (179) and per-chat
+mute/tone controls remain Queued; lockscreen previews (180) follow channel
+importance with no separate toggle. Biometric lock (184), share sheet (185),
+badges (181), and desktop/watch clients are all Queued.
