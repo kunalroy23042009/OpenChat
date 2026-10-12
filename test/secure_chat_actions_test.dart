@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:emoji_picker_flutter/emoji_picker_flutter.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -199,6 +200,45 @@ void main() {
     },
   );
 
+  testWidgets('tapping a bubble pops the quick reaction bar', (tester) async {
+    await open(tester);
+    await tester.tap(find.text('Original message'));
+    // Single-tap waits out the double-tap deadline before firing.
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.pumpAndSettle();
+    // WhatsApp's six quick emojis plus the keyboard button, no dialog.
+    for (final e in ['❤️', '😂', '😮', '😢', '🙏', '👍']) {
+      expect(find.text(e), findsOneWidget);
+    }
+    expect(find.byIcon(Icons.add), findsOneWidget);
+    await tester.tap(find.text('😂'));
+    await tester.pumpAndSettle();
+    final reacted = parseMessageBody(encryptedPlaintexts.single);
+    expect(reacted.isReact, isTrue);
+    expect(reacted.text, '😂');
+    expect(reacted.removed, isFalse);
+    expect(store.secureReactions(me, peer)['out:original'], {'😂': 'mine'});
+    expect(tester.takeException(), isNull);
+    await disposeScreen(tester);
+  });
+
+  testWidgets('plus button opens the full emoji keyboard', (tester) async {
+    await open(tester);
+    await tester.tap(find.text('Original message'));
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byIcon(Icons.add));
+    await tester.pumpAndSettle();
+    expect(find.byType(EmojiPicker), findsOneWidget);
+    // Dismiss without choosing; nothing is transmitted.
+    await tester.tapAt(const Offset(400, 100));
+    await tester.pumpAndSettle();
+    expect(encryptedPlaintexts, isEmpty);
+    expect(find.byType(EmojiPicker), findsNothing);
+    expect(tester.takeException(), isNull);
+    await disposeScreen(tester);
+  });
+
   testWidgets('reacting adds a chip and transmits explicit state', (
     tester,
   ) async {
@@ -207,15 +247,21 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.text('React'));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('❤️'));
+    // Menu React opens the full keyboard; tapping any cell reacts.
+    expect(find.byType(EmojiPicker), findsOneWidget);
+    expect(find.byType(EmojiCell), findsWidgets);
+    await tester.tap(find.byType(EmojiCell).first);
     await tester.pumpAndSettle();
     final reacted = parseMessageBody(encryptedPlaintexts.single);
     expect(reacted.isReact, isTrue);
-    expect(reacted.text, '❤️');
+    expect(reacted.text, isNotEmpty);
     expect(reacted.removed, isFalse);
-    expect(find.text('❤️'), findsWidgets);
+    final votes = store.secureReactions(me, peer)['out:original']!;
+    expect(votes, hasLength(1));
+    final emoji = votes.keys.single;
+    expect(find.text(emoji), findsWidgets);
     // Tapping the chip again removes the reaction.
-    await tester.tap(find.text('❤️').first);
+    await tester.tap(find.text(emoji).first);
     // The parent also supports double-tap; let its single-tap deadline pass.
     await tester.pump(const Duration(milliseconds: 350));
     await tester.pumpAndSettle();

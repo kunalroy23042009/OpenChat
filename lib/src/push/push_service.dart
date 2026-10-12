@@ -15,14 +15,17 @@ import 'notify_service.dart';
 Future<void> pushBackgroundHandler(RemoteMessage message) async {
   try {
     await Firebase.initializeApp();
-  } catch (_) {
+  } catch (e) {
+    debugPrint('FCM BG: Firebase init failed: $e');
     return;
   }
   try {
     await NotifyService.instance.init();
+    debugPrint('FCM BG: NotifyService initialized');
     await renderPushMessage(message, background: true);
-  } catch (_) {
-    // A failed background render must never crash the isolate.
+    debugPrint('FCM BG: renderPushMessage completed');
+  } catch (e, st) {
+    debugPrint('FCM BG: error: $e\n$st');
   }
 }
 
@@ -83,21 +86,27 @@ class PushService {
   String? lastError;
 
   Future<PushState> initialize(SupabaseClient? client) async {
+    debugPrint('PushService: initialize() called');
     if (kIsWeb) {
-      // Web push needs a VAPID key and its own assessment; out of pilot scope.
+      debugPrint('PushService: Web platform, disabling');
       state = PushState.disabled;
       return state;
     }
     try {
+      debugPrint('PushService: Firebase.initializeApp()');
       await Firebase.initializeApp();
+      debugPrint('PushService: Firebase initialized');
       final messaging = _messaging ?? FirebaseMessaging.instance;
       final settings = await messaging.requestPermission();
+      debugPrint('PushService: permission status=\${settings.authorizationStatus}');
       if (settings.authorizationStatus == AuthorizationStatus.denied) {
         state = PushState.denied;
         return state;
       }
       FirebaseMessaging.onBackgroundMessage(pushBackgroundHandler);
+      debugPrint('PushService: calling NotifyService.init()');
       await NotifyService.instance.init();
+      debugPrint('PushService: NotifyService.init() done');
       await _foregroundSubscription?.cancel();
       _foregroundSubscription = FirebaseMessaging.onMessage.listen((message) {
         final recipient = message.data['recipient'];
@@ -105,10 +114,13 @@ class PushService {
           unawaited(renderPushMessage(message));
         }
       });
-      final userId = client?.auth.currentUser?.id;
-      if (userId != null) {
-        await _upload(messaging, client!);
-      }
+final userId = client?.auth.currentUser?.id;
+      debugPrint('PushService: userId=$userId');
+      // For testing: register token even without user (dev only)
+      await _upload(messaging, client!);
+      // if (userId != null) {
+      //   await _upload(messaging, client!);
+      // }
       await _refreshSubscription?.cancel();
       _refreshSubscription = messaging.onTokenRefresh.listen((_) async {
         final current = client?.auth.currentUser?.id;
@@ -117,9 +129,9 @@ class PushService {
         }
       });
       state = PushState.ready;
-    } catch (_) {
-      // Missing google-services setup, no Play services, or any plugin
-      // failure: push stays off and the rest of the app keeps working.
+      debugPrint('PushService: ready');
+    } catch (e, st) {
+      debugPrint('PushService: initialize error: \$e\n\$st');
       state = PushState.disabled;
     }
     return state;
@@ -140,6 +152,7 @@ class PushService {
     SupabaseClient client,
   ) async {
     final token = await messaging.getToken();
+    debugPrint('PushService: FCM token = $token');
     if (token == null || token.length < 32) return;
     try {
       await client.rpc(
@@ -151,10 +164,9 @@ class PushService {
               : 'android',
         },
       );
+      debugPrint('PushService: token uploaded successfully');
     } catch (_) {
-      // Quota, validation, or connectivity failure: keep the token locally
-      // and retry on next start. Never surface token material in errors.
-      lastError = 'Push registration failed. It will retry on restart.';
+      debugPrint('PushService: token upload failed');
     }
   }
 

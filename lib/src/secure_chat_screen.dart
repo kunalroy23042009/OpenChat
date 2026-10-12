@@ -5,6 +5,7 @@ import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:emoji_picker_flutter/emoji_picker_flutter.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:video_player/video_player.dart';
@@ -74,6 +75,14 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
   /// Pending in-place correction: (target ref, original text).
   ({String ref, String text})? _editing;
 
+  /// Floating WhatsApp-style reaction bar (tap a bubble). Dismissed on
+  /// selection, outside tap, scroll, or dispose — never stacked twice.
+  OverlayEntry? _reactBar;
+
+  /// Last tap-down position, used to anchor the reaction bar near the
+  /// bubble. Falls back to upper-center when unavailable.
+  Offset? _tapPos;
+
   /// In-chat search state. Filters the rendered list; history untouched.
   bool _searching = false;
   String _searchQuery = '';
@@ -92,6 +101,7 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
     widget.store.setSecureUnread(accountId, widget.peerId, false);
     composer.text = widget.store.secureDraft(accountId, widget.peerId);
     composer.addListener(_saveDraft);
+    scroll.addListener(_hideReactBar);
     _pinsFuture = widget.store.securePins(accountId, widget.peerId);
     _bootstrap();
   }
@@ -1122,7 +1132,7 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
           ).showSnackBar(const SnackBar(content: Text('Copied to clipboard')));
         }
       case 'react':
-        await _reactPicker(msg);
+        await _fullEmojiKeyboard(msg);
       case 'edit':
         if (!msg.canEdit(DateTime.now())) {
           if (mounted) {
@@ -1291,53 +1301,147 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
     }
   }
 
-  /// Emoji picker for reactions. Sends explicit set/remove state (never a
-  /// toggle) and applies it optimistically; a failed send reverts.
-  static const _quickEmojis = [
-    '❤️',
-    '😂',
-    '😮',
-    '😢',
-    '🙏',
-    '👍',
-    '👎',
-    '🔥',
-    '🎉',
-    '✅',
-  ];
+  void _hideReactBar() {
+    _reactBar?.remove();
+    _reactBar = null;
+  }
 
-  Future<void> _reactPicker(SecureMessage msg) async {
+  /// WhatsApp-style quick reactions: a floating bar with the 6 standard
+  /// emojis plus a "+" that opens the full emoji keyboard. One tap sends.
+  static const _barEmojis = ['❤️', '😂', '😮', '😢', '🙏', '👍'];
+
+  void _showReactBar(SecureMessage msg) {
+    _hideReactBar();
+    final votes =
+        widget.store.secureReactions(accountId, widget.peerId)[msg.ref] ?? {};
+    final mq = MediaQuery.of(context);
+    const barWidth = 336.0;
+    const barHeight = 60.0;
+    final anchor = _tapPos ?? Offset(mq.size.width / 2, mq.size.height / 3);
+    // Bar floats above the tap; clamped so it never leaves the screen.
+    final left = (anchor.dx - barWidth / 2).clamp(
+      8.0,
+      (mq.size.width - barWidth - 8).clamp(8.0, double.infinity),
+    );
+    final top = (anchor.dy - barHeight - 72).clamp(
+      mq.padding.top + 64.0,
+      (mq.size.height - barHeight - 160).clamp(
+        mq.padding.top + 64.0,
+        double.infinity,
+      ),
+    );
+    late final OverlayEntry entry;
+    entry = OverlayEntry(
+      builder: (ctx) => Stack(
+        children: [
+          Positioned.fill(
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: _hideReactBar,
+              child: const SizedBox.expand(),
+            ),
+          ),
+          Positioned(
+            left: left,
+            top: top,
+            child: Material(
+              elevation: 8,
+              borderRadius: BorderRadius.circular(30),
+              color: Theme.of(ctx).colorScheme.surfaceContainerHigh,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 6,
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    for (final e in _barEmojis)
+                      GestureDetector(
+                        onTap: () {
+                          final side = votes[e];
+                          _hideReactBar();
+                          _toggleReaction(
+                            msg,
+                            e,
+                            side == 'mine' || side == 'both',
+                          );
+                        },
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 5),
+                          decoration: (votes[e] == 'mine' || votes[e] == 'both')
+                              ? BoxDecoration(
+                                  color: Theme.of(
+                                    ctx,
+                                  ).colorScheme.primaryContainer,
+                                  borderRadius: BorderRadius.circular(20),
+                                )
+                              : null,
+                          child: Text(
+                            e,
+                            style: const TextStyle(fontSize: 30),
+                          ),
+                        ),
+                      ),
+                    GestureDetector(
+                      onTap: () {
+                        _hideReactBar();
+                        _fullEmojiKeyboard(msg);
+                      },
+                      child: Container(
+                        margin: const EdgeInsets.only(left: 2),
+                        padding: const EdgeInsets.all(6),
+                        decoration: BoxDecoration(
+                          color: Theme.of(
+                            ctx,
+                          ).colorScheme.surfaceContainerHighest,
+                          shape: BoxShape.circle,
+                        ),
+                        child: Icon(
+                          Icons.add,
+                          size: 22,
+                          color: Theme.of(
+                            ctx,
+                          ).colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+    _reactBar = entry;
+    Overlay.of(context).insert(entry);
+  }
+
+  /// Full emoji keyboard for reactions (the "+" path and the menu's React).
+  Future<void> _fullEmojiKeyboard(SecureMessage msg) async {
     final votes =
         widget.store.secureReactions(accountId, widget.peerId)[msg.ref] ?? {};
     final emoji = await showModalBottomSheet<String>(
       context: context,
       showDragHandle: true,
+      isScrollControlled: true,
       builder: (ctx) => SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(8, 8, 8, 24),
-          child: Wrap(
-            alignment: WrapAlignment.center,
-            spacing: 4,
-            children: [
-              for (final e in _quickEmojis)
-                IconButton(
-                  tooltip: (votes[e] == 'mine' || votes[e] == 'both')
-                      ? 'Remove $e'
-                      : 'React $e',
-                  style: IconButton.styleFrom(
-                    backgroundColor: (votes[e] == 'mine' || votes[e] == 'both')
-                        ? Theme.of(ctx).colorScheme.primaryContainer
-                        : null,
-                  ),
-                  onPressed: () => Navigator.pop(ctx, e),
-                  icon: Text(e, style: const TextStyle(fontSize: 26)),
-                ),
-            ],
+        child: SizedBox(
+          height: MediaQuery.of(ctx).size.height * 0.55,
+          child: EmojiPicker(
+            onEmojiSelected: (category, e) => Navigator.pop(ctx, e.emoji),
+            config: Config(
+              categoryViewConfig: const CategoryViewConfig(
+                initCategory: Category.SMILEYS,
+                recentTabBehavior: RecentTabBehavior.NONE,
+              ),
+            ),
           ),
         ),
       ),
     );
-    if (emoji == null || !mounted) return;
+    if (emoji == null || emoji.isEmpty || !mounted) return;
     final side = votes[emoji];
     await _toggleReaction(msg, emoji, side == 'mine' || side == 'both');
   }
@@ -1534,7 +1638,9 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
 
   @override
   void dispose() {
+    _hideReactBar();
     composer.removeListener(_saveDraft);
+    scroll.removeListener(_hideReactBar);
     // Persist the draft even if the listener missed the last keystroke.
     widget.store.setSecureDraft(accountId, widget.peerId, composer.text);
     NotifyService.instance.openChats.remove(widget.peerId);
@@ -1828,8 +1934,23 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                               ],
                             );
                           }
+                          // Only plain text/reply bubbles react on single tap:
+                          // media opens on tap, polls vote on tap.
+                          final tappable =
+                              !body.isTombstone &&
+                              !body.isImage &&
+                              !body.isVideo &&
+                              !body.isPoll &&
+                              !body.isVote;
                           return GestureDetector(
                             key: ValueKey(msg.ref),
+                            onTapDown: tappable
+                                ? (details) =>
+                                      _tapPos = details.globalPosition
+                                : null,
+                            onTap: tappable
+                                ? () => _showReactBar(msg)
+                                : null,
                             onHorizontalDragEnd: body.isTombstone
                                 ? null
                                 : (details) {

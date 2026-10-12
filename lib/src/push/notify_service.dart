@@ -93,6 +93,7 @@ class NotifyService {
   Future<void> init() async {
     if (_ready) return;
     try {
+      debugPrint('NotifyService: initializing...');
       const android = AndroidInitializationSettings('@mipmap/ic_launcher');
       final ok = await _plugin.initialize(
         settings: const InitializationSettings(android: android),
@@ -101,20 +102,27 @@ class NotifyService {
           if (tap != null) onTap?.call(tap);
         },
       );
+      debugPrint('NotifyService: plugin initialized ok=$ok');
       if (ok != true) return;
       final impl = _plugin
           .resolvePlatformSpecificImplementation<
             AndroidFlutterLocalNotificationsPlugin
           >();
-      await impl?.createNotificationChannel(
+      debugPrint('NotifyService: android impl = $impl');
+      if (impl == null) {
+        debugPrint('NotifyService: ERROR - Android impl is null!');
+        return;
+      }
+      await impl.createNotificationChannel(
         const AndroidNotificationChannel(
           messagesChannel,
           'Messages',
           description: 'New encrypted message alerts',
-          importance: Importance.high,
+          importance: Importance.max,
         ),
       );
-      await impl?.createNotificationChannel(
+      debugPrint('NotifyService: messages channel created');
+      await impl.createNotificationChannel(
         const AndroidNotificationChannel(
           callsChannel,
           'Calls',
@@ -124,18 +132,20 @@ class NotifyService {
           enableVibration: true,
         ),
       );
-      await impl?.createNotificationChannel(
+      debugPrint('NotifyService: calls channel created');
+      await impl.createNotificationChannel(
         const AndroidNotificationChannel(
           statusChannel,
           'Status updates',
           description: 'New status updates from contacts',
-          importance: Importance.defaultImportance,
+          importance: Importance.max,
         ),
       );
+      debugPrint('NotifyService: status channel created');
       _ready = true;
-    } catch (_) {
-      // Plugin unavailable (widget tests, unsupported platforms):
-      // every render below degrades to a silent no-op.
+      debugPrint('NotifyService: ready=$_ready');
+    } catch (e, st) {
+      debugPrint('NotifyService: init error: $e\n$st');
       _ready = false;
     }
   }
@@ -171,16 +181,24 @@ class NotifyService {
     String? event,
     bool ignoreOpenChats = false,
   }) async {
-    if (!_ready) return;
+    if (!_ready) {
+      debugPrint('NotifyService: showMessage - not ready');
+      return;
+    }
     if (!ignoreOpenChats &&
         !shouldNotifyMessage(
           myId: null,
           senderId: peerId,
           openPeers: openChats,
         )) {
+      debugPrint('NotifyService: showMessage - suppressed by shouldNotifyMessage');
       return;
     }
-    if (!_newEvent('msg', event)) return;
+    if (!_newEvent('msg', event)) {
+      debugPrint('NotifyService: showMessage - deduplicated');
+      return;
+    }
+    debugPrint('NotifyService: showing message for peer=$peerId name=$name');
     await _plugin.show(
       id: notificationId('msg', peerId),
       title: name,
@@ -196,6 +214,7 @@ class NotifyService {
       ),
       payload: NotifyTap(kind: 'msg', peer: peerId, name: name).encode(),
     );
+    debugPrint('NotifyService: _plugin.show() completed');
   }
 
   /// Full-screen ringing that opens the app onto the incoming-call dialog.
