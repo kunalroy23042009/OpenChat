@@ -533,31 +533,43 @@ class _ChatHomeState extends State<ChatHome> {
             ),
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 24),
-              child: Wrap(
-                spacing: 8,
-                crossAxisAlignment: WrapCrossAlignment.center,
-                children: [
-                  ChoiceChip(
-                    label: const Text('All chats'),
-                    selected: filter == 'all',
-                    onSelected: (_) => setState(() => filter = 'all'),
-                  ),
-                  ChoiceChip(
-                    label: const Text('Unread'),
-                    selected: filter == 'unread',
-                    onSelected: (_) => setState(() => filter = 'unread'),
-                  ),
-                  ChoiceChip(
-                    label: const Text('Favourites'),
-                    selected: filter == 'favourites',
-                    onSelected: (_) => setState(() => filter = 'favourites'),
-                  ),
-                  IconButton(
-                    tooltip: 'New conversation',
-                    onPressed: () => newChat(wide),
-                    icon: const Icon(Icons.edit_square),
-                  ),
-                ],
+              child: SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: Row(
+                  children: [
+                    ChoiceChip(
+                      label: const Text('All chats'),
+                      selected: filter == 'all',
+                      onSelected: (_) => setState(() => filter = 'all'),
+                    ),
+                    const SizedBox(width: 8),
+                    ChoiceChip(
+                      label: const Text('Unread'),
+                      selected: filter == 'unread',
+                      onSelected: (_) => setState(() => filter = 'unread'),
+                    ),
+                    const SizedBox(width: 8),
+                    ChoiceChip(
+                      label: const Text('Favourites'),
+                      selected: filter == 'favourites',
+                      onSelected: (_) => setState(() => filter = 'favourites'),
+                    ),
+                    const SizedBox(width: 8),
+                    ChoiceChip(
+                      avatar: const Icon(Icons.archive_outlined, size: 18),
+                      label: const Text('Archived'),
+                      selected: archivedOpen,
+                      onSelected: (_) =>
+                          setState(() => archivedOpen = !archivedOpen),
+                    ),
+                    const SizedBox(width: 8),
+                    IconButton(
+                      tooltip: 'New conversation',
+                      onPressed: () => newChat(wide),
+                      icon: const Icon(Icons.edit_square),
+                    ),
+                  ],
+                ),
               ),
             ),
             const SizedBox(height: 16),
@@ -1117,12 +1129,14 @@ class _SecureSectionState extends State<_SecureSection> {
                 ),
               );
             }
-            return SizedBox(
-              height: 72.0 * chats.length.clamp(1, 3),
-              child: ListView.builder(
-                padding: EdgeInsets.zero,
-                itemCount: chats.length,
-                itemBuilder: (context, i) {
+            // Shrink-wrapped (never a fixed height): rows can grow with
+            // large fonts or long previews without overflowing.
+            return ListView.builder(
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              padding: EdgeInsets.zero,
+              itemCount: chats.length,
+              itemBuilder: (context, i) {
                   final row = chats[i];
                   final contact = row.contact;
                   return ListTile(
@@ -1166,10 +1180,9 @@ class _SecureSectionState extends State<_SecureSection> {
                     onTap: () => _open(contact),
                   );
                 },
-              ),
-            );
-          },
-        ),
+              );
+            },
+          ),
         const Divider(height: 16),
       ],
     ),

@@ -5,6 +5,7 @@ import 'package:image_picker/image_picker.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'status_repository.dart';
+import 'video_status_view.dart';
 
 class StatusItem {
   const StatusItem({
@@ -16,6 +17,7 @@ class StatusItem {
     this.isViewed = false,
     this.backgroundColor = const Color(0xFF245CDB),
     this.imagePath,
+    this.mediaType = 'text',
   });
 
   final String id;
@@ -28,6 +30,10 @@ class StatusItem {
 
   /// Local gallery photo attached to this status (this-device demo for now).
   final String? imagePath;
+
+  /// 'text', 'image', or 'video'. Cloud text posts sync; media stays local
+  /// until the media pipeline lands for status.
+  final String mediaType;
 }
 
 class StatusPage extends StatefulWidget {
@@ -108,6 +114,12 @@ class _StatusPageState extends State<StatusPage> {
               title: const Text('Photo status'),
               onTap: () => Navigator.pop(ctx, 'photo'),
             ),
+            ListTile(
+              leading: const Icon(Icons.videocam_outlined),
+              title: const Text('Video status'),
+              subtitle: const Text('Up to 3 minutes, stays on this device'),
+              onTap: () => Navigator.pop(ctx, 'video'),
+            ),
           ],
         ),
       ),
@@ -117,35 +129,78 @@ class _StatusPageState extends State<StatusPage> {
       await _addPhotoStatus();
       return;
     }
+    if (choice == 'video') {
+      await _addVideoStatus();
+      return;
+    }
+    const palette = [
+      Color(0xFF0EA5E9),
+      Color(0xFF8B5CF6),
+      Color(0xFF10B981),
+      Color(0xFFF59E0B),
+      Color(0xFFEF4444),
+      Color(0xFF0F172A),
+    ];
+    var pickedColor = palette.first;
     final text = await showDialog<String>(
       context: context,
       builder: (ctx) {
         final controller = TextEditingController();
-        return AlertDialog(
-          title: const Text('Add Status Update'),
-          content: TextField(
-            controller: controller,
-            maxLength: 140,
-            decoration: const InputDecoration(
-              hintText: 'Type a status message...',
+        return StatefulBuilder(
+          builder: (ctx, setDialog) => AlertDialog(
+            title: const Text('Add Status Update'),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextField(
+                    controller: controller,
+                    maxLength: 140,
+                    decoration: const InputDecoration(
+                      hintText: 'Type a status message...',
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Wrap(
+                    spacing: 8,
+                    children: [
+                      for (final c in palette)
+                        InkWell(
+                          onTap: () => setDialog(() => pickedColor = c),
+                          child: CircleAvatar(
+                            radius: 16,
+                            backgroundColor: c,
+                            child: pickedColor == c
+                                ? const Icon(
+                                    Icons.check,
+                                    size: 16,
+                                    color: Colors.white,
+                                  )
+                                : null,
+                          ),
+                        ),
+                    ],
+                  ),
+                ],
+              ),
             ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(ctx, controller.text),
+                child: const Text('Post'),
+              ),
+            ],
           ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.pop(ctx, controller.text),
-              child: const Text('Post'),
-            ),
-          ],
         );
       },
     );
 
     if (text != null && text.trim().isNotEmpty) {
-      const color = Color(0xFF0EA5E9);
+      final color = pickedColor;
       setState(() {
         _statuses.insert(
           0,
@@ -188,6 +243,36 @@ class _StatusPageState extends State<StatusPage> {
           isViewed: true,
           backgroundColor: const Color(0xFF0F172A),
           imagePath: picked!.path,
+          mediaType: 'image',
+        ),
+      );
+    });
+  }
+
+  Future<void> _addVideoStatus() async {
+    XFile? picked;
+    try {
+      picked = await ImagePicker().pickVideo(
+        source: ImageSource.gallery,
+        maxDuration: const Duration(minutes: 3),
+      );
+    } on Exception catch (_) {
+      return;
+    }
+    if (picked == null || !mounted) return;
+    setState(() {
+      _statuses.insert(
+        0,
+        StatusItem(
+          id: DateTime.now().toIso8601String(),
+          authorName: 'My Status',
+          content: 'Video',
+          timestamp: DateTime.now(),
+          isMe: true,
+          isViewed: true,
+          backgroundColor: const Color(0xFF0F172A),
+          imagePath: picked!.path,
+          mediaType: 'video',
         ),
       );
     });
@@ -257,16 +342,21 @@ class _StatusPageState extends State<StatusPage> {
                           Flexible(
                             child: Padding(
                               padding: const EdgeInsets.all(16),
-                              child: ClipRRect(
-                                borderRadius: BorderRadius.circular(16),
-                                child: Image.file(
-                                  File(status.imagePath!),
-                                  fit: BoxFit.contain,
-                                ),
-                              ),
+                              child: status.mediaType == 'video'
+                                  ? VideoStatusView(
+                                      path: status.imagePath!,
+                                    )
+                                  : ClipRRect(
+                                      borderRadius: BorderRadius.circular(16),
+                                      child: Image.file(
+                                        File(status.imagePath!),
+                                        fit: BoxFit.contain,
+                                      ),
+                                    ),
                             ),
                           ),
-                          if (status.content != 'Photo')
+                          if (status.content != 'Photo' &&
+                              status.content != 'Video')
                             Padding(
                               padding: const EdgeInsets.all(16),
                               child: Text(
@@ -578,9 +668,16 @@ class _ChannelCardState extends State<_ChannelCard> {
       ),
       title: Row(
         children: [
-          Text(
-            widget.name,
-            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+          Expanded(
+            child: Text(
+              widget.name,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                fontWeight: FontWeight.bold,
+                fontSize: 15,
+              ),
+            ),
           ),
           const SizedBox(width: 4),
           const Icon(Icons.verified, color: Color(0xFF00A884), size: 16),
