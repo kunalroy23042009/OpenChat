@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -41,6 +43,7 @@ class _ContactsPageState extends State<ContactsPage>
   List<CloudContact> contacts = [];
   CloudContact? phoneMatch;
   List<SyncedContact> synced = [];
+  List<InvitableContact> invitable = [];
   int syncedChecked = 0;
   bool syncedRan = false;
   bool loading = true;
@@ -74,6 +77,37 @@ class _ContactsPageState extends State<ContactsPage>
   }
 
   Future<void> load() async {
+    // Show the last background sync instantly while fresh data loads.
+    try {
+      final uid = widget.client?.auth.currentUser?.id;
+      if (uid != null && widget.store != null) {
+        final raw = widget.store!.preferences.getString(
+          'openchat.sync.matched.v1.$uid',
+        );
+        if (raw != null && raw.isNotEmpty) {
+          final cached = (jsonDecode(raw) as List)
+              .map(
+                (e) => SyncedContact(
+                  contact: CloudContact(
+                    userId: (e as Map)['userId'] as String? ?? '',
+                    name: e['name'] as String? ?? 'OpenChat user',
+                    username: e['username'] as String? ?? '',
+                    about: e['about'] as String?,
+                    avatarUrl: e['avatarUrl'] as String?,
+                    status: 'found',
+                    incoming: false,
+                  ),
+                  phone: e['phone'] as String? ?? '',
+                ),
+              )
+              .toList();
+          setState(() {
+            synced = cached;
+            syncedRan = true;
+          });
+        }
+      }
+    } catch (_) {}
     setState(() {
       loading = true;
       error = null;
@@ -391,12 +425,13 @@ class _ContactsPageState extends State<ContactsPage>
                           try {
                             final result = await ContactSyncService(
                               widget.client!,
-                            ).sync();
+                            ).syncFull();
                             if (!mounted) return;
                             setState(() {
                               synced = result.matched;
                               syncedChecked = result.checked;
                               syncedRan = true;
+                              invitable = result.invitable;
                               if (result.matched.isEmpty) {
                                 feedback = result.checked == 0
                                     ? 'No usable phone numbers in your address book.'
@@ -470,6 +505,52 @@ class _ContactsPageState extends State<ContactsPage>
                         ),
                       ),
                     ),
+                  if (invitable.isNotEmpty) ...[
+                    const SizedBox(height: 8),
+                    Text(
+                      'Invite to OpenChat (${invitable.length})',
+                      style: const TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    for (final entry in invitable)
+                      Card(
+                        margin: const EdgeInsets.only(top: 8),
+                        child: ListTile(
+                          leading: CircleAvatar(
+                            child: Text(
+                              entry.name.isEmpty
+                                  ? '?'
+                                  : entry.name[0].toUpperCase(),
+                            ),
+                          ),
+                          title: Text(entry.name),
+                          subtitle: Text(entry.phone),
+                          trailing: FilledButton.tonal(
+                            onPressed: disabled
+                                ? null
+                                : () async {
+                                    final uri = Uri(
+                                      scheme: 'sms',
+                                      path: entry.phone,
+                                      queryParameters: {
+                                        'body': 'Chat with me on OpenChat — end-to-end encrypted messaging!',
+                                      },
+                                    );
+                                    if (!await launchUrl(uri)) {
+                                      if (mounted) {
+                                        setState(
+                                          () => error = 'Could not open your messaging app.',
+                                        );
+                                      }
+                                    }
+                                  },
+                            child: const Text('Invite'),
+                          ),
+                        ),
+                      ),
+                  ],
                   const SizedBox(height: 8),
                   OutlinedButton.icon(
                     onPressed: () async {

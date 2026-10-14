@@ -94,6 +94,7 @@ class GroupMessage {
     required this.type,
     required this.createdAt,
     this.senderName,
+    this.senderAvatar,
     this.parentMessageId,
     this.mediaUrl,
     this.metadata,
@@ -118,6 +119,7 @@ class GroupMessage {
   final String type;
   final DateTime createdAt;
   final String? senderName;
+  final String? senderAvatar;
   final String? parentMessageId;
   final String? mediaUrl;
   final Map<String, dynamic>? metadata;
@@ -153,6 +155,8 @@ class GroupMessage {
     type: json['type'] as String? ?? 'text',
     createdAt: DateTime.parse(json['created_at'] as String),
     senderName: json['sender_name'] as String?,
+    senderAvatar:
+        json['sender_avatar'] as String? ?? json['avatar_url'] as String?,
     parentMessageId: json['parent_message_id'] as String?,
     mediaUrl: json['media_url'] as String?,
     metadata: json['metadata'] as Map<String, dynamic>?,
@@ -574,7 +578,8 @@ class ConversationRepository extends ChangeNotifier {
         final local = Map<String, dynamic>.from(raw as Map);
         if (local['id'] == row['id'] &&
             local['sender_id'] == row['sender_id'] &&
-            local['content'] != 'Could not decrypt this group message on this device.' &&
+            local['content'] !=
+                'Could not decrypt this group message on this device.' &&
             !(local['content'] as String).startsWith('E2E1:')) {
           return {
             ...row,
@@ -877,7 +882,8 @@ class ConversationRepository extends ChangeNotifier {
         if (row['is_deleted'] == true) {
           messages.add(row);
         } else if (local != null &&
-            local['content'] != 'Could not decrypt this group message on this device.') {
+            local['content'] !=
+                'Could not decrypt this group message on this device.') {
           messages.add(local);
         } else if ((row['metadata'] as Map?)?['e2ee'] == true) {
           messages.add(await _decryptGroupRow(uid, row, throwOnFailure: true));
@@ -937,9 +943,9 @@ class ConversationRepository extends ChangeNotifier {
           final saved = Map<String, dynamic>.from(jsonDecode(archive) as Map);
           final fetchedIds = {for (final row in messageRows) row['id']};
           messageRows.addAll(
-            (saved['messages'] as List? ?? []).map(
-              (row) => Map<String, dynamic>.from(row as Map),
-            ).where((row) => !fetchedIds.contains(row['id'])),
+            (saved['messages'] as List? ?? [])
+                .map((row) => Map<String, dynamic>.from(row as Map))
+                .where((row) => !fetchedIds.contains(row['id'])),
           );
         }
       }
@@ -1293,6 +1299,7 @@ class ConversationRepository extends ChangeNotifier {
           type: messages[idx].type,
           createdAt: messages[idx].createdAt,
           senderName: messages[idx].senderName,
+          senderAvatar: messages[idx].senderAvatar,
           parentMessageId: messages[idx].parentMessageId,
           isEdited: true,
           editedAt: DateTime.now(),

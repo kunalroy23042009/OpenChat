@@ -6,9 +6,12 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'dart:async';
 
+import 'package:flutter_contacts/flutter_contacts.dart';
+
 import 'chat_store.dart';
 import 'chat_lock.dart';
 import 'contacts_repository.dart';
+import 'contacts_sync.dart';
 import 'local_profile.dart';
 import 'media/media_message.dart';
 import 'profile_page.dart';
@@ -99,6 +102,14 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
     // Silent scheduled backup (needs one manual backup first). Never
     // blocks startup and never surfaces errors.
     WidgetsBinding.instance.addPostFrameCallback((_) => _maybeAutoBackup());
+    // WhatsApp-style address-book sync: silent refresh when permission is
+    // already granted and the cache is stale. Never prompts on startup.
+    WidgetsBinding.instance.addPostFrameCallback(
+      (_) => _maybeAutoSyncContacts(),
+    );
+    // OpenChat AI works with the app sign-in alone: ensure its chat exists
+    // once per account so nobody must configure API keys.
+    WidgetsBinding.instance.addPostFrameCallback((_) => _maybeAddOpenChatAi());
   }
 
   Future<void> _publishSignalKeys() async {
@@ -121,6 +132,64 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
     if (state == AppLifecycleState.resumed) {
       _maybeAutoBackup();
     }
+  }
+
+  /// Silent contact refresh: runs at most once per day per account, only
+  /// when the OS permission is already granted (no startup prompts).
+  /// Results are cached for the People tab to show instantly.
+  Future<void> _maybeAutoSyncContacts() async {
+    final client = widget.client;
+    final uid = client?.auth.currentUser?.id;
+    if (uid == null) return;
+    try {
+      if (!await FlutterContacts.permissions.has(PermissionType.read)) return;
+      final prefs = widget.store.preferences;
+      final lastKey = 'openchat.sync.last.v1.$uid';
+      final last = prefs.getInt(lastKey) ?? 0;
+      if (DateTime.now().millisecondsSinceEpoch - last <
+          const Duration(hours: 24).inMilliseconds) {
+        return;
+      }
+      final result = await ContactSyncService(client!).syncFull();
+      await prefs.setInt(lastKey, DateTime.now().millisecondsSinceEpoch);
+      await prefs.setString(
+        'openchat.sync.matched.v1.$uid',
+        jsonEncode([
+          for (final m in result.matched)
+            {
+              'userId': m.contact.userId,
+              'name': m.contact.name,
+              'username': m.contact.username,
+              'about': m.contact.about,
+              'avatarUrl': m.contact.avatarUrl,
+              'phone': m.phone,
+            },
+        ]),
+      );
+    } catch (_) {
+      // Silent background refresh; the manual Sync button reports errors.
+    }
+  }
+
+  /// Ensures the keyless OpenChat AI assistant chat exists once per
+  /// account. Runs silently; failures never block startup.
+  Future<void> _maybeAddOpenChatAi() async {
+    final uid = widget.client?.auth.currentUser?.id;
+    if (uid == null) return;
+    try {
+      final flag = 'openchat.ai.seeded.v1.$uid';
+      if (widget.store.preferences.getBool(flag) == true) return;
+      if (widget.store.conversations.any((c) => c.isAi)) {
+        await widget.store.preferences.setBool(flag, true);
+        return;
+      }
+      await widget.store.createAiChat(
+        name: 'OpenChat AI',
+        provider: 'openchat',
+        color: 0xFF245CDB,
+      );
+      await widget.store.preferences.setBool(flag, true);
+    } catch (_) {}
   }
 
   Future<void> _maybeAutoBackup() async {
@@ -538,34 +607,75 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
       initialState: CallState.connected,
     );
     final startedAt = DateTime.now();
+    var incomingDone = false;
+    RealtimeChannel? remoteWatch;
+    Future<void> finishIncoming(String outcome, {bool pop = true}) async {
+      if (incomingDone) return;
+      incomingDone = true;
+      try {
+        await remoteWatch?.unsubscribe();
+      } catch (_) {}
+      if (outcome != 'remote') {
+        try {
+          await CallSignaling.finish(client, inviteId: inviteId);
+        } catch (_) {}
+      }
+      await service.hangUp();
+      try {
+        await CallRepository(client).add(
+          peerLabel: peerName,
+          peerId: callerId,
+          callType: callType,
+          outcome: outcome == 'remote'
+              ? (session.durationSeconds > 0 ? 'completed' : 'failed')
+              : outcome,
+          startedAt: startedAt,
+          durationSeconds: session.durationSeconds,
+          direction: 'incoming',
+        );
+      } catch (_) {}
+      service.dispose();
+      if (pop) {
+        try {
+          navigator.pop();
+        } catch (_) {}
+      }
+    }
+    remoteWatch =
+        client.channel('invite:$inviteId')
+      ..onPostgresChanges(
+        event: PostgresChangeEvent.update,
+        schema: 'public',
+        table: 'call_invites',
+        filter: PostgresChangeFilter(
+          type: PostgresChangeFilterType.eq,
+          column: 'id',
+          value: inviteId,
+        ),
+        callback: (payload) {
+          if (incomingDone) return;
+          if (payload.newRecord['status'] == 'ended') {
+            // Caller hung up: close our side too instead of stranding
+            // this device on a dead call screen.
+            finishIncoming('remote');
+          }
+        },
+      )
+      ..subscribe();
     await navigator.push(
       MaterialPageRoute<void>(
         builder: (_) => CallScreen(
           session: session,
           service: service,
-          onEndCall: () async {
-            try {
-              await CallSignaling.finish(client, inviteId: inviteId);
-            } catch (_) {}
-            await service.hangUp();
-            try {
-              await CallRepository(client).add(
-                peerLabel: peerName,
-                peerId: callerId,
-                callType: callType,
-                outcome: session.durationSeconds > 0 ? 'completed' : 'failed',
-                startedAt: startedAt,
-                durationSeconds: session.durationSeconds,
-                direction: 'incoming',
-              );
-            } catch (_) {}
-            service.dispose();
-            try {
-              navigator.pop();
-            } catch (_) {}
-          },
+          onEndCall: () => finishIncoming(
+            session.durationSeconds > 0 ? 'completed' : 'failed',
+          ),
         ),
       ),
+    );
+    await finishIncoming(
+      session.durationSeconds > 0 ? 'completed' : 'failed',
+      pop: false,
     );
   }
 

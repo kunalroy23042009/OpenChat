@@ -161,11 +161,22 @@ Future<void> startOutgoingCall(
       ),
       callback: (payload) {
         if (finished) return;
-        if (payload.newRecord['status'] == 'declined') {
+        final status = payload.newRecord['status'];
+        if (status == 'declined') {
           finish('declined');
           messenger.showSnackBar(
             SnackBar(content: Text('$peerName declined the call.')),
           );
+        } else if (status == 'ended') {
+          // Remote hangup (before or during the call): end locally too
+          // instead of stranding this side on a dead call screen.
+          final connected = service.remoteJoined || session.durationSeconds > 0;
+          finish(connected ? 'completed' : 'failed');
+          if (!connected) {
+            messenger.showSnackBar(
+              SnackBar(content: Text('$peerName ended the call.')),
+            );
+          }
         }
       },
     )

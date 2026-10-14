@@ -8,6 +8,7 @@ import '../widgets/message_actions.dart';
 import '../widgets/status_ticks.dart';
 import '../widgets/whatsapp_wallpaper.dart';
 import '../calling/call_screen.dart';
+import '../contacts_repository.dart';
 import 'conversation_repository.dart';
 import 'typing_presence.dart';
 import 'team_tools_page.dart';
@@ -67,6 +68,34 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   // Active interaction states
   GroupMessage? _replyingTo;
   GroupMessage? _editingMessage;
+
+  /// Sender profile photos by user id, resolved through contacts.
+  /// Server rows carry no avatar (profiles are self-read-only), so the
+  /// contacts listing is the accessible source of truth.
+  final Map<String, String> _senderAvatars = {};
+
+  String? _senderAvatarFor(GroupMessage msg) {
+    final server = msg.senderAvatar;
+    if (server != null && server.isNotEmpty) return server;
+    final known = _senderAvatars[msg.senderId];
+    return (known != null && known.isNotEmpty) ? known : null;
+  }
+
+  Future<void> _loadSenderAvatars() async {
+    try {
+      final contacts = await SupabaseContactsRepository(
+        Supabase.instance.client,
+      ).contacts();
+      if (!mounted) return;
+      setState(() {
+        for (final c in contacts) {
+          if (c.avatarUrl != null && c.avatarUrl!.isNotEmpty) {
+            _senderAvatars[c.userId] = c.avatarUrl!;
+          }
+        }
+      });
+    } catch (_) {}
+  }
 
   String get _currentUserId =>
       Supabase.instance.client.auth.currentUser?.id ?? '';
@@ -158,6 +187,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     }
 
     try {
+      unawaited(_loadSenderAvatars());
       if (!widget.readOnlyArchive) {
         unawaited(_repo.updatePresence(isOnline: true));
       }
@@ -563,6 +593,9 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                     final kickable = canManage && !isMe && role != 'owner';
                     return ListTile(
                       leading: CircleAvatar(
+                        foregroundImage: (_senderAvatars[id] ?? '').isNotEmpty
+                            ? NetworkImage(_senderAvatars[id]!)
+                            : null,
                         child: Text(name.isEmpty ? '?' : name[0].toUpperCase()),
                       ),
                       title: Text(name),
@@ -1085,17 +1118,44 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
           crossAxisAlignment: CrossAxisAlignment.start,
           mainAxisSize: MainAxisSize.min,
           children: [
-            // Sender name (for incoming group messages)
+            // Sender profile + name (for incoming group messages)
             if (!isMine && msg.senderName != null)
               Padding(
                 padding: const EdgeInsets.only(bottom: 2),
-                child: Text(
-                  msg.senderName!,
-                  style: const TextStyle(
-                    fontSize: 12,
-                    fontWeight: FontWeight.bold,
-                    color: Color(0xFF00A884),
-                  ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    CircleAvatar(
+                      radius: 10,
+                      backgroundColor: const Color(0xFFE4EBFF),
+                      foregroundImage: (_senderAvatarFor(msg) ?? '').isNotEmpty
+                          ? NetworkImage(_senderAvatarFor(msg)!)
+                          : null,
+                      child: Text(
+                        msg.senderName!.isEmpty
+                            ? '?'
+                            : msg.senderName![0].toUpperCase(),
+                        style: const TextStyle(
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold,
+                          color: Color(0xFF245CDB),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Flexible(
+                      child: Text(
+                        msg.senderName!,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
+                          color: Color(0xFF00A884),
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
               ),
 

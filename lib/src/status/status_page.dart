@@ -7,7 +7,18 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'status_repository.dart';
 import 'video_status_view.dart';
+import '../contacts_repository.dart'
+    show CloudContact, SupabaseContactsRepository;
 import '../push/notify_service.dart';
+
+/// Human "time ago" label, WhatsApp-style ("Just now", "5 min ago").
+String statusTimeAgo(DateTime when) {
+  final age = DateTime.now().difference(when);
+  if (age.inMinutes < 1) return 'Just now';
+  if (age.inMinutes < 60) return '${age.inMinutes} min ago';
+  if (age.inHours < 24) return '${age.inHours} h ago';
+  return '${age.inDays} d ago';
+}
 
 class StatusItem {
   const StatusItem({
@@ -20,6 +31,8 @@ class StatusItem {
     this.backgroundColor = const Color(0xFF245CDB),
     this.imagePath,
     this.mediaType = 'text',
+    this.authorId,
+    this.avatarUrl,
   });
 
   final String id;
@@ -29,6 +42,8 @@ class StatusItem {
   final bool isMe;
   final bool isViewed;
   final Color backgroundColor;
+  final String? authorId;
+  final String? avatarUrl;
 
   /// Local gallery photo attached to this status (this-device demo for now).
   final String? imagePath;
@@ -63,23 +78,39 @@ class _StatusPageState extends State<StatusPage> {
     if (client?.auth.currentUser == null) return;
     try {
       final cloud = await StatusRepository(client!).activeStatuses();
+      // Resolve real names/photos through contacts (profiles are
+      // self-read-only, so this is the accessible source of truth).
+      Map<String, CloudContact> byId = {};
+      try {
+        final contacts = await SupabaseContactsRepository(client).contacts();
+        byId = {for (final c in contacts) c.userId: c};
+      } catch (_) {}
       if (!mounted) return;
       final me = client.auth.currentUser!.id;
       setState(() {
         _statuses
           ..clear()
           ..addAll(
-            cloud.map(
-              (status) => StatusItem(
+            cloud.map((status) {
+              final isMe = status.authorId == me;
+              final contact = byId[status.authorId];
+              final name = isMe
+                  ? 'My Status'
+                  : (contact != null && contact.name.isNotEmpty
+                        ? contact.name
+                        : 'Contact');
+              return StatusItem(
                 id: status.id,
-                authorName: status.authorId == me ? 'My Status' : 'Contact',
+                authorName: name,
                 content: status.content,
                 timestamp: status.createdAt,
-                isMe: status.authorId == me,
-                isViewed: status.authorId == me,
+                isMe: isMe,
+                isViewed: isMe,
                 backgroundColor: Color(status.backgroundColor ?? 0xFF245CDB),
-              ),
-            ),
+                authorId: status.authorId,
+                avatarUrl: contact?.avatarUrl,
+              );
+            }),
           );
       });
     } catch (_) {
@@ -301,8 +332,13 @@ class _StatusPageState extends State<StatusPage> {
                   children: [
                     CircleAvatar(
                       backgroundColor: Colors.white24,
+                      foregroundImage: (status.avatarUrl ?? '').isNotEmpty
+                          ? NetworkImage(status.avatarUrl!)
+                          : null,
                       child: Text(
-                        status.authorName[0].toUpperCase(),
+                        status.authorName.isEmpty
+                            ? '?'
+                            : status.authorName[0].toUpperCase(),
                         style: const TextStyle(
                           color: Colors.white,
                           fontWeight: FontWeight.bold,
@@ -347,9 +383,7 @@ class _StatusPageState extends State<StatusPage> {
                             child: Padding(
                               padding: const EdgeInsets.all(16),
                               child: status.mediaType == 'video'
-                                  ? VideoStatusView(
-                                      path: status.imagePath!,
-                                    )
+                                  ? VideoStatusView(path: status.imagePath!)
                                   : ClipRRect(
                                       borderRadius: BorderRadius.circular(16),
                                       child: Image.file(
@@ -395,11 +429,42 @@ class _StatusPageState extends State<StatusPage> {
     );
   }
 
+  Widget _statusAvatar(StatusItem status, double radius) {
+    final url = status.avatarUrl;
+    return Container(
+      padding: const EdgeInsets.all(2),
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        border: Border.all(
+          color: status.isViewed ? Colors.grey : const Color(0xFF00A884),
+          width: 2.2,
+        ),
+      ),
+      child: CircleAvatar(
+        radius: radius,
+        backgroundColor: status.backgroundColor,
+        foregroundImage: (url != null && url.isNotEmpty)
+            ? NetworkImage(url)
+            : null,
+        child: Text(
+          status.authorName.isEmpty ? '?' : status.authorName[0].toUpperCase(),
+          style: const TextStyle(
+            color: Colors.white,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final myStatuses = _statuses.where((s) => s.isMe).toList();
-    final recentStatuses = _statuses.where((s) => !s.isMe).toList();
+    final freshStatuses = _statuses
+        .where((s) => !s.isMe && !s.isViewed)
+        .toList();
+    final seenStatuses = _statuses.where((s) => !s.isMe && s.isViewed).toList();
 
     return Scaffold(
       appBar: AppBar(
@@ -451,7 +516,7 @@ class _StatusPageState extends State<StatusPage> {
               }
             },
           ),
-          if (recentStatuses.isNotEmpty) ...[
+          if (freshStatuses.isNotEmpty) ...[
             const Padding(
               padding: EdgeInsets.fromLTRB(16, 16, 16, 8),
               child: Text(
@@ -463,43 +528,71 @@ class _StatusPageState extends State<StatusPage> {
                 ),
               ),
             ),
-            ...recentStatuses.map(
-            (status) => ListTile(
-              leading: Container(
-                padding: const EdgeInsets.all(2),
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  border: Border.all(
-                    color: status.isViewed
-                        ? Colors.grey
-                        : const Color(0xFF00A884),
-                    width: 2.2,
-                  ),
+            ...freshStatuses.map(
+              (status) => ListTile(
+                leading: _statusAvatar(status, 24),
+                title: Text(
+                  status.authorName,
+                  style: const TextStyle(fontWeight: FontWeight.w600),
                 ),
-                child: CircleAvatar(
-                  radius: 24,
-                  backgroundColor: status.backgroundColor,
-                  child: Text(
-                    status.authorName[0].toUpperCase(),
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
+                subtitle: Text(
+                  statusTimeAgo(status.timestamp),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
                 ),
+                onTap: () {
+                  _viewStatus(status);
+                  setState(() {
+                    final i = _statuses.indexWhere((s) => s.id == status.id);
+                    if (i >= 0) {
+                      final s = _statuses[i];
+                      _statuses[i] = StatusItem(
+                        id: s.id,
+                        authorName: s.authorName,
+                        content: s.content,
+                        timestamp: s.timestamp,
+                        isMe: s.isMe,
+                        isViewed: true,
+                        backgroundColor: s.backgroundColor,
+                        imagePath: s.imagePath,
+                        mediaType: s.mediaType,
+                        authorId: s.authorId,
+                        avatarUrl: s.avatarUrl,
+                      );
+                    }
+                  });
+                },
               ),
-              title: Text(
-                status.authorName,
-                style: const TextStyle(fontWeight: FontWeight.w600),
-              ),
-              subtitle: Text(
-                status.content,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-              ),
-              onTap: () => _viewStatus(status),
             ),
-          )],
+          ],
+          if (seenStatuses.isNotEmpty) ...[
+            const Padding(
+              padding: EdgeInsets.fromLTRB(16, 16, 16, 8),
+              child: Text(
+                'Viewed updates',
+                style: TextStyle(
+                  fontWeight: FontWeight.bold,
+                  color: Colors.grey,
+                  fontSize: 13,
+                ),
+              ),
+            ),
+            ...seenStatuses.map(
+              (status) => ListTile(
+                leading: _statusAvatar(status, 24),
+                title: Text(
+                  status.authorName,
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+                subtitle: Text(
+                  statusTimeAgo(status.timestamp),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                onTap: () => _viewStatus(status),
+              ),
+            ),
+          ],
           const Divider(thickness: 8, height: 24),
           // Channels arrive with the communities milestone; no fictional
           // entries are shown in the meantime.
