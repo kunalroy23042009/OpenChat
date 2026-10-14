@@ -12,6 +12,8 @@ import 'src/onboarding.dart';
 import 'src/ops/error_report.dart';
 import 'src/push/push_service.dart';
 import 'src/theme/app_theme.dart';
+import 'src/security/app_lock.dart';
+import 'src/security/secure_history_database.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -34,11 +36,14 @@ Future<void> main() async {
   final recovery = client == null
       ? null
       : RecoveryController(client.auth.onAuthStateChange);
+  final preferences = await SharedPreferences.getInstance();
+  final secureHistory = SecureHistoryDatabase();
+  await secureHistory.initialize(preferences);
   final store = ChatStore(
-    await SharedPreferences.getInstance(),
+    preferences,
     purgeDemoSeeds: true,
+    secureHistory: secureHistory,
   );
-  final preferences = store.preferences;
   final profile = LocalProfile(preferences);
   final theme = AppThemeController(preferences);
   // Load saved AI provider keys before any screen reads them; the ChatStore
@@ -149,6 +154,8 @@ class _OpenChatAppState extends State<OpenChatApp> {
           ? theme.emeraldTheme
           : theme.darkTheme,
       themeMode: theme.themeMode,
+      builder: (context, child) =>
+          AppLockGate(child: child ?? const SizedBox()),
       home: entered
           ? ChatHome(
               store: widget.store,

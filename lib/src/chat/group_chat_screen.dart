@@ -11,6 +11,7 @@ import '../calling/call_screen.dart';
 import 'conversation_repository.dart';
 import 'typing_presence.dart';
 import 'team_tools_page.dart';
+import '../security/secure_history_database.dart';
 
 /// Full-featured Group and Channel chat screen.
 ///
@@ -30,6 +31,9 @@ class GroupChatScreen extends StatefulWidget {
     this.conversationType = 'group',
     this.avatarUrl,
     this.memberCount = 0,
+    this.secureHistory,
+    this.readOnlyArchive = false,
+    this.e2eeEnabled = false,
   });
 
   final String conversationId;
@@ -37,6 +41,9 @@ class GroupChatScreen extends StatefulWidget {
   final String conversationType; // 'group' | 'channel'
   final String? avatarUrl;
   final int memberCount;
+  final SecureHistoryDatabase? secureHistory;
+  final bool readOnlyArchive;
+  final bool e2eeEnabled;
 
   @override
   State<GroupChatScreen> createState() => _GroupChatScreenState();
@@ -49,6 +56,8 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   final FocusNode _focusNode = FocusNode();
 
   bool _isLoading = true;
+  bool _loadingOlder = false;
+  bool _hasMoreHistory = true;
   String? _error;
 
   // Realtime Presence
@@ -65,9 +74,58 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   @override
   void initState() {
     super.initState();
-    _repo = ConversationRepository(Supabase.instance.client);
+    _repo = ConversationRepository(
+      Supabase.instance.client,
+      secureHistory: widget.secureHistory,
+      archiveConversation: {
+        'id': widget.conversationId,
+        'type': widget.conversationType,
+        'title': widget.conversationTitle,
+        'avatar_url': widget.avatarUrl,
+        'e2ee_enabled': widget.e2eeEnabled,
+      },
+    );
     _repo.addListener(_onRepoChanged);
+    _scrollController.addListener(_onHistoryScroll);
     _initChat();
+  }
+
+  void _onHistoryScroll() {
+    if (!_scrollController.hasClients ||
+        _loadingOlder ||
+        !_hasMoreHistory ||
+        _isLoading) {
+      return;
+    }
+    // This list is reversed: its largest scroll offset is the oldest end.
+    if (_scrollController.position.maxScrollExtent -
+            _scrollController.position.pixels <=
+        240) {
+      unawaited(_loadOlderMessages());
+    }
+  }
+
+  Future<void> _loadOlderMessages() async {
+    if (_loadingOlder || !_hasMoreHistory) return;
+    final loaded = _repo.messagesFor(widget.conversationId);
+    if (loaded.isEmpty) {
+      _hasMoreHistory = false;
+      return;
+    }
+    setState(() => _loadingOlder = true);
+    try {
+      final count = await _repo.loadMessages(
+        widget.conversationId,
+        before: loaded.last.createdAt,
+      );
+      if (mounted && count < ConversationRepository.messagePageSize) {
+        setState(() => _hasMoreHistory = false);
+      }
+    } catch (_) {
+      // Keep the paging affordance active so scrolling up retries.
+    } finally {
+      if (mounted) setState(() => _loadingOlder = false);
+    }
   }
 
   void _onRepoChanged() {
@@ -82,7 +140,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
         client.auth.currentUser?.phone ??
         'User';
 
-    if (myId != null) {
+    if (myId != null && !widget.readOnlyArchive) {
       _typingPresence = TypingPresence(
         client: client,
         conversationId: widget.conversationId,
@@ -100,8 +158,19 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     }
 
     try {
-      await _repo.loadMessages(widget.conversationId);
-      _repo.subscribeToConversation(widget.conversationId);
+      if (!widget.readOnlyArchive) {
+        unawaited(_repo.updatePresence(isOnline: true));
+      }
+      final count = await _repo.loadMessages(widget.conversationId);
+      _hasMoreHistory = count == ConversationRepository.messagePageSize;
+      if (widget.e2eeEnabled && !widget.readOnlyArchive) {
+        await _repo.retryPendingGroupMessages(widget.conversationId);
+      }
+      if (!widget.readOnlyArchive) {
+        _repo.subscribeToConversation(widget.conversationId);
+      } else {
+        _hasMoreHistory = false;
+      }
       if (mounted) setState(() => _isLoading = false);
     } catch (e) {
       if (mounted) {
@@ -123,7 +192,11 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
 
   @override
   void dispose() {
+    if (!widget.readOnlyArchive) {
+      unawaited(_repo.updatePresence(isOnline: false));
+    }
     _textController.dispose();
+    _scrollController.removeListener(_onHistoryScroll);
     _scrollController.dispose();
     _focusNode.dispose();
     _typingPresence?.dispose();
@@ -144,6 +217,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   }
 
   Future<void> _sendMessage() async {
+    if (widget.readOnlyArchive) return;
     final text = _textController.text.trim();
     if (text.isEmpty) return;
 
@@ -158,16 +232,35 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       return;
     }
 
-    _textController.clear();
     final replyId = _replyingTo?.id;
-    setState(() => _replyingTo = null);
-
+    final pending = _repo
+        .messagesFor(widget.conversationId)
+        .where(
+          (message) =>
+              message.isPending &&
+              message.content == text &&
+              message.parentMessageId == replyId,
+        );
     try {
-      await _repo.sendMessage(
-        widget.conversationId,
-        text,
-        parentMessageId: replyId,
-      );
+      if (pending.isNotEmpty) {
+        final pendingId = pending.first.id;
+        await _repo.retryPendingGroupMessages(widget.conversationId);
+        final stillPending = _repo
+            .messagesFor(widget.conversationId)
+            .any((message) => message.id == pendingId && message.isPending);
+        if (stillPending) {
+          _showToast('Message is still pending; it will retry when connected.');
+          return;
+        }
+      } else {
+        await _repo.sendMessage(
+          widget.conversationId,
+          text,
+          parentMessageId: replyId,
+        );
+      }
+      _textController.clear();
+      if (mounted) setState(() => _replyingTo = null);
       _scrollToBottom();
     } catch (e) {
       _showToast('Failed to send: $e');
@@ -205,22 +298,9 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   }
 
   void _startGroupCall(CallType type) {
-    final session = ActiveCallSession(
-      callId:
-          '${widget.conversationId}-${DateTime.now().millisecondsSinceEpoch}',
-      peerUsername: widget.conversationId,
-      peerDisplayName: widget.conversationTitle,
-      type: type,
-    );
-    Navigator.push(
-      context,
-      MaterialPageRoute<void>(
-        builder: (context) => CallScreen(
-          session: session,
-          onEndCall: () => Navigator.pop(context),
-        ),
-      ),
-    );
+    // No group-call media path exists (1:1 LiveKit calls only). Opening the
+    // call screen here would land on a dead-end placeholder, so fail loudly.
+    _showToast('Group calls aren\'t available yet. Use 1:1 encrypted chats.');
   }
 
   void _openMessageActions(GroupMessage msg) {
@@ -241,7 +321,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
           Navigator.pop(ctx);
           _startReply(msg);
         },
-        onEdit: isMine && msg.isEditable
+        onEdit: !widget.e2eeEnabled && isMine && msg.isEditable
             ? () {
                 Navigator.pop(ctx);
                 _startEdit(msg);
@@ -249,11 +329,29 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
             : null,
         onStar: () => _repo.toggleStar(msg.id),
         onPin: () => _repo.togglePin(widget.conversationId, msg.id),
-        onDeleteForMe: () => _repo.deleteMessage(msg.id, forEveryone: false),
+        onDeleteForMe: widget.e2eeEnabled
+            ? null
+            : () => _repo.deleteMessage(msg.id, forEveryone: false),
         onDeleteForEveryone: isMine
             ? () => _repo.deleteMessage(msg.id, forEveryone: true)
             : null,
-        onConvertToTask: () => _showTaskDialog(source: msg),
+        onInfo: isMine
+            ? () {
+                Navigator.pop(ctx);
+                showModalBottomSheet<void>(
+                  context: context,
+                  builder: (_) => MessageInfoSheet(
+                    messageText: msg.content,
+                    sentAt: msg.createdAt,
+                    editedAt: msg.editedAt,
+                    isEdited: msg.isEdited,
+                  ),
+                );
+              }
+            : null,
+        onConvertToTask: widget.e2eeEnabled
+            ? null
+            : () => _showTaskDialog(source: msg),
       ),
     );
   }
@@ -377,16 +475,18 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
             ],
           ),
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('Send'),
-          ),
-        ],
+        actions: widget.readOnlyArchive
+            ? const []
+            : [
+                TextButton(
+                  onPressed: () => Navigator.pop(context, false),
+                  child: const Text('Cancel'),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.pop(context, true),
+                  child: const Text('Send'),
+                ),
+              ],
       ),
     );
     final values = options
@@ -408,6 +508,156 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     for (final option in options) {
       option.dispose();
     }
+  }
+
+  /// Member roster with role badges. Admins/owners can remove members;
+  /// anyone can leave. Backed by list_conversation_members.
+  Future<void> _showMembers() async {
+    List<Map<String, dynamic>> roster = [];
+    String? error;
+    try {
+      roster = await _repo.members(widget.conversationId);
+    } catch (_) {
+      error = 'Could not load members. Check your connection.';
+    }
+    if (!mounted) return;
+    final myId = _currentUserId;
+    var myRole = 'member';
+    for (final m in roster) {
+      if (m['user_id'] == myId) myRole = (m['role'] as String?) ?? 'member';
+    }
+    final canManage = myRole == 'admin' || myRole == 'owner';
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Text(
+                '${widget.conversationTitle} • ${roster.length} members',
+                style: const TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+            if (error != null)
+              Padding(padding: const EdgeInsets.all(16), child: Text(error))
+            else
+              Flexible(
+                child: ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: roster.length,
+                  itemBuilder: (ctx, i) {
+                    final m = roster[i];
+                    final id = (m['user_id'] ?? '').toString();
+                    final name =
+                        (m['display_name'] as String?)?.isNotEmpty == true
+                        ? m['display_name'] as String
+                        : 'Member ${id.length >= 8 ? id.substring(0, 8) : id}';
+                    final role = (m['role'] as String?) ?? 'member';
+                    final isMe = id == myId;
+                    final kickable = canManage && !isMe && role != 'owner';
+                    return ListTile(
+                      leading: CircleAvatar(
+                        child: Text(name.isEmpty ? '?' : name[0].toUpperCase()),
+                      ),
+                      title: Text(name),
+                      subtitle: Text(
+                        '@${(m['username'] as String?) ?? 'unknown'}',
+                      ),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          if (role != 'member')
+                            Chip(
+                              label: Text(role),
+                              visualDensity: VisualDensity.compact,
+                            ),
+                          if (kickable)
+                            IconButton(
+                              tooltip: 'Remove member',
+                              icon: const Icon(Icons.person_remove_outlined),
+                              onPressed: () async {
+                                final confirmed = await showDialog<bool>(
+                                  context: ctx,
+                                  builder: (dctx) => AlertDialog(
+                                    title: Text('Remove $name?'),
+                                    content: const Text(
+                                      'They will stop receiving new messages.',
+                                    ),
+                                    actions: [
+                                      TextButton(
+                                        onPressed: () =>
+                                            Navigator.pop(dctx, false),
+                                        child: const Text('Cancel'),
+                                      ),
+                                      FilledButton(
+                                        onPressed: () =>
+                                            Navigator.pop(dctx, true),
+                                        child: const Text('Remove'),
+                                      ),
+                                    ],
+                                  ),
+                                );
+                                if (confirmed != true) return;
+                                try {
+                                  await _repo.removeMember(
+                                    widget.conversationId,
+                                    id,
+                                  );
+                                  if (!mounted) return;
+                                  Navigator.pop(context);
+                                  _showToast('$name removed.');
+                                } catch (_) {
+                                  if (ctx.mounted) {
+                                    ScaffoldMessenger.of(ctx).showSnackBar(
+                                      const SnackBar(
+                                        content: Text(
+                                          'Could not remove member.',
+                                        ),
+                                      ),
+                                    );
+                                  }
+                                }
+                              },
+                            ),
+                          if (isMe)
+                            TextButton(
+                              onPressed: () async {
+                                try {
+                                  await _repo.removeMember(
+                                    widget.conversationId,
+                                    myId,
+                                  );
+                                  if (!mounted) return;
+                                  Navigator.pop(context);
+                                  Navigator.pop(context);
+                                } catch (_) {
+                                  if (ctx.mounted) {
+                                    ScaffoldMessenger.of(ctx).showSnackBar(
+                                      const SnackBar(
+                                        content: Text('Could not leave.'),
+                                      ),
+                                    );
+                                  }
+                                }
+                              },
+                              child: const Text('Leave'),
+                            ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
   }
 
   @override
@@ -439,40 +689,48 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
             ),
             const SizedBox(width: 10),
             Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(
-                    widget.conversationTitle,
-                    style: const TextStyle(
-                      fontSize: 16,
-                      fontWeight: FontWeight.w600,
+              child: InkWell(
+                onTap: widget.readOnlyArchive ? null : _showMembers,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      widget.conversationTitle,
+                      style: const TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w600,
+                      ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                     ),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  Text(
-                    _presenceStatus != null && _presenceStatus!.isNotEmpty
-                        ? _presenceStatus!
-                        : widget.memberCount > 0
-                        ? '${widget.memberCount} members'
-                        : widget.conversationType,
-                    style: TextStyle(
-                      fontSize: 12,
-                      color:
-                          _presenceStatus != null && _presenceStatus!.isNotEmpty
-                          ? const Color(0xFF25D366)
-                          : (isDark ? Colors.white60 : Colors.black54),
-                      fontWeight:
-                          _presenceStatus != null && _presenceStatus!.isNotEmpty
-                          ? FontWeight.w500
-                          : FontWeight.normal,
+                    Text(
+                      widget.readOnlyArchive
+                          ? 'Recovered archive · read only'
+                          : _presenceStatus != null &&
+                                _presenceStatus!.isNotEmpty
+                          ? _presenceStatus!
+                          : widget.memberCount > 0
+                          ? '${widget.memberCount} members'
+                          : widget.conversationType,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color:
+                            _presenceStatus != null &&
+                                _presenceStatus!.isNotEmpty
+                            ? const Color(0xFF25D366)
+                            : (isDark ? Colors.white60 : Colors.black54),
+                        fontWeight:
+                            _presenceStatus != null &&
+                                _presenceStatus!.isNotEmpty
+                            ? FontWeight.w500
+                            : FontWeight.normal,
+                      ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                     ),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ],
+                  ],
+                ),
               ),
             ),
           ],
@@ -539,6 +797,25 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       body: WhatsAppWallpaper(
         child: Column(
           children: [
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+              color: Colors.amber.withValues(alpha: 0.14),
+              child: Row(
+                children: [
+                  const Icon(Icons.info_outline, size: 16, color: Colors.amber),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      widget.e2eeEnabled
+                          ? 'End-to-end encrypted group text is enabled. Media, polls and tasks are disabled in encrypted groups.'
+                          : 'This is a legacy group. Its messages are not end-to-end encrypted; create a new group for confidential messages.',
+                      style: TextStyle(fontSize: 12, height: 1.3),
+                    ),
+                  ),
+                ],
+              ),
+            ),
             // Pinned message banner (if any)
             if (pinnedMessages.isNotEmpty)
               _buildPinnedBanner(pinnedMessages.first, isDark),
@@ -558,13 +835,29 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                         horizontal: 10,
                         vertical: 8,
                       ),
-                      itemCount: messages.length,
+                      itemCount: messages.length + (_loadingOlder ? 1 : 0),
                       itemBuilder: (context, index) {
+                        if (index >= messages.length) {
+                          return const Padding(
+                            padding: EdgeInsets.all(16),
+                            child: Center(
+                              child: SizedBox(
+                                width: 20,
+                                height: 20,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              ),
+                            ),
+                          );
+                        }
                         final msg = messages[index];
                         final isMine = msg.senderId == _currentUserId;
 
                         return GestureDetector(
-                          onLongPress: () => _openMessageActions(msg),
+                          onLongPress: widget.readOnlyArchive
+                              ? null
+                              : () => _openMessageActions(msg),
                           child: _buildGroupBubble(msg, isMine, isDark),
                         );
                       },
@@ -576,7 +869,18 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
             if (_editingMessage != null) _buildEditBar(isDark),
 
             // Chat input bar
-            _buildInputBar(isDark),
+            if (widget.readOnlyArchive)
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(14),
+                color: isDark ? const Color(0xFF202C33) : Colors.white,
+                child: const Text(
+                  'This restored group history is read-only.',
+                  textAlign: TextAlign.center,
+                ),
+              )
+            else
+              _buildInputBar(isDark),
           ],
         ),
       ),
@@ -733,6 +1037,25 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       );
     }
 
+    if (msg.type == 'poll') {
+      final meta = msg.metadata;
+      final options =
+          (meta?['options'] as List?)?.whereType<String>().toList() ?? const [];
+      if (options.length >= 2) {
+        return Align(
+          alignment: isMine ? Alignment.centerRight : Alignment.centerLeft,
+          child: _GroupPollCard(
+            conversationId: widget.conversationId,
+            msg: msg,
+            options: options,
+            multiple: meta?['multiple'] == true,
+            isMine: isMine,
+            repo: _repo,
+          ),
+        );
+      }
+    }
+
     final bubbleColor = isMine
         ? (isDark ? const Color(0xFF005C4B) : const Color(0xFFD9FDD3))
         : (isDark ? const Color(0xFF1F2C34) : Colors.white);
@@ -818,7 +1141,15 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                     color: isDark ? Colors.white54 : Colors.black45,
                   ),
                 ),
-                if (isMine) ...[
+                if (isMine && msg.isPending)
+                  Padding(
+                    padding: const EdgeInsets.only(left: 5),
+                    child: Text(
+                      'Pending',
+                      style: TextStyle(fontSize: 10, color: Colors.orange[700]),
+                    ),
+                  )
+                else if (isMine) ...[
                   const SizedBox(width: 4),
                   const MessageStatusTicks(
                     state: MessageDeliveryState.delivered,
@@ -953,16 +1284,18 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                         ),
                       ),
                     ),
-                    IconButton(
-                      icon: const Icon(Icons.attach_file),
-                      color: Colors.grey[600],
-                      onPressed: () => _showAttachmentSheet(),
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.camera_alt_outlined),
-                      color: Colors.grey[600],
-                      onPressed: () => _showToast('Camera'),
-                    ),
+                    if (!widget.e2eeEnabled) ...[
+                      IconButton(
+                        icon: const Icon(Icons.attach_file),
+                        color: Colors.grey[600],
+                        onPressed: () => _showAttachmentSheet(),
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.camera_alt_outlined),
+                        color: Colors.grey[600],
+                        onPressed: () => _showToast('Camera'),
+                      ),
+                    ],
                   ],
                 ),
               ),
@@ -1007,17 +1340,10 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
           spacing: 20,
           runSpacing: 20,
           alignment: WrapAlignment.spaceAround,
+          // Only actions with a real implementation are shown. Media
+          // uploads were never wired for groups; dead tiles were removed
+          // rather than silently closing the sheet.
           children: [
-            _attachmentItem(
-              Icons.insert_drive_file,
-              'Document',
-              Colors.indigo,
-              () {},
-            ),
-            _attachmentItem(Icons.camera_alt, 'Camera', Colors.pink, () {}),
-            _attachmentItem(Icons.photo, 'Gallery', Colors.purple, () {}),
-            _attachmentItem(Icons.headphones, 'Audio', Colors.orange, () {}),
-            _attachmentItem(Icons.location_on, 'Location', Colors.green, () {}),
             _attachmentItem(
               Icons.poll,
               'Poll',
@@ -1053,6 +1379,158 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
           const SizedBox(height: 6),
           Text(label, style: const TextStyle(fontSize: 12)),
         ],
+      ),
+    );
+  }
+}
+
+/// Group poll card with live tallies. Tapping an option casts a ballot
+/// via vote_poll (single-choice replaces, multi-choice accumulates).
+class _GroupPollCard extends StatefulWidget {
+  const _GroupPollCard({
+    required this.conversationId,
+    required this.msg,
+    required this.options,
+    required this.multiple,
+    required this.isMine,
+    required this.repo,
+  });
+  final String conversationId;
+  final GroupMessage msg;
+  final List<String> options;
+  final bool multiple;
+  final bool isMine;
+  final ConversationRepository repo;
+
+  @override
+  State<_GroupPollCard> createState() => _GroupPollCardState();
+}
+
+class _GroupPollCardState extends State<_GroupPollCard> {
+  List<Map<String, dynamic>> _votes = [];
+  bool _loading = true;
+  bool _voting = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    try {
+      final votes = await widget.repo.pollVotes(widget.msg.id);
+      if (mounted) setState(() => _votes = votes);
+    } catch (_) {}
+    if (mounted) setState(() => _loading = false);
+  }
+
+  Future<void> _vote(int index) async {
+    if (_voting) return;
+    setState(() => _voting = true);
+    try {
+      await widget.repo.votePoll(widget.conversationId, widget.msg.id, index);
+      await _load();
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Vote failed. Try again.')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _voting = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final counts = List<int>.filled(widget.options.length, 0);
+    for (final v in _votes) {
+      final i = (v['option_index'] as num?)?.toInt();
+      if (i != null && i >= 0 && i < counts.length) counts[i]++;
+    }
+    final total = counts.fold(0, (a, b) => a + b);
+    return Align(
+      alignment: widget.isMine ? Alignment.centerRight : Alignment.centerLeft,
+      child: Container(
+        margin: const EdgeInsets.symmetric(vertical: 3),
+        constraints: BoxConstraints(
+          maxWidth: MediaQuery.of(context).size.width * 0.78,
+        ),
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: widget.isMine
+              ? (isDark ? const Color(0xFF005C4B) : const Color(0xFFD9FDD3))
+              : (isDark ? const Color(0xFF1F2C34) : Colors.white),
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (!widget.isMine && widget.msg.senderName != null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 4),
+                child: Text(
+                  widget.msg.senderName!,
+                  style: const TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                    color: Color(0xFF00A884),
+                  ),
+                ),
+              ),
+            Text(
+              widget.msg.content,
+              style: const TextStyle(
+                fontSize: 14.5,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 8),
+            if (_loading)
+              const LinearProgressIndicator()
+            else
+              for (var i = 0; i < widget.options.length; i++)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 6),
+                  child: InkWell(
+                    onTap: _voting ? null : () => _vote(i),
+                    borderRadius: BorderRadius.circular(8),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(child: Text(widget.options[i])),
+                            Text(
+                              '${counts[i]}',
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: isDark ? Colors.white60 : Colors.black54,
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 4),
+                        LinearProgressIndicator(
+                          value: total == 0 ? 0 : counts[i] / total,
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+            Text(
+              '$total vote${total == 1 ? '' : 's'}${widget.multiple ? ' • multiple choice' : ''}',
+              style: TextStyle(
+                fontSize: 11,
+                color: isDark ? Colors.white60 : Colors.black54,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

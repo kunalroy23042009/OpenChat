@@ -115,7 +115,10 @@ serve(async (req) => {
   const supabase = createClient(supabaseUrl, anonKey, {
     global: { headers: { Authorization: auth } },
   });
-  const { data: user } = await supabase.auth.getUser();
+  // Pass the token explicitly: pinned supabase-js versions resolve
+  // getUser() from storage session only and ignore the header.
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : auth;
+  const { data: user } = await supabase.auth.getUser(token);
   const me = user?.user?.id;
   if (!me) return json({ error: "Sign in to notify." }, 401);
   const { data: profile } = await supabase

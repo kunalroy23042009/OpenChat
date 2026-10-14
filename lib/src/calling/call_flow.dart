@@ -1,13 +1,17 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:math';
 
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import '../push/notify_service.dart';
+import '../security/signal_crypto.dart';
 import 'call_repository.dart';
 import 'call_screen.dart';
 import 'call_service.dart';
 import 'call_signaling.dart';
-import '../push/notify_service.dart';
 
 /// Outgoing 1:1 call: permissions → token → join room → ring peer → live
 /// screen. Callee accept/decline arrives over Realtime; unanswered rings
@@ -31,14 +35,27 @@ Future<void> startOutgoingCall(
   }
   final me = client.auth.currentUser!.id;
   final room = callRoomFor(me, peerId);
+  final mediaKey = base64UrlEncode(
+    List<int>.generate(32, (_) => Random.secure().nextInt(256)),
+  ).replaceAll('=', '');
+  late final String encryptedCallKey;
+  try {
+    encryptedCallKey = await SignalCrypto(
+      client: client,
+      accountId: me,
+      preferences: await SharedPreferences.getInstance(),
+    ).encryptText(peerId, mediaKey);
+  } catch (e) {
+    messenger.showSnackBar(
+      SnackBar(content: Text('Could not establish encrypted calling: $e')),
+    );
+    service.dispose();
+    return;
+  }
   late final String url;
   late final String token;
   try {
-    final creds = await CallSignaling.token(
-      client,
-      room: room,
-      name: peerName,
-    );
+    final creds = await CallSignaling.token(client, room: room, name: peerName);
     url = creds.url;
     token = creds.token;
   } catch (e) {
@@ -52,6 +69,7 @@ Future<void> startOutgoingCall(
       client,
       peerId: peerId,
       callType: type == CallType.video ? 'video' : 'voice',
+      encryptedCallKey: encryptedCallKey,
     );
     inviteId = invite.inviteId;
     // Ring a killed/background callee via FCM; foreground callees ring
@@ -74,6 +92,7 @@ Future<void> startOutgoingCall(
     url: url,
     token: token,
     video: type == CallType.video,
+    mediaKey: mediaKey,
   )) {
     messenger.showSnackBar(
       SnackBar(content: Text(service.error ?? 'Could not start the call.')),
@@ -130,28 +149,27 @@ Future<void> startOutgoingCall(
     }
   }
 
-  watch =
-      client.channel('invite:$inviteId')
-        ..onPostgresChanges(
-          event: PostgresChangeEvent.update,
-          schema: 'public',
-          table: 'call_invites',
-          filter: PostgresChangeFilter(
-            type: PostgresChangeFilterType.eq,
-            column: 'id',
-            value: inviteId,
-          ),
-          callback: (payload) {
-            if (finished) return;
-            if (payload.newRecord['status'] == 'declined') {
-              finish('declined');
-              messenger.showSnackBar(
-                SnackBar(content: Text('$peerName declined the call.')),
-              );
-            }
-          },
-        )
-        ..subscribe();
+  watch = client.channel('invite:$inviteId')
+    ..onPostgresChanges(
+      event: PostgresChangeEvent.update,
+      schema: 'public',
+      table: 'call_invites',
+      filter: PostgresChangeFilter(
+        type: PostgresChangeFilterType.eq,
+        column: 'id',
+        value: inviteId,
+      ),
+      callback: (payload) {
+        if (finished) return;
+        if (payload.newRecord['status'] == 'declined') {
+          finish('declined');
+          messenger.showSnackBar(
+            SnackBar(content: Text('$peerName declined the call.')),
+          );
+        }
+      },
+    )
+    ..subscribe();
   timeout = Timer(const Duration(seconds: 60), () {
     if (finished || service.remoteJoined || session.durationSeconds > 0) {
       return;
@@ -167,12 +185,14 @@ Future<void> startOutgoingCall(
       builder: (_) => CallScreen(
         session: session,
         service: service,
-        onEndCall: () => finish(
-          session.durationSeconds > 0 ? 'completed' : 'failed',
-        ),
+        onEndCall: () =>
+            finish(session.durationSeconds > 0 ? 'completed' : 'failed'),
       ),
     ),
   );
   // Route popped (system back or finish above already ran).
-  await finish(session.durationSeconds > 0 ? 'completed' : 'failed', pop: false);
+  await finish(
+    session.durationSeconds > 0 ? 'completed' : 'failed',
+    pop: false,
+  );
 }

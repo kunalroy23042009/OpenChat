@@ -6,6 +6,7 @@ import 'dart:convert';
 class MediaBody {
   const MediaBody.text(this.text, {this.forwarded = false})
     : kind = 'text',
+      metadata = const {},
       removed = false,
       path = null,
       key = null,
@@ -23,7 +24,7 @@ class MediaBody {
       quoteName = null,
       quoteText = null,
       target = null;
-  const MediaBody.image({required this.path, this.text = '', this.key, this.nonce, this.forwarded = false})
+  const MediaBody.image({required this.path, this.text = '', this.key, this.nonce, this.forwarded = false, this.metadata = const {}})
     : kind = 'image',
       removed = false,
       thumbPath = null,
@@ -49,6 +50,7 @@ class MediaBody {
     this.thumbNonce,
     this.durationSec = 0,
     this.forwarded = false,
+    this.metadata = const {},
   }) : kind = 'video',
       removed = false,
        pollId = null,
@@ -67,6 +69,7 @@ class MediaBody {
     this.multi = false,
     this.forwarded = false,
   }) : kind = 'poll',
+       metadata = const {},
       removed = false,
        text = '',
        path = null,
@@ -83,6 +86,7 @@ class MediaBody {
        target = null;
   const MediaBody.vote({required this.pollId, required this.choices})
     : kind = 'vote',
+      metadata = const {},
       removed = false,
       forwarded = false,
       text = '',
@@ -107,6 +111,7 @@ class MediaBody {
     required this.quoteText,
     this.forwarded = false,
   }) : kind = 'reply',
+       metadata = const {},
       removed = false,
        path = null,
        key = null,
@@ -123,6 +128,7 @@ class MediaBody {
        target = null;
   const MediaBody.delete({required this.target})
     : kind = 'del',
+      metadata = const {},
       removed = false,
       forwarded = false,
       text = '',
@@ -143,6 +149,7 @@ class MediaBody {
       quoteText = null;
   const MediaBody.tomb()
     : kind = 'tomb',
+      metadata = const {},
       removed = false,
       forwarded = false,
       text = '',
@@ -164,6 +171,7 @@ class MediaBody {
       target = null;
   const MediaBody.react({required this.target, required this.text, this.removed = false})
     : kind = 'react',
+      metadata = const {},
       forwarded = false,
       path = null,
       key = null,
@@ -182,6 +190,7 @@ class MediaBody {
       quoteText = null;
   const MediaBody.edit({required this.target, required this.text})
     : kind = 'edit',
+      metadata = const {},
       removed = false,
       forwarded = false,
       path = null,
@@ -199,7 +208,51 @@ class MediaBody {
       refId = null,
       quoteName = null,
       quoteText = null;
+  const MediaBody.voice({
+    required this.path,
+    required this.durationSec,
+    this.key,
+    this.nonce,
+    this.forwarded = false,
+    this.metadata = const {},
+  }) : kind = 'voice',
+       removed = false,
+       text = '',
+       thumbPath = null,
+       thumbKey = null,
+       thumbNonce = null,
+       pollId = null,
+       question = null,
+       options = null,
+       multi = false,
+       choices = null,
+       refId = null,
+       quoteName = null,
+       quoteText = null,
+       target = null;
+  const MediaBody.document({required this.path, required this.key, required this.nonce, this.metadata = const {}, this.forwarded = false})
+      : kind = 'document', text = '', removed = false, thumbPath = null, thumbKey = null, thumbNonce = null,
+        durationSec = 0, pollId = null, question = null, options = null, multi = false, choices = null,
+        refId = null, quoteName = null, quoteText = null, target = null;
+  const MediaBody.contact({required String name, this.metadata = const {}, this.forwarded = false})
+      : kind = 'contact', text = name, removed = false, path = null, key = null, nonce = null,
+        thumbPath = null, thumbKey = null, thumbNonce = null,
+        durationSec = 0, pollId = null, question = null, options = null, multi = false, choices = null,
+        refId = null, quoteName = null, quoteText = null, target = null;
+  const MediaBody._location({required this.text, required this.metadata, required this.forwarded})
+      : kind = 'location', removed = false, path = null, key = null, nonce = null,
+        thumbPath = null, thumbKey = null, thumbNonce = null,
+        durationSec = 0, pollId = null, question = null, options = null, multi = false, choices = null,
+        refId = null, quoteName = null, quoteText = null, target = null;
+  factory MediaBody.location({required double latitude, required double longitude, String? label, bool forwarded = false}) =>
+      MediaBody._location(text: label ?? '', metadata: {'lat': latitude, 'lng': longitude}, forwarded: forwarded);
   final String kind;
+  final Map<String, dynamic> metadata;
+  List<double> get waveform => (metadata['wave'] as List? ?? const []).cast<num>().map((v) => v.toDouble()).toList();
+  bool get viewOnce => metadata['once'] == true;
+  String get fileName => metadata['name'] as String? ?? 'Document';
+  int get byteLength => metadata['bytes'] as int? ?? 0;
+  bool get isDocument => kind == 'document';
   final String text;
   final String? path;
 
@@ -242,6 +295,19 @@ class MediaBody {
   bool get isTombstone => kind == 'tomb';
   bool get isReact => kind == 'react';
   bool get isEdit => kind == 'edit';
+  bool get isVoice => kind == 'voice';
+  bool get isContact => kind == 'contact';
+  bool get isLocation => kind == 'location';
+
+  /// Shared contact card fields (name in [text], numbers in metadata).
+  String get contactName => isContact ? text : '';
+  List<String> get contactPhones => isContact
+      ? ((metadata['phones'] as List?) ?? const []).whereType<String>().toList()
+      : const [];
+
+  /// Shared static location (null when absent or malformed).
+  double? get latitude => isLocation ? (metadata['lat'] as num?)?.toDouble() : null;
+  double? get longitude => isLocation ? (metadata['lng'] as num?)?.toDouble() : null;
 
   /// Text and quoted replies support in-place correction.
   bool get isEditable => kind == 'text' || kind == 'reply';
@@ -255,6 +321,10 @@ class MediaBody {
   /// "Forwarded" label). Text bodies gain a JSON envelope; media and
   /// polls keep every field.
   String get forwardedBody {
+    if (viewOnce) throw StateError('View-once media cannot be forwarded.');
+    if (isDocument) {
+      throw StateError('Documents must be re-uploaded for the next recipient.');
+    }
     switch (kind) {
       case 'image':
         return encodeImageBody(
@@ -276,6 +346,12 @@ class MediaBody {
           durationSec: durationSec,
           fwd: true,
         );
+      case 'voice':
+        return encodeVoiceBody(path ?? '', durationSec, key: key, nonce: nonce, waveform: waveform, fwd: true);
+      case 'contact':
+        return encodeContactBody(text, contactPhones, fwd: true);
+      case 'location':
+        return encodeLocationBody(latitude ?? 0, longitude ?? 0, label: text.isEmpty ? null : text, fwd: true);
       case 'poll':
         return encodePollBody(
           pollId ?? '',
@@ -367,6 +443,35 @@ String encodeEditBody(String target, String text) => jsonEncode({
   'b': text,
 });
 
+/// Voice note reference: path + duration.
+String encodeVoiceBody(
+  String path,
+  int durationSec, {
+  String? key,
+  String? nonce,
+  bool fwd = false,
+  List<double> waveform = const [],
+}) => jsonEncode({
+  't': 'voice',
+  'path': path,
+  'dur': durationSec,
+  'k': ?key,
+  'n': ?nonce,
+  'wave': waveform,
+  if (fwd) 'fwd': true,
+});
+
+String encodeDocumentBody(String path, String name, int bytes, {required String key, required String nonce, bool fwd = false}) =>
+    jsonEncode({'t': 'doc', 'path': path, 'name': name, 'bytes': bytes, 'k': key, 'n': nonce, if (fwd) 'fwd': true});
+
+/// Shared contact card: display name plus up to 5 phone numbers.
+String encodeContactBody(String name, List<String> phones, {bool fwd = false}) =>
+    jsonEncode({'t': 'contact', 'name': name, 'phones': phones, if (fwd) 'fwd': true});
+
+/// Shared static location: WGS-84 coordinates plus an optional label.
+String encodeLocationBody(double latitude, double longitude, {String? label, bool fwd = false}) =>
+    jsonEncode({'t': 'loc', 'lat': latitude, 'lng': longitude, if (label != null && label.isNotEmpty) 'label': label, if (fwd) 'fwd': true});
+
 /// Local tombstone rendered where a deleted message stood.
 String encodeTombstoneBody() => jsonEncode({'t': 'tomb'});
 
@@ -380,12 +485,14 @@ String encodeImageBody(
   String? key,
   String? nonce,
   bool fwd = false,
+  bool viewOnce = false,
 }) => jsonEncode({
   't': 'img',
   'path': path,
   'cap': caption,
   'k': ?key,
   'n': ?nonce,
+  if (viewOnce) 'once': true,
   if (fwd) 'fwd': true,
 });
 
@@ -399,6 +506,7 @@ String encodeVideoBody(
   String? thumbNonce,
   int durationSec = 0,
   bool fwd = false,
+  bool viewOnce = false,
 }) => jsonEncode({
   't': 'vid',
   'path': path,
@@ -409,6 +517,7 @@ String encodeVideoBody(
   'tk': ?thumbKey,
   'tn': ?thumbNonce,
   'dur': durationSec,
+  if (viewOnce) 'once': true,
   if (fwd) 'fwd': true,
 });
 
@@ -495,6 +604,8 @@ MediaBody parseMessageBody(String raw) {
   try {
     final decoded = jsonDecode(raw);
     final fwd = decoded is Map<String, dynamic> && decoded['fwd'] == true;
+    String? str(Object? v) =>
+        v is String && v.isNotEmpty ? v : null;
     if (decoded is Map<String, dynamic> && decoded['t'] == 'txt') {
       final b = decoded['b'];
       if (b is String) return MediaBody.text(b, forwarded: fwd);
@@ -507,6 +618,7 @@ MediaBody parseMessageBody(String raw) {
       final key = decoded['k'];
       final nonce = decoded['n'];
       return MediaBody.image(
+          metadata: {'once': decoded['once'] == true},
           forwarded: fwd,
           path: decoded['path'] as String,
           text: caption is String ? caption : '',
@@ -518,10 +630,9 @@ MediaBody parseMessageBody(String raw) {
         decoded['t'] == 'vid' &&
         decoded['path'] is String &&
         (decoded['path'] as String).isNotEmpty) {
-      String? str(Object? v) =>
-          v is String && v.isNotEmpty ? v : null;
       final dur = decoded['dur'];
       return MediaBody.video(
+          metadata: {'once': decoded['once'] == true},
           forwarded: fwd,
           path: decoded['path'] as String,
           text: decoded['cap'] is String ? decoded['cap'] as String : '',
@@ -532,6 +643,60 @@ MediaBody parseMessageBody(String raw) {
           thumbNonce: str(decoded['tn']),
           durationSec: dur is int ? dur : 0,
       );
+    }
+    if (decoded is Map<String, dynamic> &&
+        decoded['t'] == 'voice' &&
+        decoded['path'] is String &&
+        (decoded['path'] as String).isNotEmpty) {
+      final dur = decoded['dur'];
+      final wave = decoded['wave'] ?? <double>[];
+      if (dur is! int || dur < 0 || dur > 7200 || wave is! List || wave.length > 96 ||
+          wave.any((v) => v is! num || !v.isFinite || v < 0 || v > 1)) {
+        return MediaBody.text(raw);
+      }
+      return MediaBody.voice(
+          metadata: {'wave': wave},
+          forwarded: fwd,
+          path: decoded['path'] as String,
+          durationSec: dur,
+          key: str(decoded['k']),
+          nonce: str(decoded['n']),
+      );
+    }
+    if (decoded is Map<String, dynamic> && decoded['t'] == 'doc') {
+      final name = decoded['name'];
+      final size = decoded['bytes'];
+      final path = str(decoded['path']);
+      final key = str(decoded['k']);
+      final nonce = str(decoded['n']);
+      if (name is String && name.isNotEmpty && name.length <= 255 && size is int && size >= 0 && size <= 200 * 1024 * 1024 && path != null && key != null && nonce != null) {
+        return MediaBody.document(path: path, key: key, nonce: nonce, forwarded: fwd, metadata: {'name': name, 'bytes': size});
+      }
+    }
+    if (decoded is Map<String, dynamic> && decoded['t'] == 'contact') {
+      final name = decoded['name'];
+      final phones = decoded['phones'];
+      if (name is String && name.isNotEmpty && name.length <= 100 && phones is List && phones.isNotEmpty && phones.length <= 5 &&
+          phones.every((p) => p is String && p.isNotEmpty && p.length <= 30)) {
+        return MediaBody.contact(
+            name: name,
+            metadata: {'phones': phones.cast<String>()},
+            forwarded: fwd);
+      }
+    }
+    if (decoded is Map<String, dynamic> && decoded['t'] == 'loc') {
+      final lat = decoded['lat'];
+      final lng = decoded['lng'];
+      final label = decoded['label'];
+      if (lat is num && lng is num && lat.isFinite && lng.isFinite &&
+          lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180 &&
+          (label == null || (label is String && label.length <= 140))) {
+        return MediaBody.location(
+            latitude: lat.toDouble(),
+            longitude: lng.toDouble(),
+            label: label is String && label.isNotEmpty ? label : null,
+            forwarded: fwd);
+      }
     }
     if (decoded is Map<String, dynamic> && decoded['t'] == 'poll') {
       final id = decoded['id'];

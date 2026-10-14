@@ -364,6 +364,20 @@ class _CallScreenState extends State<CallScreen> {
           ),
           if (widget.session.type == CallType.video)
             IconButton(
+              icon: Icon(
+                widget.session.isVideoEnabled
+                    ? Icons.videocam
+                    : Icons.videocam_off,
+                color: widget.session.isVideoEnabled
+                    ? Colors.white
+                    : Colors.redAccent,
+              ),
+              onPressed: failed
+                  ? null
+                  : () => service?.toggleVideo(),
+            ),
+          if (widget.session.type == CallType.video)
+            IconButton(
               icon: const Icon(Icons.flip_camera_ios_outlined, color: Colors.white),
               onPressed: failed
                   ? null

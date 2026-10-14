@@ -17,7 +17,7 @@ class ChatLock {
       _storage.write(key: _pinKey, value: pin);
 
   static bool validPin(String pin) =>
-      pin.length == 4 && int.tryParse(pin) != null;
+      RegExp(r'^[0-9]{4}$').hasMatch(pin);
 
   /// Prompts for the existing PIN. Returns true when it matches.
   static Future<bool> promptVerify(BuildContext context) async {
@@ -77,6 +77,10 @@ class ChatLock {
 
   /// Sets or changes the PIN (enter + confirm). Returns true when saved.
   static Future<bool> promptSetup(BuildContext context) async {
+    if (await hasPin()) {
+      if (!context.mounted || !await promptVerify(context)) return false;
+    }
+    if (!context.mounted) return false;
     final first = TextEditingController();
     final second = TextEditingController();
     String? error;

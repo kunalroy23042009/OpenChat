@@ -4,9 +4,12 @@ import 'package:open_chat/main.dart';
 import 'package:open_chat/src/chat_store.dart';
 import 'package:open_chat/src/local_profile.dart';
 import 'package:open_chat/src/push/push_service.dart';
+import 'package:open_chat/src/security/app_lock.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 Future<void> pumpApp(WidgetTester tester) async {
+  AppLock.testBypass = true;
+  AppLock.enabled.value = false;
   SharedPreferences.setMockInitialValues({});
   final preferences = await SharedPreferences.getInstance();
   await tester.pumpWidget(
@@ -59,6 +62,8 @@ void main() {
   });
 
   testWidgets('returning users skip onboarding', (tester) async {
+    AppLock.testBypass = true;
+    AppLock.enabled.value = false;
     SharedPreferences.setMockInitialValues({'openchat.onboarding.v1': true});
     final preferences = await SharedPreferences.getInstance();
     await tester.pumpWidget(

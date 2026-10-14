@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
@@ -134,6 +136,7 @@ class _ProfilePageState extends State<ProfilePage> {
     try {
       if (choice == 'remove') {
         await widget.profile.removeAvatar();
+        await _syncAvatarUrl(null);
       } else {
         final picked = await ImagePicker().pickImage(
           source: choice == 'camera' ? ImageSource.camera : ImageSource.gallery,
@@ -142,6 +145,7 @@ class _ProfilePageState extends State<ProfilePage> {
         );
         if (picked != null && mounted) {
           await widget.profile.setAvatar(picked.path);
+          await _syncAvatarUrl(widget.profile.avatarPath);
         }
       }
     } on PlatformException {
@@ -154,6 +158,32 @@ class _ProfilePageState extends State<ProfilePage> {
       }
     } finally {
       if (mounted) setState(() => busy = false);
+    }
+  }
+
+  /// Uploads the device photo to the public avatars bucket and points the
+  /// cloud profile at it. Best-effort: the local photo stays regardless.
+  Future<void> _syncAvatarUrl(String? localPath) async {
+    final client = widget.client;
+    if (client == null || client.auth.currentUser == null || !mounted) return;
+    try {
+      final repository = SupabaseContactsRepository(client);
+      if (localPath == null) {
+        await repository.setAvatarUrl(null);
+        return;
+      }
+      final uid = client.auth.currentUser!.id;
+      final name = '$uid/avatar_${DateTime.now().microsecondsSinceEpoch}.jpg';
+      await client.storage.from('avatars').upload(
+        name,
+        File(localPath),
+        fileOptions: const FileOptions(contentType: 'image/jpeg', upsert: true),
+      );
+      await repository.setAvatarUrl(client.storage.from('avatars').getPublicUrl(name));
+    } catch (_) {
+      if (mounted) {
+        setState(() => feedback = 'Photo saved on this device. Cloud sync failed — check your connection.');
+      }
     }
   }
 
@@ -379,7 +409,7 @@ class _ProfilePageState extends State<ProfilePage> {
               const Padding(
                 padding: EdgeInsets.symmetric(horizontal: 4),
                 child: Text(
-                  'Your profile photo is stored on this device. Profile-photo cloud sync is not yet available.',
+                  'Your profile photo is stored on this device and shared with your contacts when signed in.',
                   style: TextStyle(fontSize: 12, color: Color(0xFF66748A)),
                 ),
               ),

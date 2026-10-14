@@ -3,6 +3,57 @@ import 'package:flutter/services.dart';
 import 'formatted_text.dart';
 import 'status_ticks.dart';
 
+/// Plays a short fade-and-rise the first time a keyed item appears (new
+/// message or row), then stays static across rebuilds. A process-wide
+/// seen-set keyed by widget key means tick updates, reactions, and theme
+/// changes never replay the animation.
+class AppearOnce extends StatefulWidget {
+  const AppearOnce({super.key, required this.child});
+  final Widget child;
+  @override
+  State<AppearOnce> createState() => _AppearOnceState();
+}
+
+class _AppearOnceState extends State<AppearOnce>
+    with SingleTickerProviderStateMixin {
+  static final Set<String> _seen = {};
+  late final AnimationController _controller;
+  late final Animation<double> _opacity;
+  late final Animation<Offset> _offset;
+
+  @override
+  void initState() {
+    super.initState();
+    final firstSight = _seen.add(widget.key.toString());
+    if (_seen.length > 2000) _seen.clear();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 260),
+    );
+    final curve = CurvedAnimation(parent: _controller, curve: Curves.easeOut);
+    _opacity = curve;
+    _offset = Tween(begin: const Offset(0, 0.12), end: Offset.zero)
+        .animate(curve);
+    if (firstSight) {
+      _controller.forward();
+    } else {
+      _controller.value = 1;
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => FadeTransition(
+    opacity: _opacity,
+    child: SlideTransition(position: _offset, child: widget.child),
+  );
+}
+
 class WhatsAppBubble extends StatelessWidget {
   const WhatsAppBubble({
     super.key,
@@ -221,72 +272,4 @@ class WhatsAppBubble extends StatelessWidget {
   }
 }
 
-class WhatsAppAttachmentSheet extends StatelessWidget {
-  const WhatsAppAttachmentSheet({super.key, required this.onPick});
-  final ValueChanged<String> onPick;
 
-  @override
-  Widget build(BuildContext context) {
-    final isDark = Theme.of(context).brightness == Brightness.dark;
-
-    final items = [
-      {'label': 'Document', 'icon': Icons.insert_drive_file, 'color': const Color(0xFF7F66FF)},
-      {'label': 'Camera', 'icon': Icons.camera_alt, 'color': const Color(0xFFD3396D)},
-      {'label': 'Gallery', 'icon': Icons.image, 'color': const Color(0xFFAC44CF)},
-      {'label': 'Audio', 'icon': Icons.headphones, 'color': const Color(0xFFFF6500)},
-      {'label': 'Location', 'icon': Icons.location_on, 'color': const Color(0xFF0F9D58)},
-      {'label': 'Contact', 'icon': Icons.person, 'color': const Color(0xFF009EE6)},
-      {'label': 'Poll', 'icon': Icons.bar_chart, 'color': const Color(0xFF00A884)},
-    ];
-
-    return Container(
-      padding: const EdgeInsets.all(24),
-      decoration: BoxDecoration(
-        color: isDark ? const Color(0xFF1F2C34) : Colors.white,
-        borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
-      ),
-      child: GridView.builder(
-        shrinkWrap: true,
-        physics: const NeverScrollableScrollPhysics(),
-        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-          crossAxisCount: 4,
-          crossAxisSpacing: 16,
-          mainAxisSpacing: 16,
-          childAspectRatio: 0.85,
-        ),
-        itemCount: items.length,
-        itemBuilder: (context, i) {
-          final item = items[i];
-          final color = item['color'] as Color;
-          final icon = item['icon'] as IconData;
-          final label = item['label'] as String;
-
-          return GestureDetector(
-            onTap: () {
-              Navigator.pop(context);
-              onPick(label);
-            },
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                CircleAvatar(
-                  radius: 26,
-                  backgroundColor: color,
-                  child: Icon(icon, color: Colors.white, size: 24),
-                ),
-                const SizedBox(height: 6),
-                Text(
-                  label,
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: isDark ? Colors.white70 : const Color(0xFF54656F),
-                  ),
-                ),
-              ],
-            ),
-          );
-        },
-      ),
-    );
-  }
-}

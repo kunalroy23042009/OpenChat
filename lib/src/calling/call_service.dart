@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:livekit_client/livekit_client.dart';
@@ -11,7 +12,15 @@ String callRoomFor(String a, String b) {
   return 'dm_${ids[0]}_${ids[1]}';
 }
 
-enum LiveCallState { idle, joining, ringing, connected, reconnecting, ended, failed }
+enum LiveCallState {
+  idle,
+  joining,
+  ringing,
+  connected,
+  reconnecting,
+  ended,
+  failed,
+}
 
 /// Foreground 1:1 voice/video calling over LiveKit. Media never touches
 /// our backend: audio/video flows phone <-> LiveKit SFU, encrypted with
@@ -44,14 +53,6 @@ class CallService extends ChangeNotifier {
     return null;
   }
 
-  bool get remoteAudio {
-    if (_room == null) return false;
-    for (final p in _room!.remoteParticipants.values) {
-      if (p.audioTrackPublications.isNotEmpty) return true;
-    }
-    return false;
-  }
-
   Future<bool> ensurePermissions({required bool video}) async {
     final mic = await Permission.microphone.request();
     if (!mic.isGranted) {
@@ -74,12 +75,23 @@ class CallService extends ChangeNotifier {
     required String url,
     required String token,
     required bool video,
+    required String mediaKey,
   }) async {
     error = null;
     state = LiveCallState.joining;
     notifyListeners();
     try {
-      final room = Room();
+      final rawKey = Uint8List.fromList(
+        base64Url.decode(base64Url.normalize(mediaKey)),
+      );
+      if (rawKey.length != 32) {
+        throw StateError('End-to-end call encryption key is invalid.');
+      }
+      final keyProvider = await BaseKeyProvider.create();
+      await keyProvider.setRawKey(rawKey);
+      rawKey.fillRange(0, rawKey.length, 0);
+      final e2eeOptions = E2EEOptions(keyProvider: keyProvider);
+      final room = Room(roomOptions: RoomOptions(encryption: e2eeOptions));
       _room = room;
       _cancelEvents = room.events.listen(_onEvent);
       await room.connect(url, token);

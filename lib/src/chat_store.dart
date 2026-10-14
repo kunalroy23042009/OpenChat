@@ -5,6 +5,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'ai/ai_service.dart';
 import 'media/media_message.dart';
+import 'security/secure_history_database.dart';
 
 class ChatMessage {
   ChatMessage({required this.text, required this.mine, required this.at});
@@ -210,7 +211,11 @@ class ChatStore extends ChangeNotifier {
   /// tests keep them via [purgeDemoSeeds] = false.
   static const demoSeedIds = {'maya', 'leo', 'aisha', 'noah'};
 
-  ChatStore(this.preferences, {bool purgeDemoSeeds = false}) {
+  ChatStore(
+    this.preferences, {
+    bool purgeDemoSeeds = false,
+    this.secureHistory,
+  }) {
     AiService.instance.init(preferences);
     final saved = preferences.getString(storageKey);
     try {
@@ -235,6 +240,7 @@ class ChatStore extends ChangeNotifier {
   }
   static const storageKey = 'openchat.demo.v1';
   final SharedPreferences preferences;
+  final SecureHistoryDatabase? secureHistory;
   late List<Conversation> conversations;
   String? storageWarning;
   Future<void> _save() async {
@@ -250,6 +256,9 @@ class ChatStore extends ChangeNotifier {
       notifyListeners();
     }
   }
+
+  String? _securePayload(String key) =>
+      secureHistory?.read(key) ?? preferences.getString(key);
 
   /// Removes a local/demo conversation (swipe-to-delete). Encrypted
   /// cloud chats are managed through contacts, not here.
@@ -407,7 +416,7 @@ class ChatStore extends ChangeNotifier {
 
   Future<void> loadSecureConversation(String accountId, String peerId) async {
     final key = _secureKey(accountId, peerId);
-    final saved = preferences.getString(key);
+    final saved = _securePayload(key);
     if (saved == null) return;
     try {
       final data = jsonDecode(saved) as Map<String, dynamic>;
@@ -447,20 +456,6 @@ class ChatStore extends ChangeNotifier {
 
   static String _secureKey(String accountId, String peerId) =>
       '$_securePrefix$accountId-$peerId';
-
-  DateTime? lastSecureMessageTime(String accountId, String peerId) {
-    final key = _secureKey(accountId, peerId);
-    final saved = preferences.getString(key);
-    if (saved == null) return null;
-    try {
-      final data = jsonDecode(saved) as Map<String, dynamic>;
-      final list = (data['messages'] as List);
-      if (list.isEmpty) return null;
-      return DateTime.parse((list.last as Map)['at'] as String);
-    } catch (_) {
-      return null;
-    }
-  }
 
   Future<void> addSecureMessage(
     String accountId,
@@ -549,7 +544,7 @@ class ChatStore extends ChangeNotifier {
   }
 
   List<SecureMessage> _readSecureMessages(String key) {
-    final saved = preferences.getString(key);
+    final saved = _securePayload(key);
     if (saved == null) return [];
     final rows = (jsonDecode(saved) as Map)['messages'] as List;
     return rows
@@ -565,11 +560,16 @@ class ChatStore extends ChangeNotifier {
     String peerId,
     List<SecureMessage> messages,
   ) async {
-    final ok = await preferences.setString(
-      _secureKey(accountId, peerId),
-      jsonEncode({'messages': messages.map((m) => m.toJson()).toList()}),
-    );
-    if (!ok) throw StateError('Secure save failed');
+    final key = _secureKey(accountId, peerId);
+    final payload = jsonEncode({
+      'messages': messages.map((m) => m.toJson()).toList(),
+    });
+    if (secureHistory != null) {
+      await secureHistory!.write(key, payload);
+    } else {
+      final ok = await preferences.setString(key, payload);
+      if (!ok) throw StateError('Secure save failed');
+    }
     _syncSecureConversation(
       accountId,
       peerId,
@@ -611,7 +611,7 @@ class ChatStore extends ChangeNotifier {
 
   List<SecureMessage> getSecureConversation(String accountId, String peerId) {
     final key = _secureKey(accountId, peerId);
-    final saved = preferences.getString(key);
+    final saved = _securePayload(key);
     if (saved == null) return [];
     try {
       return _readSecureMessages(key).where((m) {
@@ -644,7 +644,7 @@ class ChatStore extends ChangeNotifier {
     if (clientId.isEmpty) return;
     final key = _secureKey(accountId, peerId);
     await _queueSecureWrite(key, () async {
-      final saved = preferences.getString(key);
+      final saved = _securePayload(key);
       if (saved == null) return;
       final messages = _readSecureMessages(key);
       var changed = false;
@@ -693,7 +693,7 @@ class ChatStore extends ChangeNotifier {
     final key = _secureKey(accountId, peerId);
     var removed = false;
     await _queueSecureWrite(key, () async {
-      final saved = preferences.getString(key);
+      final saved = _securePayload(key);
       if (saved == null) return;
       final messages = _readSecureMessages(key);
       final i = messages.indexWhere((m) => m.ref == ref && !m.hidden);
@@ -703,6 +703,33 @@ class ChatStore extends ChangeNotifier {
       removed = true;
     });
     return removed;
+  }
+
+  /// Atomically consumes a received view-once body before it is shown.
+  /// Retains envelope identity for dedupe but erases the persisted key.
+  Future<bool> consumeViewOnce(
+    String accountId,
+    String peerId,
+    String ref,
+  ) async {
+    var consumed = false;
+    await _queueSecureWrite(_secureKey(accountId, peerId), () async {
+      final messages = _readSecureMessages(_secureKey(accountId, peerId));
+      final index = messages.indexWhere(
+        (m) =>
+            m.ref == ref &&
+            !m.mine &&
+            !m.hidden &&
+            parseMessageBody(m.text).viewOnce,
+      );
+      if (index < 0) return;
+      messages[index] = messages[index].withBody(
+        encodeTextBody('View-once media opened'),
+      );
+      await _writeSecureMessages(accountId, peerId, messages);
+      consumed = true;
+    });
+    return consumed;
   }
 
   static String _starKey(String accountId, String peerId) =>
@@ -919,6 +946,156 @@ class ChatStore extends ChangeNotifier {
     // Only empty<->non-empty transitions change any UI (the home preview).
     if (wasEmpty == value.isEmpty) return;
     notifyListeners();
+  }
+
+  /// Full-fidelity export of every secure conversation for encrypted
+  /// cloud backup. Raw rows (including tombstones/ballots) plus stars,
+  /// pins, drafts, and the persisted reaction map — restore recomputes
+  /// derived state identically.
+  Map<String, dynamic> exportSecureBackup(String accountId) {
+    final prefix = '$_securePrefix$accountId-';
+    final peers = <String>{};
+    for (final key in preferences.getKeys()) {
+      if (key.startsWith(prefix)) peers.add(key.substring(prefix.length));
+    }
+    for (final key in secureHistory?.readEntries(prefix).keys ?? <String>[]) {
+      peers.add(key.substring(prefix.length));
+    }
+    final out = <String, dynamic>{};
+    for (final peerId in peers) {
+      out[peerId] = {
+        'messages': _readSecureMessages(_secureKey(accountId, peerId))
+            .map((m) => m.toJson())
+            .toList(),
+        'stars': preferences.getStringList(_starKey(accountId, peerId)) ?? [],
+        'pins': preferences.getStringList(_pinKey(accountId, peerId)) ?? [],
+        'draft': secureDraft(accountId, peerId),
+        'reacts': preferences.getString(_reactKey(accountId, peerId)) ?? '{}',
+      };
+    }
+    return out;
+  }
+
+  /// Merges a backup export into local state. Messages union by stable ref
+  /// (never duplicates, never drops local-only rows); stars/pins union
+  /// (pins keep the 3-slot cap); drafts fill only empty composers;
+  /// reactions fill only refs without local votes. Returns message count.
+  Future<int> importSecureBackup(
+    String accountId,
+    Map<String, dynamic> peers,
+  ) async {
+    var count = 0;
+    for (final entry in peers.entries) {
+      final peerId = entry.key;
+      final data = Map<String, dynamic>.from(entry.value as Map);
+      await _queueSecureWrite(_secureKey(accountId, peerId), () async {
+        final current = _readSecureMessages(_secureKey(accountId, peerId));
+        final seen = {for (final m in current) m.ref};
+        final merged = List<SecureMessage>.from(current);
+        for (final raw in (data['messages'] as List? ?? [])) {
+          try {
+            final m = SecureMessage.fromJson(
+              Map<String, dynamic>.from(raw as Map),
+            );
+            if (seen.add(m.ref)) merged.add(m);
+          } catch (_) {}
+        }
+        merged.sort((a, b) {
+          final time = a.at.compareTo(b.at);
+          return time == 0 ? a.ref.compareTo(b.ref) : time;
+        });
+        await _writeSecureMessages(accountId, peerId, merged);
+        count += (data['messages'] as List? ?? []).length;
+        final stars = {
+          ...?preferences.getStringList(_starKey(accountId, peerId)),
+          for (final s in (data['stars'] as List? ?? [])) s.toString(),
+        };
+        await preferences.setStringList(
+          _starKey(accountId, peerId),
+          stars.toList(),
+        );
+        final pins = [
+          ...?preferences.getStringList(_pinKey(accountId, peerId)),
+        ];
+        for (final p in (data['pins'] as List? ?? [])) {
+          if (pins.length >= 3) break;
+          if (!pins.contains(p.toString())) pins.add(p.toString());
+        }
+        await preferences.setStringList(_pinKey(accountId, peerId), pins);
+        if (secureDraft(accountId, peerId).isEmpty) {
+          final draft = (data['draft'] ?? '').toString();
+          if (draft.isNotEmpty) {
+            await preferences.setString(_draftKey(accountId, peerId), draft);
+          }
+        }
+        try {
+          final restored = jsonDecode(
+            (data['reacts'] ?? '{}').toString(),
+          ) as Map<String, dynamic>;
+          final local = jsonDecode(
+            preferences.getString(_reactKey(accountId, peerId)) ?? '{}',
+          ) as Map<String, dynamic>;
+          for (final e in restored.entries) {
+            local.putIfAbsent(e.key, () => e.value);
+          }
+          await preferences.setString(
+            _reactKey(accountId, peerId),
+            jsonEncode(local),
+          );
+        } catch (_) {}
+        notifyListeners();
+      });
+    }
+    return count;
+  }
+
+  static String _groupArchiveKey(String accountId, String conversationId) =>
+      'openchat.groupArchive.v1.$accountId.$conversationId';
+
+  String? groupArchive(String accountId, String conversationId) =>
+      _securePayload(_groupArchiveKey(accountId, conversationId));
+
+  /// Stores group history as an encrypted, read-only recovery archive.
+  /// The live server remains authoritative for group membership and writes;
+  /// importing a backup never impersonates another group member.
+  Future<int> importGroupBackup(
+    String accountId,
+    Map<String, dynamic> groups,
+  ) async {
+    var count = 0;
+    for (final entry in groups.entries) {
+      final archive = Map<String, dynamic>.from(entry.value as Map);
+      final messages = (archive['messages'] as List? ?? []);
+      final key = _groupArchiveKey(accountId, entry.key);
+      final local = _securePayload(key);
+      final existing = local == null
+          ? <String, dynamic>{}
+          : Map<String, dynamic>.from(jsonDecode(local) as Map);
+      final byId = <String, Map<String, dynamic>>{
+        for (final raw in (existing['messages'] as List? ?? []))
+          (raw as Map)['id'] as String: Map<String, dynamic>.from(raw),
+        for (final raw in messages)
+          (raw as Map)['id'] as String: Map<String, dynamic>.from(raw),
+      };
+      final merged = {
+        'conversation': archive['conversation'],
+        'messages': byId.values.toList()
+          ..sort(
+            (a, b) => (a['created_at'] as String).compareTo(
+              b['created_at'] as String,
+            ),
+          ),
+      };
+      final encoded = jsonEncode(merged);
+      if (secureHistory != null) {
+        await secureHistory!.write(key, encoded);
+      } else {
+        await preferences.setString(key, encoded);
+      }
+      count += messages.length;
+    }
+    notifyListeners();
+    return count;
   }
 
   static String _unreadKey(String accountId) => 'openchat.unread.v1.$accountId';

@@ -1,6 +1,9 @@
 package dev.openchat.open_chat.security
 
 import java.security.SecureRandom
+import java.util.UUID
+import org.signal.libsignal.protocol.groups.GroupCipher
+import org.signal.libsignal.protocol.groups.GroupSessionBuilder
 import org.signal.libsignal.protocol.IdentityKey
 import org.signal.libsignal.protocol.SessionBuilder
 import org.signal.libsignal.protocol.SessionCipher
@@ -12,6 +15,7 @@ import org.signal.libsignal.protocol.kem.KEMPublicKey
 import org.signal.libsignal.protocol.message.CiphertextMessage
 import org.signal.libsignal.protocol.message.PreKeySignalMessage
 import org.signal.libsignal.protocol.message.SignalMessage
+import org.signal.libsignal.protocol.message.SenderKeyDistributionMessage
 import org.signal.libsignal.protocol.state.KyberPreKeyRecord
 import org.signal.libsignal.protocol.state.PreKeyBundle
 import org.signal.libsignal.protocol.state.PreKeyRecord
@@ -95,6 +99,67 @@ object SignalSessions {
             else -> throw IllegalArgumentException("Unsupported message type")
         }
     }
+
+    /** Creates (once per sender/group epoch) a Signal Sender Key distribution. */
+    data class GroupSenderKey(val distributionId: UUID, val packet: ByteArray?, val created: Boolean)
+
+    fun createGroupSenderKey(
+        store: PersistentSignalStore,
+        groupSender: SignalProtocolAddress,
+    ): GroupSenderKey {
+        var distributionId = store.groupDistributionId(groupSender)
+        var packet = store.groupDistributionPacket(groupSender)
+        if (distributionId == null) {
+            distributionId = UUID.randomUUID()
+            store.saveGroupDistributionId(groupSender, distributionId)
+        }
+        if (packet == null) {
+            packet = GroupSessionBuilder(store).create(groupSender, distributionId).serialize()
+            store.saveGroupDistributionPacket(groupSender, packet)
+        }
+        val stableId = requireNotNull(distributionId)
+        val stablePacket = requireNotNull(packet) {
+            "Group sender-key distribution is missing"
+        }
+        return GroupSenderKey(
+            stableId,
+            stablePacket,
+            !store.isGroupDistributionPublished(groupSender),
+        )
+    }
+
+    fun markGroupSenderKeyPublished(
+        store: PersistentSignalStore,
+        groupSender: SignalProtocolAddress,
+    ) = store.markGroupDistributionPublished(groupSender)
+
+    /** Installs a pairwise-delivered sender-key distribution for a group epoch. */
+    fun processGroupSenderKey(
+        store: PersistentSignalStore,
+        groupSender: SignalProtocolAddress,
+        distribution: ByteArray,
+    ) {
+        val message = SenderKeyDistributionMessage(distribution)
+        if (store.containsSenderKey(groupSender, message.distributionId)) return
+        GroupSessionBuilder(store).process(groupSender, message)
+    }
+
+    fun encryptGroup(
+        store: PersistentSignalStore,
+        groupSender: SignalProtocolAddress,
+        plain: ByteArray,
+    ): ByteArray {
+        require(plain.size in 1..4000) { "Group message size out of bounds" }
+        val distributionId = store.groupDistributionId(groupSender)
+            ?: throw IllegalStateException("Group sender key is not initialized")
+        return GroupCipher(store, groupSender).encrypt(distributionId, plain).serialize()
+    }
+
+    fun decryptGroup(
+        store: PersistentSignalStore,
+        groupSender: SignalProtocolAddress,
+        ciphertext: ByteArray,
+    ): ByteArray = GroupCipher(store, groupSender).decrypt(ciphertext)
 
     private fun unusedId(contains: (Int) -> Boolean): Int {
         repeat(1000) {

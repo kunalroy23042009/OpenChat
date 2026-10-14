@@ -5,6 +5,7 @@ import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.util.TreeMap
+import java.util.UUID
 import org.signal.libsignal.protocol.IdentityKey
 import org.signal.libsignal.protocol.IdentityKeyPair
 import org.signal.libsignal.protocol.InvalidKeyIdException
@@ -23,7 +24,7 @@ import org.signal.libsignal.protocol.state.SignedPreKeyRecord
  * File-persisted Signal protocol store. State is a compact binary document
  * (Data streams only, so the same code runs on JVM tests and Android).
  * Callers must hold no locks; every mutation re-saves atomically.
- * Sender keys are process-local only: this pilot is 1:1 messaging.
+ * Sender-key chains and their distribution ids are persisted for E2EE groups.
  */
 class PersistentSignalStore(
     private val backend: SignalStoreBackend,
@@ -38,6 +39,9 @@ class PersistentSignalStore(
     private val kyberUsed = mutableSetOf<Int>()
     private val kyberBaseKeys = mutableMapOf<Pair<Int, Int>, MutableSet<ByteArrayKey>>()
     private val senderKeys = mutableMapOf<String, ByteArray>()
+    private val groupDistributionIds = TreeMap<String, String>()
+    private val groupDistributionPackets = mutableMapOf<String, ByteArray>()
+    private val groupDistributionsPublished = mutableSetOf<String>()
 
     init {
         backend.load()?.let { readFully(it) }
@@ -48,7 +52,7 @@ class PersistentSignalStore(
         val out = ByteArrayOutputStream()
         DataOutputStream(out).use { data ->
             data.writeBytes("OCSS")
-            data.writeInt(2)
+            data.writeInt(4)
             writeBytes(data, identity.serialize())
             data.writeInt(registrationId)
             writeStringMap(data, sessions)
@@ -65,6 +69,17 @@ class PersistentSignalStore(
                 data.writeInt(keys.size)
                 for (key in keys) writeBytes(data, key.bytes)
             }
+            writeStringMap(data, senderKeys)
+            data.writeInt(groupDistributionIds.size)
+            for ((groupKey, distributionId) in groupDistributionIds) {
+                writeBytes(data, groupKey.toByteArray(Charsets.UTF_8))
+                writeBytes(data, distributionId.toByteArray(Charsets.UTF_8))
+            }
+            writeStringMap(data, groupDistributionPackets)
+            data.writeInt(groupDistributionsPublished.size)
+            for (groupKey in groupDistributionsPublished) {
+                writeBytes(data, groupKey.toByteArray(Charsets.UTF_8))
+            }
         }
         backend.store(out.toByteArray())
     }
@@ -74,7 +89,8 @@ class PersistentSignalStore(
             val magic = ByteArray(4)
             data.readFully(magic)
             check(magic.contentEquals("OCSS".toByteArray())) { "Unknown store" }
-            check(data.readInt() == 2) { "Unsupported store version" }
+            val version = data.readInt()
+            check(version in 2..4) { "Unsupported store version" }
             val identityBytes = readBytes(data)
             check(IdentityKeyPair(identityBytes).publicKey.serialize().contentEquals(identity.publicKey.serialize())) {
                 "Store belongs to a different identity"
@@ -91,6 +107,23 @@ class PersistentSignalStore(
                 val keys = mutableSetOf<ByteArrayKey>()
                 repeat(data.readInt()) { keys.add(ByteArrayKey(readBytes(data))) }
                 kyberBaseKeys[pair] = keys
+            }
+            if (version >= 3) {
+                readStringMap(data, senderKeys)
+                repeat(data.readInt()) {
+                    val groupKey = String(readBytes(data), Charsets.UTF_8)
+                    val distributionId = String(readBytes(data), Charsets.UTF_8)
+                    UUID.fromString(distributionId)
+                    groupDistributionIds[groupKey] = distributionId
+                }
+            }
+            if (version >= 4) {
+                readStringMap(data, groupDistributionPackets)
+                repeat(data.readInt()) {
+                    groupDistributionsPublished.add(
+                        String(readBytes(data), Charsets.UTF_8),
+                    )
+                }
             }
         }
     }
@@ -243,15 +276,50 @@ class PersistentSignalStore(
         if (signedPreKeys.remove(signedPreKeyId) != null) save()
     }
 
-    // SenderKeyStore (process-local; unused by 1:1 pilot flows)
+    // SenderKeyStore
     @Synchronized
     override fun storeSenderKey(sender: SignalProtocolAddress, distributionId: java.util.UUID, record: SenderKeyRecord) {
         senderKeys["${addressKey(sender)}|${distributionId}"] = record.serialize()
+        save()
     }
 
     @Synchronized
     override fun loadSenderKey(sender: SignalProtocolAddress, distributionId: java.util.UUID): SenderKeyRecord? =
         senderKeys["${addressKey(sender)}|${distributionId}"]?.let { SenderKeyRecord(it) }
+
+    @Synchronized
+    fun containsSenderKey(sender: SignalProtocolAddress, distributionId: UUID): Boolean =
+        senderKeys.containsKey("${addressKey(sender)}|$distributionId")
+
+    @Synchronized
+    fun groupDistributionId(groupSender: SignalProtocolAddress): UUID? =
+        groupDistributionIds[addressKey(groupSender)]?.let(UUID::fromString)
+
+    @Synchronized
+    fun saveGroupDistributionId(groupSender: SignalProtocolAddress, id: UUID) {
+        groupDistributionIds[addressKey(groupSender)] = id.toString()
+        save()
+    }
+
+    @Synchronized
+    fun groupDistributionPacket(groupSender: SignalProtocolAddress): ByteArray? =
+        groupDistributionPackets[addressKey(groupSender)]?.copyOf()
+
+    @Synchronized
+    fun saveGroupDistributionPacket(groupSender: SignalProtocolAddress, packet: ByteArray) {
+        groupDistributionPackets[addressKey(groupSender)] = packet.copyOf()
+        save()
+    }
+
+    @Synchronized
+    fun isGroupDistributionPublished(groupSender: SignalProtocolAddress): Boolean =
+        addressKey(groupSender) in groupDistributionsPublished
+
+    @Synchronized
+    fun markGroupDistributionPublished(groupSender: SignalProtocolAddress) {
+        groupDistributionsPublished.add(addressKey(groupSender))
+        save()
+    }
 
     // KyberPreKeyStore
     @Synchronized

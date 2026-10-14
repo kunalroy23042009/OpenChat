@@ -6,8 +6,10 @@ import 'dart:typed_data';
 import 'package:image_picker/image_picker.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import '../backup/chat_backup.dart';
 import 'media_seal.dart';
 import 'media_message.dart';
+
 /// Reference to a sealed upload: object path plus base64 key material that
 /// travels inside the Signal-encrypted message.
 class SealedUpload {
@@ -51,7 +53,11 @@ class ChatMedia {
 
   /// New object, new key, new recipient path. Reusing the source path would
   /// deny the next recipient access under the private bucket's RLS policy.
-  Future<SealedUpload> uploadSealedBytes(Uint8List plain, String peerId, {bool video = false}) async {
+  Future<SealedUpload> uploadSealedBytes(
+    Uint8List plain,
+    String peerId, {
+    bool video = false,
+  }) async {
     final me = client.auth.currentUser?.id;
     if (me == null) throw const AuthException('Sign in to share media.');
     if (plain.length > (video ? maxVideoBytes : maxBytes)) {
@@ -59,41 +65,82 @@ class ChatMedia {
     }
     final sealed = await MediaSeal.seal(plain);
     final random = Random.secure();
-    final name = base64UrlEncode(List<int>.generate(18, (_) => random.nextInt(256)));
+    final name = base64UrlEncode(
+      List<int>.generate(18, (_) => random.nextInt(256)),
+    );
     final path = '$me/$peerId/$name.enc';
     await client.storage.from(bucket).uploadBinary(path, sealed.cipher);
-    return SealedUpload(path: path, key: base64Encode(sealed.key), nonce: base64Encode(sealed.nonce));
+    return SealedUpload(
+      path: path,
+      key: base64Encode(sealed.key),
+      nonce: base64Encode(sealed.nonce),
+    );
   }
 
   Future<String> forwardBody(MediaBody body, String peerId) async {
-    if (body.isImage || body.isVideo) {
-      if (body.path == null || body.path!.isEmpty) throw StateError('Missing media.');
-      if ((body.key == null) != (body.nonce == null)) throw StateError('Incomplete media key.');
+    if (body.viewOnce) throw StateError('View-once media cannot be forwarded.');
+    if (body.isDocument) {
+      throw StateError('Documents must be re-uploaded via DocumentTransfer.');
+    }
+    if (body.isImage || body.isVideo || body.isVoice) {
+      if (body.path == null || body.path!.isEmpty) {
+        throw StateError('Missing media.');
+      }
+      if ((body.key == null) != (body.nonce == null)) {
+        throw StateError('Incomplete media key.');
+      }
       final plain = body.isSealed
           ? await downloadSealed(body.path!, body.key!, body.nonce!)
           : await downloadRaw(body.path!);
-      final upload = await uploadSealedBytes(plain, peerId, video: body.isVideo);
+      final upload = await uploadSealedBytes(
+        plain,
+        peerId,
+        video: body.isVideo,
+      );
+      if (body.isVoice) {
+        return encodeVoiceBody(
+          upload.path,
+          body.durationSec,
+          key: upload.key,
+          nonce: upload.nonce,
+          waveform: body.waveform,
+          fwd: true,
+        );
+      }
       if (body.isImage) {
-        return encodeImageBody(upload.path, body.text, key: upload.key, nonce: upload.nonce, fwd: true);
+        return encodeImageBody(
+          upload.path,
+          body.text,
+          key: upload.key,
+          nonce: upload.nonce,
+          fwd: true,
+        );
       }
       // The duration tile works without a thumbnail; do not disclose an
       // old thumbnail path/key to a third participant.
-      return encodeVideoBody(upload.path, body.text, key: upload.key,
-          nonce: upload.nonce, durationSec: body.durationSec, fwd: true);
+      return encodeVideoBody(
+        upload.path,
+        body.text,
+        key: upload.key,
+        nonce: upload.nonce,
+        durationSec: body.durationSec,
+        fwd: true,
+      );
     }
     if (body.isPoll) {
       final random = Random.secure();
-      final id = base64UrlEncode(List<int>.generate(18, (_) => random.nextInt(256)));
-      return encodePollBody(id, body.question!, body.options!, multi: body.multi, fwd: true);
+      final id = base64UrlEncode(
+        List<int>.generate(18, (_) => random.nextInt(256)),
+      );
+      return encodePollBody(
+        id,
+        body.question!,
+        body.options!,
+        multi: body.multi,
+        fwd: true,
+      );
     }
     return body.forwardedBody;
-  }
-
-  /// Uploads an image picked from gallery/camera and returns its object
-  /// path `<sender>/<recipient>/<uuid>.jpg`.
-  Future<String> uploadImage(File file, String peerId) async {
-    final sealed = await uploadSealed(file, peerId);
-    return sealed.path;
   }
 
   /// Seals [file] with a fresh AES-256-GCM key, uploads the ciphertext,
@@ -130,7 +177,14 @@ class ChatMedia {
     String keyB64,
     String nonceB64,
   ) async {
-    final cipher = await client.storage.from(bucket).download(path);
+    Uint8List cipher;
+    try {
+      cipher = await client.storage.from(bucket).download(path);
+    } catch (_) {
+      final restored = await ChatBackup.restoreMediaBytes(client, path);
+      if (restored == null) rethrow;
+      cipher = restored;
+    }
     return MediaSeal.open(
       cipher: cipher,
       key: base64Decode(keyB64),
@@ -139,8 +193,15 @@ class ChatMedia {
   }
 
   /// Raw download for legacy unsealed uploads (no key material).
-  Future<Uint8List> downloadRaw(String path) =>
-      client.storage.from(bucket).download(path);
+  Future<Uint8List> downloadRaw(String path) async {
+    try {
+      return await client.storage.from(bucket).download(path);
+    } catch (_) {
+      final restored = await ChatBackup.restoreMediaBytes(client, path);
+      if (restored == null) rethrow;
+      return restored;
+    }
+  }
 
   static const maxVideoBytes = 64 * 1024 * 1024;
 
@@ -195,10 +256,6 @@ class ChatMedia {
     source: ImageSource.camera,
     maxDuration: const Duration(minutes: 3),
   );
-
-  /// Short-lived authenticated URL for rendering. Never share or persist it.
-  Future<String> displayUrl(String path) =>
-      client.storage.from(bucket).createSignedUrl(path, 3600);
 
   Future<XFile?> pickGalleryImage() => ImagePicker().pickImage(
     source: ImageSource.gallery,

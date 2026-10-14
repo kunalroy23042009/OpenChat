@@ -5,8 +5,13 @@ import 'package:open_chat/main.dart';
 import 'package:open_chat/src/chat_store.dart';
 import 'package:open_chat/src/local_profile.dart';
 import 'package:open_chat/src/push/push_service.dart';
+import 'package:open_chat/src/security/app_lock.dart';
 
 void main() {
+  setUp(() {
+    AppLock.testBypass = true;
+    AppLock.enabled.value = false;
+  });
   testWidgets('wide layout opens chat alongside searchable list', (
     tester,
   ) async {
@@ -105,6 +110,29 @@ void main() {
     );
     expect(restored.conversations.first.unread, 0);
   });
+  testWidgets('short landscape layout does not overflow', (tester) async {
+    tester.view.physicalSize = const Size(900, 360);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    SharedPreferences.setMockInitialValues({});
+    final preferences = await SharedPreferences.getInstance();
+    final store = ChatStore(preferences);
+    await tester.pumpWidget(
+      OpenChatApp(
+        store: store,
+        profile: LocalProfile(preferences),
+        preferences: preferences,
+        onboardingComplete: true,
+        push: PushService(),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('OpenChat'), findsOneWidget);
+    expect(find.textContaining('Good conversations'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
   test(
     'blank messages are ignored and corrupt data recovers visibly',
     () async {

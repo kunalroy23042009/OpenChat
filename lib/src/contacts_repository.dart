@@ -1,10 +1,11 @@
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 class AccountProfile {
-  const AccountProfile({required this.name, this.username, this.about, this.phone});
+  const AccountProfile({required this.name, this.username, this.about, this.phone, this.avatarUrl});
   final String name;
   final String? username;
   final String? about;
+  final String? avatarUrl;
 
   /// Self-asserted number until SMS verification is enabled.
   final String? phone;
@@ -17,6 +18,7 @@ class CloudContact {
     required this.name,
     required this.username,
     this.about,
+    this.avatarUrl,
     required this.status,
     required this.incoming,
   });
@@ -25,6 +27,7 @@ class CloudContact {
   final String name;
   final String username;
   final String? about;
+  final String? avatarUrl;
   final String status;
   final bool incoming;
   factory CloudContact.fromJson(Map<String, dynamic> json) => CloudContact(
@@ -33,6 +36,7 @@ class CloudContact {
     name: json['display_name'] as String,
     username: json['username'] as String? ?? '',
     about: json['about'] as String?,
+    avatarUrl: json['avatar_url'] as String?,
     status: json['status'] as String,
     incoming: json['incoming'] as bool,
   );
@@ -41,6 +45,7 @@ class CloudContact {
 abstract class ContactsRepository {
   Future<AccountProfile> profile();
   Future<void> saveProfile(String name, String username, String about);
+  Future<void> setAvatarUrl(String? url);
   Future<void> setMyPhone(String phone);
   Future<CloudContact?> findByPhone(String phone);
   Future<List<CloudContact>> contacts();
@@ -62,7 +67,7 @@ class SupabaseContactsRepository implements ContactsRepository {
     if (id == null) throw const AuthException('Sign in to load your profile.');
     final row = await client
         .from('profiles')
-        .select('display_name, username, about, phone_number')
+        .select('display_name, username, about, phone_number, avatar_url')
         .eq('id', id)
         .single();
     return AccountProfile(
@@ -70,7 +75,13 @@ class SupabaseContactsRepository implements ContactsRepository {
       username: row['username'] as String?,
       about: row['about'] as String?,
       phone: row['phone_number'] as String?,
+      avatarUrl: row['avatar_url'] as String?,
     );
+  }
+
+  @override
+  Future<void> setAvatarUrl(String? url) async {
+    await client.rpc('set_avatar_url', params: {'p_url': url});
   }
 
   @override
@@ -113,6 +124,7 @@ class SupabaseContactsRepository implements ContactsRepository {
       userId: row['user_id'] as String,
       name: row['display_name'] as String? ?? 'OpenChat user',
       username: row['username'] as String? ?? '',
+      avatarUrl: row['avatar_url'] as String?,
       status: 'found',
       incoming: false,
     );

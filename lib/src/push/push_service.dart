@@ -114,13 +114,8 @@ class PushService {
           unawaited(renderPushMessage(message));
         }
       });
-final userId = client?.auth.currentUser?.id;
-      debugPrint('PushService: userId=$userId');
-      // For testing: register token even without user (dev only)
-      await _upload(messaging, client!);
-      // if (userId != null) {
-      //   await _upload(messaging, client!);
-      // }
+      final userId = client?.auth.currentUser?.id;
+      if (userId != null) await _upload(messaging, client!);
       await _refreshSubscription?.cancel();
       _refreshSubscription = messaging.onTokenRefresh.listen((_) async {
         final current = client?.auth.currentUser?.id;
@@ -130,8 +125,8 @@ final userId = client?.auth.currentUser?.id;
       });
       state = PushState.ready;
       debugPrint('PushService: ready');
-    } catch (e, st) {
-      debugPrint('PushService: initialize error: \$e\n\$st');
+    } catch (_) {
+      lastError = 'Notification initialization failed. Try again from Settings.';
       state = PushState.disabled;
     }
     return state;
@@ -152,7 +147,6 @@ final userId = client?.auth.currentUser?.id;
     SupabaseClient client,
   ) async {
     final token = await messaging.getToken();
-    debugPrint('PushService: FCM token = $token');
     if (token == null || token.length < 32) return;
     try {
       await client.rpc(
@@ -166,8 +160,20 @@ final userId = client?.auth.currentUser?.id;
       );
       debugPrint('PushService: token uploaded successfully');
     } catch (_) {
-      debugPrint('PushService: token upload failed');
+      lastError = 'Push registration failed. It will retry on restart.';
     }
+  }
+
+  /// Removes this device token server-side so a signed-out device stops
+  /// receiving pushes for the previous account. Best-effort by design.
+  Future<void> unregister(SupabaseClient client) async {
+    if (kIsWeb) return;
+    try {
+      final token = await (_messaging ?? FirebaseMessaging.instance)
+          .getToken();
+      if (token == null || token.isEmpty) return;
+      await client.rpc('unregister_push_token', params: {'p_token': token});
+    } catch (_) {}
   }
 
   Future<void> dispose() async {

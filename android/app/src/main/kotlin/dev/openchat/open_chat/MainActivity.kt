@@ -3,23 +3,38 @@ package dev.openchat.open_chat
 import dev.openchat.open_chat.security.IdentityVault
 import dev.openchat.open_chat.security.SignalBridge
 import dev.openchat.open_chat.security.SignalDiagnostics
-import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.android.FlutterFragmentActivity
+import android.view.WindowManager
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.util.concurrent.Executors
 
-class MainActivity : FlutterActivity() {
+class MainActivity : FlutterFragmentActivity() {
     private val securityWorker = Executors.newSingleThreadExecutor()
     private var securityChannel: MethodChannel? = null
+    private var privacyChannel: MethodChannel? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        privacyChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "dev.openchat/privacy")
+        privacyChannel!!.setMethodCallHandler { call, result ->
+            if (call.method == "setSecure") {
+                if (call.argument<Boolean>("enabled") == true) {
+                    window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                } else {
+                    window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                }
+                result.success(true)
+            } else result.notImplemented()
+        }
         securityChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "dev.openchat/security")
         securityChannel!!.setMethodCallHandler { call, result ->
             if (call.method !in setOf("status", "initialize", "selfTest",
-                    "signalPublish", "signalProcessBundle", "signalEncrypt",
-                    "signalDecrypt", "blobSeal", "blobOpen", "signalHasSession")) {
+                     "signalPublish", "signalProcessBundle", "signalEncrypt",
+                     "signalDecrypt", "blobSeal", "blobOpen", "signalHasSession",
+                    "signalDeleteSession", "signalGroupCreate", "signalGroupProcess",
+                    "signalGroupEncrypt", "signalGroupDecrypt", "signalGroupMarkPublished")) {
                 result.notImplemented()
                 return@setMethodCallHandler
             }
@@ -46,6 +61,36 @@ class MainActivity : FlutterActivity() {
                             call.argument<Number>("type") ?: throw IllegalArgumentException("Invalid payload"),
                             call.argument<String>("body") ?: throw IllegalArgumentException("Invalid payload"),
                         )
+                        "signalGroupCreate" -> SignalBridge(applicationContext).createGroupSenderKey(
+                            requiredAccount(call),
+                            call.argument<String>("groupId") ?: throw IllegalArgumentException("Group required"),
+                            call.argument<Number>("epoch")?.toInt() ?: throw IllegalArgumentException("Epoch required"),
+                        )
+                        "signalGroupMarkPublished" -> SignalBridge(applicationContext).markGroupSenderKeyPublished(
+                            requiredAccount(call),
+                            call.argument<String>("groupId") ?: throw IllegalArgumentException("Group required"),
+                            call.argument<Number>("epoch")?.toInt() ?: throw IllegalArgumentException("Epoch required"),
+                        )
+                        "signalGroupProcess" -> SignalBridge(applicationContext).processGroupSenderKey(
+                            requiredAccount(call),
+                            call.argument<String>("groupId") ?: throw IllegalArgumentException("Group required"),
+                            call.argument<Number>("epoch")?.toInt() ?: throw IllegalArgumentException("Epoch required"),
+                            call.argument<String>("senderId") ?: throw IllegalArgumentException("Sender required"),
+                            call.argument<String>("distribution") ?: throw IllegalArgumentException("Distribution required"),
+                        )
+                        "signalGroupEncrypt" -> SignalBridge(applicationContext).encryptGroup(
+                            requiredAccount(call),
+                            call.argument<String>("groupId") ?: throw IllegalArgumentException("Group required"),
+                            call.argument<Number>("epoch")?.toInt() ?: throw IllegalArgumentException("Epoch required"),
+                            call.argument<String>("plain") ?: throw IllegalArgumentException("Payload required"),
+                        )
+                        "signalGroupDecrypt" -> SignalBridge(applicationContext).decryptGroup(
+                            requiredAccount(call),
+                            call.argument<String>("groupId") ?: throw IllegalArgumentException("Group required"),
+                            call.argument<Number>("epoch")?.toInt() ?: throw IllegalArgumentException("Epoch required"),
+                            call.argument<String>("senderId") ?: throw IllegalArgumentException("Sender required"),
+                            call.argument<String>("ciphertext") ?: throw IllegalArgumentException("Ciphertext required"),
+                        )
                         "blobSeal" -> SignalBridge(applicationContext).seal(
                             requiredAccount(call),
                             call.argument<String>("data") ?: throw IllegalArgumentException("Invalid payload"),
@@ -58,6 +103,14 @@ class MainActivity : FlutterActivity() {
                             requiredAccount(call),
                             call.argument<String>("peerId") ?: throw IllegalArgumentException("Contact required"),
                         ))
+                        "signalDeleteSession" -> {
+                            SignalBridge(applicationContext).resetPeer(
+                                requiredAccount(call),
+                                call.argument<String>("peerId") ?: throw IllegalArgumentException("Contact required"),
+                                call.argument<String>("identityKey"),
+                            )
+                            mapOf("ok" to true)
+                        }
                         else -> {
                             val vault = IdentityVault(applicationContext, requiredAccount(call))
                             if (call.method == "initialize") vault.initialize() else vault.status()
@@ -81,6 +134,8 @@ class MainActivity : FlutterActivity() {
         call.argument<String>("accountId") ?: throw IllegalArgumentException("Account required")
 
     override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
+        privacyChannel?.setMethodCallHandler(null)
+        privacyChannel = null
         securityChannel?.setMethodCallHandler(null)
         securityChannel = null
         super.cleanUpFlutterEngine(flutterEngine)

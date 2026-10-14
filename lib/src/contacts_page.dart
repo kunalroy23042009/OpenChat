@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import 'chat_store.dart';
 import 'contacts_repository.dart';
+import 'contacts_sync.dart';
 import 'local_profile.dart';
 import 'push/push_service.dart';
 import 'secure_chat_screen.dart';
@@ -33,9 +35,14 @@ class _ContactsPageState extends State<ContactsPage>
   final phone = TextEditingController();
   final inviteName = TextEditingController();
   final invitePhone = TextEditingController();
+  final contactSearch = TextEditingController();
   final profileForm = GlobalKey<FormState>();
+  String contactQuery = '';
   List<CloudContact> contacts = [];
   CloudContact? phoneMatch;
+  List<SyncedContact> synced = [];
+  int syncedChecked = 0;
+  bool syncedRan = false;
   bool loading = true;
   bool busy = false;
   bool loaded = false;
@@ -57,6 +64,7 @@ class _ContactsPageState extends State<ContactsPage>
     phone.dispose();
     inviteName.dispose();
     invitePhone.dispose();
+    contactSearch.dispose();
     super.dispose();
   }
 
@@ -113,6 +121,18 @@ class _ContactsPageState extends State<ContactsPage>
   }
 
   bool get disabled => loading || busy;
+
+  /// WhatsApp-style contact search across name, username, and about lines.
+  bool _matchesSearch(CloudContact c) {
+    final q = contactQuery.trim().toLowerCase();
+    if (q.isEmpty) return true;
+    return c.name.toLowerCase().contains(q) ||
+        c.username.toLowerCase().contains(q) ||
+        (c.about ?? '').toLowerCase().contains(q);
+  }
+
+  List<CloudContact> _filtered(Iterable<CloudContact> rows) =>
+      rows.where(_matchesSearch).toList();
   @override
   Widget build(BuildContext context) => Scaffold(
     appBar: AppBar(
@@ -243,8 +263,7 @@ class _ContactsPageState extends State<ContactsPage>
                           labelText: 'Phone number (optional)',
                           hintText: '+14155552671',
                           prefixIcon: Icon(Icons.phone_outlined),
-                          helperText:
-                              'Lets contacts find you by number. Verified by SMS once phone login is enabled.',
+                          helperText: 'Lets contacts find you by number. Verified by SMS once phone login is enabled.',
                           helperMaxLines: 2,
                         ),
                         validator: (v) {
@@ -344,13 +363,14 @@ class _ContactsPageState extends State<ContactsPage>
                       ? null
                       : () {
                           if (invitePhone.text.trim().isEmpty) {
-                            setState(() => error = 'Enter a valid phone number (e.g. +14155552671).');
+                            setState(
+                              () => error = 'Enter a valid phone number (e.g. +14155552671).',
+                            );
                             return;
                           }
                           perform(() async {
-                            final message = await widget.repository.inviteByPhone(
-                              invitePhone.text,
-                            );
+                            final message = await widget.repository
+                                .inviteByPhone(invitePhone.text);
                             if (mounted) invitePhone.clear();
                             return message;
                           });
@@ -360,13 +380,126 @@ class _ContactsPageState extends State<ContactsPage>
                 ),
                 const SizedBox(height: 8),
                 OutlinedButton.icon(
+                  onPressed: disabled || widget.client == null
+                      ? null
+                      : () async {
+                          setState(() {
+                            busy = true;
+                            error = null;
+                            feedback = null;
+                          });
+                          try {
+                            final result = await ContactSyncService(
+                              widget.client!,
+                            ).sync();
+                            if (!mounted) return;
+                            setState(() {
+                              synced = result.matched;
+                              syncedChecked = result.checked;
+                              syncedRan = true;
+                              if (result.matched.isEmpty) {
+                                feedback = result.checked == 0
+                                    ? 'No usable phone numbers in your address book.'
+                                    : 'Checked ${result.checked} numbers — none are on OpenChat yet. Invite them below.';
+                              }
+                            });
+                          } catch (e) {
+                            if (mounted) {
+                              setState(
+                                () => error = e is StateError
+                                    ? e.message.toString()
+                                    : 'Could not read your contacts. Check the permission and try again.',
+                              );
+                            }
+                          } finally {
+                            if (mounted) setState(() => busy = false);
+                          }
+                        },
+                  icon: const Icon(Icons.contacts_outlined),
+                  label: const Text('Sync phone contacts'),
+                ),
+                if (syncedRan) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    synced.isEmpty
+                        ? 'Phone contacts on OpenChat (0 of $syncedChecked)'
+                        : 'Phone contacts on OpenChat (${synced.length} of $syncedChecked)',
+                    style: const TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  for (final hit in synced)
+                    Card(
+                      margin: const EdgeInsets.only(top: 8),
+                      child: ListTile(
+                        leading: CircleAvatar(
+                          foregroundImage:
+                              (hit.contact.avatarUrl != null &&
+                                  hit.contact.avatarUrl!.isNotEmpty)
+                              ? NetworkImage(hit.contact.avatarUrl!)
+                              : null,
+                          child: Text(
+                            hit.contact.name.isEmpty
+                                ? '?'
+                                : hit.contact.name[0].toUpperCase(),
+                          ),
+                        ),
+                        title: Text(hit.contact.name),
+                        subtitle: Text(
+                          hit.contact.username.isEmpty
+                              ? hit.phone
+                              : '@${hit.contact.username} • ${hit.phone}',
+                        ),
+                        trailing: FilledButton.tonal(
+                          onPressed: disabled
+                              ? null
+                              : () => perform(() async {
+                                  if (hit.contact.username.isNotEmpty) {
+                                    final status = await widget.repository
+                                        .invite(hit.contact.username);
+                                    return status == 'sent'
+                                        ? 'Invitation sent.'
+                                        : status;
+                                  }
+                                  return widget.repository.inviteByPhone(
+                                    hit.phone,
+                                  );
+                                }),
+                          child: const Text('Invite'),
+                        ),
+                      ),
+                    ),
+                  const SizedBox(height: 8),
+                  OutlinedButton.icon(
+                    onPressed: () async {
+                      final uri = Uri(
+                        scheme: 'sms',
+                        queryParameters: {
+                          'body': 'Chat with me on OpenChat — end-to-end encrypted messaging. Ask me for my username!',
+                        },
+                      );
+                      if (!await launchUrl(uri)) {
+                        if (mounted)
+                          setState(
+                            () => error = 'Could not open your messaging app.',
+                          );
+                      }
+                    },
+                    icon: const Icon(Icons.sms_outlined),
+                    label: const Text('Invite friends via SMS'),
+                  ),
+                ],
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
                   onPressed: disabled
                       ? null
                       : () async {
                           final number = invitePhone.text.trim();
                           if (number.isEmpty) {
                             setState(
-                              () => error = 'Enter a phone number to look up first.',
+                              () => error =
+                                  'Enter a phone number to look up first.',
                             );
                             return;
                           }
@@ -402,6 +535,11 @@ class _ContactsPageState extends State<ContactsPage>
                     margin: const EdgeInsets.only(top: 12),
                     child: ListTile(
                       leading: CircleAvatar(
+                        foregroundImage:
+                            (phoneMatch!.avatarUrl != null &&
+                                phoneMatch!.avatarUrl!.isNotEmpty)
+                            ? NetworkImage(phoneMatch!.avatarUrl!)
+                            : null,
                         child: Text(
                           phoneMatch!.name.isEmpty
                               ? '?'
@@ -424,19 +562,18 @@ class _ContactsPageState extends State<ContactsPage>
                                     return await widget.repository
                                         .inviteByPhone(invitePhone.text);
                                   }
-                                  final status =
-                                      await widget.repository.invite(
-                                        target.username,
-                                      );
+                                  final status = await widget.repository.invite(
+                                    target.username,
+                                  );
                                   return switch (status) {
                                     'sent' => 'Invitation sent.',
                                     'already_sent' =>
                                       'Your invitation is already pending.',
                                     'already_connected' =>
                                       'You are already connected.',
-                                    'incoming_pending' =>
-                                      'They invited you already. Accept their invitation below.',
-                                    _ => 'That person is unavailable right now.',
+                                    'incoming_pending' => 'They invited you already. Accept their invitation below.',
+                                    _ =>
+                                      'That person is unavailable right now.',
                                   };
                                 });
                               },
@@ -450,29 +587,59 @@ class _ContactsPageState extends State<ContactsPage>
                   style: TextStyle(fontSize: 12),
                 ),
                 const Divider(height: 48),
+                TextField(
+                  controller: contactSearch,
+                  enabled: !loading,
+                  onChanged: (v) => setState(() => contactQuery = v),
+                  decoration: InputDecoration(
+                    hintText: 'Search contacts',
+                    prefixIcon: const Icon(Icons.search),
+                    suffixIcon: contactQuery.isEmpty
+                        ? null
+                        : IconButton(
+                            tooltip: 'Clear search',
+                            icon: const Icon(Icons.clear),
+                            onPressed: () => setState(() {
+                              contactSearch.clear();
+                              contactQuery = '';
+                            }),
+                          ),
+                    border: const OutlineInputBorder(),
+                    isDense: true,
+                  ),
+                ),
+                const SizedBox(height: 8),
                 section(
                   'Invitations received',
-                  contacts
-                      .where((c) => c.status == 'pending' && c.incoming)
-                      .toList(),
-                  'No invitations yet.',
+                  _filtered(
+                    contacts.where((c) => c.status == 'pending' && c.incoming),
+                  ),
+                  contactQuery.trim().isEmpty
+                      ? 'No invitations yet.'
+                      : 'No invitations match your search.',
                 ),
                 section(
                   'Your contacts',
-                  contacts.where((c) => c.status == 'accepted').toList(),
-                  'Your accepted invitations will appear here.',
+                  _filtered(contacts.where((c) => c.status == 'accepted')),
+                  contactQuery.trim().isEmpty
+                      ? 'Your accepted invitations will appear here.'
+                      : 'No contacts match your search.',
                 ),
                 section(
                   'Invitations sent',
-                  contacts
-                      .where((c) => c.status == 'pending' && !c.incoming)
-                      .toList(),
-                  'No pending invitations.',
+                  _filtered(
+                    contacts.where((c) => c.status == 'pending' && !c.incoming),
+                  ),
+                  contactQuery.trim().isEmpty
+                      ? 'No pending invitations.'
+                      : 'No sent invitations match your search.',
                 ),
                 section(
                   'Blocked',
-                  contacts.where((c) => c.status == 'blocked').toList(),
-                  'No blocked contacts.',
+                  _filtered(contacts.where((c) => c.status == 'blocked')),
+                  contactQuery.trim().isEmpty
+                      ? 'No blocked contacts.'
+                      : 'No blocked contacts match your search.',
                 ),
                 const SizedBox(height: 16),
                 const Card(
@@ -512,11 +679,37 @@ class _ContactsPageState extends State<ContactsPage>
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
-                  contact.name,
-                  style: const TextStyle(fontWeight: FontWeight.w700),
+                Row(
+                  children: [
+                    CircleAvatar(
+                      radius: 22,
+                      foregroundImage:
+                          (contact.avatarUrl != null &&
+                              contact.avatarUrl!.isNotEmpty)
+                          ? NetworkImage(contact.avatarUrl!)
+                          : null,
+                      child: Text(
+                        contact.name.isEmpty
+                            ? '?'
+                            : contact.name[0].toUpperCase(),
+                        style: const TextStyle(fontWeight: FontWeight.w700),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            contact.name,
+                            style: const TextStyle(fontWeight: FontWeight.w700),
+                          ),
+                          Text('@${contact.username}'),
+                        ],
+                      ),
+                    ),
+                  ],
                 ),
-                Text('@${contact.username}'),
                 if (contact.about != null && contact.about!.isNotEmpty)
                   Padding(
                     padding: const EdgeInsets.only(top: 2),
@@ -538,19 +731,20 @@ class _ContactsPageState extends State<ContactsPage>
                         onPressed: disabled
                             ? null
                             : () => Navigator.push(
-                                  context,
-                                  MaterialPageRoute<void>(
-                                    builder: (_) => SecureChatScreen(
-                                      profile: widget.profile!,
-                                      store: widget.store!,
-                                      push: widget.push!,
-                                      client: widget.client!,
-                                      peerId: contact.userId,
-                                      peerName: contact.name,
-                                      peerUsername: contact.username,
-                                    ),
+                                context,
+                                MaterialPageRoute<void>(
+                                  builder: (_) => SecureChatScreen(
+                                    profile: widget.profile!,
+                                    store: widget.store!,
+                                    push: widget.push!,
+                                    client: widget.client!,
+                                    peerId: contact.userId,
+                                    peerName: contact.name,
+                                    peerUsername: contact.username,
+                                    peerAvatarUrl: contact.avatarUrl,
                                   ),
                                 ),
+                              ),
                         icon: const Icon(Icons.lock_outline, size: 18),
                         label: const Text('Encrypted chat'),
                       ),
@@ -580,7 +774,8 @@ class _ContactsPageState extends State<ContactsPage>
                               }),
                         child: const Text('Decline'),
                       ),
-                    ] else if (contact.status == 'pending' && !contact.incoming) ...[
+                    ] else if (contact.status == 'pending' &&
+                        !contact.incoming) ...[
                       OutlinedButton(
                         onPressed: disabled
                             ? null

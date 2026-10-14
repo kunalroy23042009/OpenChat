@@ -20,7 +20,9 @@ import 'recovery_page.dart';
 import 'security/security_page.dart';
 import 'theme/app_theme.dart';
 import 'ai/ai_settings_page.dart';
+import 'backup/backup_page.dart';
 import 'privacy_settings_page.dart';
+import 'security/app_lock.dart';
 
 class SettingsPage extends StatefulWidget {
   const SettingsPage({
@@ -189,6 +191,64 @@ class _SettingsPageState extends State<SettingsPage> {
                 ),
               ),
             ),
+            ValueListenableBuilder<bool>(valueListenable: AppLock.enabled, builder: (context, enabled, _) => SwitchListTile(
+              contentPadding: EdgeInsets.zero, secondary: const Icon(Icons.fingerprint), title: const Text('App lock'),
+              subtitle: const Text('Biometric or device PIN.'), value: enabled,
+              onChanged: (value) async {
+                final messenger = ScaffoldMessenger.of(context);
+                try {
+                  if (!await AppLock.setEnabled(value)) messenger.showSnackBar(const SnackBar(content: Text('Authentication was not completed. Set up a device screen lock first.')));
+                } catch (_) { messenger.showSnackBar(const SnackBar(content: Text('App lock could not be changed.'))); }
+                finally { if (mounted) setState(() {}); }
+              })),
+            if (AppLock.enabled.value)
+              ValueListenableBuilder<Duration>(valueListenable: AppLock.timeout, builder: (context, current, _) => ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.timer_outlined),
+                title: const Text('Automatically lock'),
+                subtitle: Text(AppLock.timeoutLabel(current)),
+                onTap: () async {
+                  final picked = await showDialog<Duration>(context: context, builder: (ctx) => SimpleDialog(
+                    title: const Text('Automatically lock'),
+                    children: [for (final option in AppLock.timeoutOptions)
+                      SimpleDialogOption(
+                        onPressed: () => Navigator.pop(ctx, option),
+                        child: Row(children: [
+                          if (option == current) const Icon(Icons.check, size: 18),
+                          if (option != current) const SizedBox(width: 18),
+                          const SizedBox(width: 8),
+                          Text(AppLock.timeoutLabel(option)),
+                        ]),
+                      )],
+                  ));
+                  if (picked != null) {
+                    try {
+                      await AppLock.setTimeout(picked);
+                    } catch (_) {
+                      if (context.mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Lock timer could not be changed.')));
+                    }
+                  }
+                },
+              )),
+            if (widget.client?.auth.currentUser != null)
+              ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.cloud_upload_outlined),
+                title: const Text('Chat backup'),
+                subtitle: const Text(
+                  'Encrypted history in the cloud, with restore.',
+                ),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: () => Navigator.push(
+                  context,
+                  MaterialPageRoute<void>(
+                    builder: (_) => BackupPage(
+                      store: widget.store,
+                      client: widget.client!,
+                    ),
+                  ),
+                ),
+              ),
             ListTile(
               contentPadding: EdgeInsets.zero,
               leading: const Icon(Icons.privacy_tip_outlined),
@@ -341,6 +401,8 @@ class _SettingsPageState extends State<SettingsPage> {
                       : () async {
                           setState(() => busy = true);
                           try {
+                            // Stop pushes for this account before signing out.
+                            await widget.push.unregister(widget.client!);
                             await widget.client!.auth.signOut();
                             feedback = 'Signed out.';
                           } catch (_) {

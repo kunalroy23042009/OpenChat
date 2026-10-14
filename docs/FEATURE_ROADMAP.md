@@ -95,9 +95,9 @@ channels registered with correct importance.
 | 48 | HD photos | Partial | Fixed 1600px/85%; no HD toggle |
 | 49 | Video sharing | Done | Sealed, 64 MB cap, temp-file playback |
 | 50 | HD video | Queued | — |
-| 51 | View-once media | Queued | — |
-| 52 | Block view-once screenshots | Queued | — |
-| 53 | Documents (2 GB) | Queued | Images/video only |
+| 51 | View-once media | Partial | 1:1 photo/video, single-open consume; Android-only |
+| 52 | Block view-once screenshots | Partial | Android FLAG_SECURE via SecureDisplay; no iOS equivalent |
+| 53 | Documents (200 MB pilot) | Partial | Encrypted 4 MiB chunks + sealed manifest; server quota 64 MB/object, 300 MB/user (`0023`); crash orphans reaped by client (`manifest.enc` heuristic) |
 | 54 | Send media as document | Queued | — |
 | 55 | In-app cropping | Queued | — |
 | 56 | Rotation | Queued | — |
@@ -109,14 +109,13 @@ channels registered with correct importance.
 | 62 | Sticker maker | Queued | — |
 | 63 | Animated stickers | Queued | — |
 | 64 | Avatar stickers | Queued | — |
-| 65 | Audio sharing | Queued | — |
-| 66 | Location sharing | Queued | — |
-| 67 | Contact (vCard) sharing | Queued | — |
+| 65 | Audio sharing | Queued | Voice notes ship separately |
+| 66 | Location sharing | Partial | Static share with Maps deep-link; no live tracking or map SDK |
+| 67 | Contact (vCard) sharing | Partial | Name + number cards with save-to-device; no vCF import/export |
 
 ## Voice notes & audio (68–76)
 
-All Queued: push-to-talk, hands-free lock, preview, pause/resume, speed
-modifiers, out-of-chat playback, waveforms, transcripts, voice status.
+Partial: in-chat recording, preview, pause/resume, discard, playback speeds, waveforms done. Queued: transcripts, voice status, out-of-chat playback.
 
 ## Privacy & core security (77–95)
 
@@ -129,7 +128,7 @@ modifiers, out-of-chat playback, waveforms, transcripts, voice status.
 | 81 | Read-receipts toggle | Partial | Server honors `read_receipts`; no settings toggle yet |
 | 82 | Profile-photo privacy | Queued | Column exists, unenforced |
 | 83 | About privacy | Queued | — |
-| 84 | Chat lock | Partial | PIN for local chats; no biometrics |
+| 84 | Chat lock | Partial | Per-chat PIN + AppLock (biometric/device PIN, relocks on background); widget-test bypass flag |
 | 85 | Secret code | Queued | — |
 | 86 | 2FA | Queued | — |
 | 87 | Passkeys | Queued | — |
@@ -140,13 +139,15 @@ modifiers, out-of-chat playback, waveforms, transcripts, voice status.
 | 92 | Block contacts | Done | Both-directions enforcement |
 | 93 | Report chats/media | Queued | — |
 | 94 | IP protection in calls | Queued | — |
-| 95 | Flash calls / auto verify | Queued | Phone auth SMS path disabled |
+| 95 | Flash calls / auto verify | Partial | Firebase OTP login live (verify-phone); Supabase SMS path still disabled |
 
 ## Groups (96–111)
 
-Schema (`0014`–`0016`) and basic group UI landed in parallel work but are
-unverified on devices: 96–100, 102, 104–105, 108 Partial; 101, 103, 106–107,
-109–111 Queued. Group E2EE/polls reuse the 1:1 protocol work where applicable.
+Creation flow (name + member multi-select), groups list section, entry
+points, and realtime (`0027`) are wired; group messages are
+transport-secured via RLS, not end-to-end encrypted (sender keys remain
+1:1-only). 96–100, 102, 104–105, 108 Partial; 101, 103, 106–107, 109–111
+Queued.
 
 ## Communities & channels (112–119)
 
@@ -167,8 +168,10 @@ All Queued. No community/channel UI or RPCs in pilot scope.
 
 ## Device linking & sync (128–136)
 
-All Queued — single-device pilot by design (128–131). No cloud/local backup
-pipelines yet (132–134); no transfer tools (135–136).
+Single-device pilot by design (128–131). Cloud backup pipeline Partial:
+password-sealed `chat-backups` bucket (`0026`), manual + scheduled
+(Never/Daily/Weekly/Monthly) backups with merge-restore in Settings →
+Chat backup (132–134 Partial); no transfer tools (135–136).
 
 ## UI & personalization (137–147)
 
@@ -204,7 +207,8 @@ All Queued. No business profiles, catalogs, automation, payments, or API.
 ## System integration & accessibility (177–200)
 
 Queued except: 191 Partial (server timestamps, local rendering; no TZ sync
-test), 197 Partial (username/phone lookup; no address-book scan), 199 Done
+test), 197 Partial (username/phone/batch lookup via `lookup_contacts_by_phones`;
+device address-book sync in People page, SMS invite included), 199 Done
 (`delete_account` RPC). Push stack: foreground realtime watchers, channels,
 tap routing, background FCM handler, and `notify-send` sender are Done;
 background delivery additionally needs the `FCM_SERVICE_ACCOUNT` secret

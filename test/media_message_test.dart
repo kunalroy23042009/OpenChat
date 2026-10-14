@@ -218,4 +218,42 @@ void main() {
     final tally = tallyPoll('p', 2, messages);
     expect(tally.counts, [1, 0]);
   });
+
+  test('contact card round-trips name and numbers', () {
+    final raw = encodeContactBody('Ava', ['+14155552671', '+919876543210']);
+    final body = parseMessageBody(raw);
+    expect(body.isContact, isTrue);
+    expect(body.contactName, 'Ava');
+    expect(body.contactPhones, ['+14155552671', '+919876543210']);
+    expect(raw.length, lessThan(8192));
+    final forwarded = parseMessageBody(body.forwardedBody);
+    expect(forwarded.isContact, isTrue);
+    expect(forwarded.forwarded, isTrue);
+    expect(forwarded.contactPhones, body.contactPhones);
+  });
+
+  test('malformed contact cards stay text', () {
+    expect(parseMessageBody('{"t":"contact","name":"","phones":["+14155552671"]}').kind, 'text');
+    expect(parseMessageBody('{"t":"contact","name":"Ava","phones":[]}').kind, 'text');
+    expect(parseMessageBody('{"t":"contact","name":"Ava"}').kind, 'text');
+  });
+
+  test('location round-trips coordinates and label', () {
+    final raw = encodeLocationBody(12.9716, 77.5946, label: 'Home');
+    final body = parseMessageBody(raw);
+    expect(body.isLocation, isTrue);
+    expect(body.latitude, 12.9716);
+    expect(body.longitude, 77.5946);
+    expect(body.text, 'Home');
+    expect(raw.length, lessThan(8192));
+    final forwarded = parseMessageBody(body.forwardedBody);
+    expect(forwarded.isLocation, isTrue);
+    expect(forwarded.forwarded, isTrue);
+  });
+
+  test('malformed locations stay text', () {
+    expect(parseMessageBody('{"t":"loc","lat":1000,"lng":77}').kind, 'text');
+    expect(parseMessageBody('{"t":"loc","lat":12}').kind, 'text');
+    expect(parseMessageBody('{"t":"loc","lat":"x","lng":77}').kind, 'text');
+  });
 }

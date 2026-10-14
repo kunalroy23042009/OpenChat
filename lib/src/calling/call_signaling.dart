@@ -9,17 +9,17 @@ class CallSignaling {
     SupabaseClient client, {
     required String peerId,
     required String callType,
+    required String encryptedCallKey,
   }) async {
-    final result =
-        await client.rpc(
-              'place_call',
-              params: {'p_callee_id': peerId, 'p_type': callType},
-            )
-            as Map<String, dynamic>;
-    return (
-      inviteId: result['id'] as String,
-      room: result['room'] as String,
-    );
+    final result = await client.rpc(
+      'place_call',
+      params: {
+        'p_callee_id': peerId,
+        'p_type': callType,
+        'p_encrypted_call_key': encryptedCallKey,
+      },
+    ) as Map<String, dynamic>;
+    return (inviteId: result['id'] as String, room: result['room'] as String);
   }
 
   static Future<void> answer(

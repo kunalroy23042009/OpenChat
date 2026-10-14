@@ -1,136 +1,52 @@
-# OpenChat — E2EE WhatsApp Clone for Flutter & Supabase
+# OpenChat — Android Team Messaging with Signal E2EE
 
-**OpenChat** is a cross-platform, end-to-end encrypted messaging application built with Flutter, Signal Protocol, Supabase, and WebRTC. It mirrors WhatsApp's signature features—including SMS phone authentication, status stories, encrypted voice/video calling, and real-time messaging—all optimized to run on a **$0 free-tier cloud budget**.
+Flutter + Signal Protocol + Supabase + LiveKit. 1:1 chats and newly created group text chats are end-to-end encrypted. Legacy groups are server-readable and labeled as such in-app.
 
----
+> Pilot status: works for team testing, **not** production-certified. Real-device call/group-E2EE verification, load tests, and recovery drills are still pending.
 
-## 🌟 Key Features
+## Features
 
-### 📱 WhatsApp-Style Experience & Navigation
-- **4-Tab Native Navigation**: Seamlessly switch between **Chats** 💬, **Status** ⭕, **Calls** 📞, and **Settings** ⚙️.
-- **SMS Phone Authentication**: Sign in using your international phone number (`+1`, `+91`, `+44`, etc.) via SMS OTP verification.
-- **Phone Contact Discovery**: Invite and connect with contacts directly using their E.164 phone numbers or custom `@username`.
-- **Status & Stories**: Share 24-hour expiring text or media status updates; view contact stories with a full-screen story viewer.
-- **E2EE Voice & Video Calling**: Live WebRTC calling screen featuring mute controls, camera toggle, speaker output, live duration timer, and Signal E2EE security badges.
-- **Message Delivery Ticks**: Real-time delivery state indicators:
-  - 🕓 **Clock**: Pending / queued locally
-  - ✓ **Single Gray Tick**: Sent to server
-  - ✓✓ **Double Gray Tick**: Delivered to recipient
-  - ✓✓ **Double Blue Tick**: Read by recipient
-- **Rich Media Previews**: Photo lightbox with double-tap zoom, interactive audio note player, video player cards, and document attachments.
+- **Chats**: 1:1 Signal E2EE messaging (text, replies, polls, media, voice, documents, view-once), delivery ticks (sent/delivered/read), offline catch-up.
+- **Groups**: new groups use Signal Sender Keys for text/replies with epoch rotation on membership/identity change. Media, polls, tasks, and edits are disabled in encrypted groups rather than sent in plaintext.
+- **Contacts**: WhatsApp-style list with search (name, @username, about), phone-book sync, invitations, block/unblock.
+- **Status**: 24-hour text/media stories with audience controls.
+- **Calls**: 1:1 voice/video over LiveKit with per-call keys exchanged via Signal. Group calls are not supported (the UI says so instead of failing silently).
+- **Backup**: password-encrypted snapshots (Argon2id + AES-256-GCM) in Supabase Storage (`chat-backups`), covering 1:1 history, group history, and referenced media. Three generations retained; restore needs only the password.
 
----
+## Sign-in (current)
 
-## 🔐 Security & Cryptography Architecture
+- **Phone OTP is temporarily hidden**: Firebase requires Blaze billing for real SMS (`BILLING_NOT_ENABLED`). Flip `kPhoneAuthEnabled` in `lib/src/auth/phone_auth.dart` after upgrading.
+- Use **Google Sign-In or email**, or Firebase **test numbers** for dev.
 
-- **Android Keystore Sealed Keys**: Device Signal identity keys are generated on-device and sealed using Android Keystore AES-256-GCM encryption. Private keys **never leave your device**.
-- **Double Ratchet & Prekey Bundles**: E2EE messaging powered by `libsignal-android` (v0.105.0) via Kotlin native bridge (`dev.openchat/security`).
-- **Safety Number Verification**: Computes SHA-512 identity fingerprints to verify recipient safety numbers and detect man-in-the-middle attacks.
-- **Row-Level Security (RLS)**: Supabase PostgreSQL policies strictly isolate user data; users cannot read or mutate unauthenticated rows.
+## Security model
 
----
+- Identity keys in Android Keystore (AES-256-GCM); private keys never leave the device.
+- 1:1 via Signal Double Ratchet + prekey bundles (`libsignal 0.105.0`, `dev.openchat/security` bridge).
+- Group text via Signal Sender Keys; server stores ciphertext + pairwise-encrypted key envelopes only.
+- Local history in transactional SQLite as AES-256-GCM ciphertext; key in platform secure storage.
+- Supabase RLS isolates all user data; call/group writes go through membership-checked RPCs.
+- Safety-number fingerprints for MITM detection.
 
-## 🚀 Development Phases & Status
-
-| Phase | Scope | Status | Highlights |
-|---|---|---|---|
-| **1** | Flutter UI & Local Chat Demo | ✅ **Completed** | Adaptive layout, local persistence store, conversation search, unread filters. |
-| **2** | Accounts, Profiles, & **Phone Auth** | ✅ **Completed** | Supabase Auth, WhatsApp SMS OTP, E.164 lookup, profile sync, 20-attempt daily rate limit, block/unblock. |
-| **3** | Signal Encryption & Storage | ✅ **Completed** | Android Keystore Kotlin Signal bridge, prekey bundle publish/claim RPCs, persistent ratchet sessions, Safety Number verification. |
-| **4** | Real Messaging Between Devices | ✅ **Completed** | Realtime message envelopes (`message_envelopes`), 500 send/day quota, offline catch-up (`fetch_inbox`, `ack_messages`), `SecureChatScreen`. |
-| **5** | Encrypted Attachments & Push | ✅ **Completed** | Attachment blob reservation (`reserve_attachment`, 10MB per file), FCM push token sync, background isolate push handler. |
-| **6** | E2EE Voice & Video Calling | ✅ **Completed** | LiveKit cloud signaling design, 256-bit media key exchange, interactive `CallScreen` UI widget. |
-| **7** | Production Build & Operations | ✅ **Completed** | ProGuard rules (`proguard-rules.pro`), optional release keystore fallback (`build.gradle.kts`), 8-migration verification suite (`verify_migrations.sql`). |
-
----
-
-## 🛠️ Getting Started
-
-### 1. Run Immediately (Offline Local Demo Mode)
-
-Requires Flutter 3.47.5+ / Dart 3.13+. Launch the app in demo mode without any cloud credentials:
+## Setup
 
 ```powershell
 flutter pub get
-flutter run -d chrome
-# OR for Android Emulator / Physical Device:
-flutter run -d <DEVICE_ID>
+flutter run --dart-define-from-file=config.json   # config.json: SUPABASE_URL + SUPABASE_ANON_KEY
 ```
 
-### 2. Connect Your Free Supabase Backend
+Apply `supabase/migrations/` **in order**, then run `supabase/verify_migrations.sql` (plus `supabase/tests/durability_security.sql` for the retention/E2EE assertions).
 
-1. Create a **Free** project at [supabase.com](https://supabase.com).
-2. Open **SQL Editor** in Supabase and execute the migration files in `supabase/migrations/` **in order**:
-   - `202610090001_foundation.sql` (Profiles & base Auth triggers)
-   - `202610090002_contacts.sql` (Usernames & contact invitations)
-   - `202610090003_profile_about.sql` (Profile about lines)
-   - `202610090004_push_tokens.sql` (Device FCM token registration)
-   - `202610090005_messaging.sql` (Realtime message envelopes & inbox catchup)
-   - `202610090006_kyber_signatures.sql` (Signal prekey bundle exchange)
-   - `202610090007_attachments.sql` (Attachment blob reservations & caps)
-   - `202610090008_phone_auth.sql` through `202610090015_conversation_rpcs.sql`
-     (repair, realtime, storage, receipts, AI quota, groups and conversation RPCs)
-   - `202610090016_team_collaboration.sql` (tasks, polls, communities and vault data)
-   - `202610090017_privacy_status_calls.sql` (privacy, linked devices, status and call logs)
-   *(Then run `supabase/verify_migrations.sql` to verify the complete schema.)*
-
-3. Create `config.json` in the project root:
-   ```json
-   {
-     "SUPABASE_URL": "https://your-project.supabase.co",
-     "SUPABASE_ANON_KEY": "your-publishable-anon-key"
-   }
-   ```
-
-4. Launch with backend credentials:
-   ```powershell
-   flutter run -d chrome --web-port 7357 --dart-define-from-file=config.json
-   ```
-
----
-
-## 🧪 Testing & Code Quality
-
-Run static analysis and full unit/widget test suite:
+## Verify
 
 ```powershell
-# Run static analysis (0 errors guaranteed)
 flutter analyze
-
-# Run all 46 unit & widget tests
 flutter test
-
-# Build production Android APK
-flutter build apk --release
+cd android; .\gradlew.bat :app:testDebugUnitTest
+flutter build apk --release --dart-define-from-file=config.json
 ```
 
----
+Shareable pilot APK: `build/app/outputs/flutter-apk/app-release.apk`.
 
-## 📁 Repository Structure
+## License
 
-```text
-lib/main.dart                         App entry point, theme management, Supabase initialization
-lib/src/home.dart                     WhatsApp 4-tab layout (Chats, Status, Calls, Settings)
-lib/src/onboarding.dart               First-launch welcome, account, and profile setup
-lib/src/auth/phone_auth.dart          SMS OTP authentication service
-lib/src/auth/phone_auth_page.dart     WhatsApp phone sign-in UI with country code picker
-lib/src/status/status_page.dart       WhatsApp Status / Stories feed and full-screen viewer
-lib/src/calling/call_screen.dart     E2EE Voice and Video calling UI with controls & timers
-lib/src/calling/call_history_page.dart Call log list and dialer
-lib/src/widgets/media_preview.dart   Rich media player & preview cards
-lib/src/widgets/status_ticks.dart    WhatsApp single/double/blue read delivery ticks
-lib/src/theme/app_theme.dart          Dynamic Light, Dark, Emerald, and System theme controller
-lib/src/secure_chat_screen.dart      Realtime Signal E2EE messaging screen
-lib/src/security/device_security.dart Android Keystore Signal identity bridge
-supabase/migrations/                 Ordered database schema migrations
-supabase/verify_migrations.sql       Database verification suite
-android/app/proguard-rules.pro        Production release obfuscation rules
-docs/DEVELOPMENT_PLAN.md             Comprehensive 7-phase implementation plan
-docs/CALLING_PLAN.md                 LiveKit WebRTC signaling specification
-```
-
----
-
-## 📄 License & Attribution
-
-This project incorporates `libsignal-client` and `libsignal-android` (AGPLv3) for Signal E2EE cryptographic operations.
+Incorporates `libsignal-client` / `libsignal-android` (AGPLv3).

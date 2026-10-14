@@ -9,18 +9,31 @@ import 'package:emoji_picker_flutter/emoji_picker_flutter.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:video_player/video_player.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter_contacts/flutter_contacts.dart' as device_contacts;
+import 'package:geolocator/geolocator.dart';
+import 'package:path_provider/path_provider.dart';
 
 import 'chat_store.dart';
+import 'chat_lock.dart';
+import 'chat/day_label.dart';
 import 'contacts_repository.dart';
 import 'calling/call_flow.dart';
 import 'calling/call_screen.dart';
 import 'local_profile.dart';
 import 'media/chat_media.dart';
+import 'media/document_transfer.dart';
+import 'media/document_bubble.dart';
+import 'media/share_bubbles.dart';
+import 'media/view_once_screen.dart';
 import 'media/media_message.dart';
 import 'media/video_player_screen.dart';
 import 'push/push_service.dart';
 import 'push/notify_service.dart';
+import 'voice_notes/voice_note_bubble.dart';
+import 'voice_notes/voice_note_recorder.dart';
 import 'widgets/message_format.dart';
+import 'widgets/whatsapp_bubble.dart';
 import 'security/envelope_codec.dart';
 import 'security/safety_number.dart';
 
@@ -34,6 +47,7 @@ class SecureChatScreen extends StatefulWidget {
     required this.peerId,
     required this.peerName,
     required this.peerUsername,
+    this.peerAvatarUrl,
   });
   final LocalProfile profile;
   final ChatStore store;
@@ -42,12 +56,17 @@ class SecureChatScreen extends StatefulWidget {
   final String peerId;
   final String peerName;
   final String peerUsername;
+  final String? peerAvatarUrl;
 
   @override
   State<SecureChatScreen> createState() => _SecureChatScreenState();
 }
 
-class _SecureChatScreenState extends State<SecureChatScreen> {
+class _SecureChatScreenState extends State<SecureChatScreen>
+    with WidgetsBindingObserver {
+  bool _accessGranted = false;
+  bool _bootstrapped = false;
+  String get _lockKey => 'openchat.secureLock.v1.$accountId.${widget.peerId}';
   final composer = TextEditingController();
   final scroll = ScrollController();
   final channel = const MethodChannel('dev.openchat/security');
@@ -66,6 +85,12 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
   String? _ownFingerprint;
   String? _peerIdentityKey;
   bool _sendingMedia = false;
+  TransferControl? _documentControl;
+  double _documentProgress = 0;
+  late final documents = DocumentTransfer(
+    SupabaseChunkStorage(widget.client),
+    accountId,
+  );
   bool _sendingText = false;
   late final ChatMedia media = ChatMedia(widget.client);
 
@@ -94,6 +119,8 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _accessGranted = widget.store.preferences.getBool(_lockKey) != true;
     // This chat is visible: suppress its notifications, clear its badge
     // and unread flag, and restore any unsent draft.
     NotifyService.instance.openChats.add(widget.peerId);
@@ -103,7 +130,29 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
     composer.addListener(_saveDraft);
     scroll.addListener(_hideReactBar);
     _pinsFuture = widget.store.securePins(accountId, widget.peerId);
-    _bootstrap();
+    if (_accessGranted) {
+      _bootstrapped = true;
+      _bootstrap();
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed &&
+        widget.store.preferences.getBool(_lockKey) == true) {
+      _hideReactBar();
+      if (mounted) setState(() => _accessGranted = false);
+    }
+  }
+
+  Future<void> _unlockChat() async {
+    if (await ChatLock.promptVerify(context) && mounted) {
+      setState(() => _accessGranted = true);
+      if (!_bootstrapped) {
+        _bootstrapped = true;
+        await _bootstrap();
+      }
+    }
   }
 
   void _saveDraft() {
@@ -132,7 +181,13 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
       });
       _ownFingerprint = status?['fingerprint'] as String?;
       await _publishKeys(force: freshIdentity);
-      await _ensureSession();
+      try {
+        await _ensureSession();
+      } catch (e) {
+        // A broken session must not take down receiving: subscribe and poll
+        // anyway; sending heals itself via _transmit's retry.
+        if (mounted) setState(() => _error = _friendlySendError(e));
+      }
       await widget.store.loadSecureConversation(accountId, widget.peerId);
       _subscribeRealtime();
       _startPolling();
@@ -144,7 +199,7 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
       if (mounted) {
         setState(() {
           _loading = false;
-          _error = e.toString();
+          _error = e is StateError ? e.message.toString() : 'Could not open this chat. Check your connection and reopen it.';
         });
       }
     }
@@ -190,40 +245,122 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
     return value;
   }
 
-  Future<void> _ensureSession() => _ensureSessionFor(widget.peerId);
+  Future<void> _ensureSession() =>
+      _ensureSessionFor(widget.peerId, revalidate: true);
 
-  Future<void> _ensureSessionFor(String peerId) async {
+  String _peerIdentityPref(String peerId) =>
+      'openchat.peerIdentity.v1.$accountId.$peerId';
+
+  static bool _isUntrustedIdentity(Object e) =>
+      e.toString().contains('UntrustedIdentity');
+
+  /// Drops the local session (and optionally trusts a rotated peer
+  /// identity) so the next ensure re-claims a fresh bundle. Used after
+  /// repeated decrypt failures or trust errors — failed messages stay
+  /// quarantined, new ones heal.
+  Future<void> _resetPeerSession(
+    String peerId, {
+    String? trustIdentityKey,
+  }) async {
+    try {
+      await channel.invokeMethod('signalDeleteSession', {
+        'accountId': accountId,
+        'peerId': peerId,
+        'identityKey': ?trustIdentityKey,
+      });
+    } catch (_) {}
+    try {
+      if (trustIdentityKey != null) {
+        await widget.store.preferences.setString(
+          _peerIdentityPref(peerId),
+          trustIdentityKey,
+        );
+      } else {
+        await widget.store.preferences.remove(_peerIdentityPref(peerId));
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _ensureSessionFor(
+    String peerId, {
+    bool revalidate = false,
+  }) async {
     // Native returns {'hasSession': bool}, not a bare bool.
     final sessionState = await channel.invokeMapMethod('signalHasSession', {
       'accountId': accountId,
       'peerId': peerId,
     });
-    if (sessionState?['hasSession'] == true) return;
+    final hasSession = sessionState?['hasSession'] == true;
+    if (hasSession && !revalidate) return;
     // Server uses snake_case; the native bridge expects camelCase.
-    final claimed = await widget.client.rpc(
-      'claim_key_bundle',
-      params: {'p_user_id': peerId},
-    ) as Map<String, dynamic>;
+    Map<String, dynamic>? claimed;
+    try {
+      claimed = await widget.client.rpc(
+        'claim_key_bundle',
+        params: {'p_user_id': peerId},
+      ) as Map<String, dynamic>;
+    } catch (_) {
+      // Offline on open: keep the existing session rather than breaking chat.
+      if (hasSession) return;
+      rethrow;
+    }
+    final identity = claimed['identity_key'] as String?;
+    final known = widget.store.preferences.getString(_peerIdentityPref(peerId));
+    if (hasSession && known != null && known == identity) return;
+    if (hasSession || (known != null && known != identity)) {
+      // Peer rotated identity (reinstall): drop the stale session and trust
+      // the fresh key first, or processBundle/encrypt fail forever.
+      await _resetPeerSession(peerId, trustIdentityKey: identity);
+    }
     if (peerId == widget.peerId) {
-      _peerIdentityKey = claimed['identity_key'] as String?;
+      _peerIdentityKey = identity;
       if (mounted) setState(() {});
     }
-    await channel.invokeMethod('signalProcessBundle', {
-      'accountId': accountId,
-      'peerId': peerId,
-      'bundle': {
-        'registrationId': claimed['registration_id'],
-        'identityKey': claimed['identity_key'],
-        'signedPrekeyId': claimed['signed_prekey_id'],
-        'signedPrekey': claimed['signed_prekey'],
-        'signedPrekeySignature': claimed['signed_prekey_signature'],
-        'prekeyId': claimed['prekey_id'],
-        'prekey': claimed['prekey'],
-        'kyberId': claimed['kyber_id'],
-        'kyber': claimed['kyber'],
-        'kyberSignature': claimed['kyber_signature'],
-      },
-    });
+    if (identity != null) {
+      await widget.store.preferences.setString(
+        _peerIdentityPref(peerId),
+        identity,
+      );
+    }
+    try {
+      await channel.invokeMethod('signalProcessBundle', {
+        'accountId': accountId,
+        'peerId': peerId,
+        'bundle': {
+          'registrationId': claimed['registration_id'],
+          'identityKey': claimed['identity_key'],
+          'signedPrekeyId': claimed['signed_prekey_id'],
+          'signedPrekey': claimed['signed_prekey'],
+          'signedPrekeySignature': claimed['signed_prekey_signature'],
+          'prekeyId': claimed['prekey_id'],
+          'prekey': claimed['prekey'],
+          'kyberId': claimed['kyber_id'],
+          'kyber': claimed['kyber'],
+          'kyberSignature': claimed['kyber_signature'],
+        },
+      });
+    } catch (e) {
+      if (!_isUntrustedIdentity(e)) rethrow;
+      // Trust store disagrees (e.g. prefs wiped but native store kept):
+      // reset trust explicitly and retry once.
+      await _resetPeerSession(peerId, trustIdentityKey: identity);
+      await channel.invokeMethod('signalProcessBundle', {
+        'accountId': accountId,
+        'peerId': peerId,
+        'bundle': {
+          'registrationId': claimed['registration_id'],
+          'identityKey': claimed['identity_key'],
+          'signedPrekeyId': claimed['signed_prekey_id'],
+          'signedPrekey': claimed['signed_prekey'],
+          'signedPrekeySignature': claimed['signed_prekey_signature'],
+          'prekeyId': claimed['prekey_id'],
+          'prekey': claimed['prekey'],
+          'kyberId': claimed['kyber_id'],
+          'kyber': claimed['kyber'],
+          'kyberSignature': claimed['kyber_signature'],
+        },
+      });
+    }
   }
 
   void _subscribeRealtime() {
@@ -288,11 +425,15 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
       final fails = widget.store.envelopeFailCount(id) + 1;
       await widget.store.recordEnvelopeFailure(id);
       if (fails >= _maxEnvelopeFailures) {
+        // Likely cause is a stale session (peer reinstalled and rotated
+        // identity). Drop it so the next open/send re-claims a fresh bundle;
+        // this message itself is unrecoverable — ask them to send it again.
+        await _resetPeerSession(sender);
         try {
           await widget.store.addSecureMessage(
             accountId,
             sender,
-            '⚠️ A message arrived but could not be decrypted.',
+            '⚠️ A message arrived but could not be decrypted. Ask them to send it again.',
             mine: false,
             envelopeId: id,
           );
@@ -347,7 +488,8 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
   }
 
   Future<void> _flushReadReceipts() async {
-    if (_reading ||
+    if (!_accessGranted ||
+        _reading ||
         !mounted ||
         ModalRoute.of(context)?.isCurrent != true ||
         WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
@@ -477,10 +619,33 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
     }
   }
 
+  /// User-safe media errors: raw platform exceptions never reach the UI.
+  static String _friendlyMediaError(String action, Object e) {
+    if (_isUntrustedIdentity(e)) {
+      return 'Peer security code changed. Reopening this chat refreshes encryption — then send again.';
+    }
+    if (e is StateError) return e.message.toString();
+    return '$action failed. Check your connection and storage allowance.';
+  }
+
+  /// User-safe send errors: raw platform/protocol exceptions never reach
+  /// the UI. StateErrors are already friendly by construction.
+  static String _friendlySendError(Object e) {
+    if (e is StateError) return e.message.toString();
+    if (_isUntrustedIdentity(e)) {
+      return 'Peer security code changed. Reopening this chat refreshes encryption — then send again.';
+    }
+    return 'Message could not be sent. Check your connection and try again.';
+  }
+
   /// Encrypts [plainText] (raw text or an encoded body), enqueues it for
   /// [toPeer] (this chat's peer by default), and stores the local copy.
   /// Shared by text, media, polls, votes, and forwarded content.
-  Future<bool> _transmit(String plainText, {String? toPeer}) async {
+  Future<bool> _transmit(
+    String plainText, {
+    String? toPeer,
+    bool retriedSession = false,
+  }) async {
     final peerId = toPeer ?? widget.peerId;
     try {
       final random = Random.secure();
@@ -535,10 +700,16 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
           throw StateError('Message rejected by the server.');
       }
     } catch (e) {
+      if (!retriedSession && _isUntrustedIdentity(e)) {
+        // Stale session (peer reinstalled): heal transparently and retry once.
+        await _resetPeerSession(peerId);
+        try {
+          await _ensureSessionFor(peerId, revalidate: true);
+        } catch (_) {}
+        return _transmit(plainText, toPeer: toPeer, retriedSession: true);
+      }
       if (mounted) {
-        setState(
-          () => _error = e is StateError ? e.message.toString() : 'Message could not be sent. Check your connection and try again.',
-        );
+        setState(() => _error = _friendlySendError(e));
       }
       return false;
     }
@@ -591,23 +762,79 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                   _createPoll();
                 },
               ),
+              _AttachTile(
+                icon: Icons.mic,
+                color: const Color(0xFF8E24AA),
+                label: 'Voice',
+                onTap: () => Navigator.pop(ctx, 'voice_record'),
+              ),
+              _AttachTile(
+                icon: Icons.description_outlined,
+                color: const Color(0xFF546E7A),
+                label: 'Document',
+                onTap: () => Navigator.pop(ctx, 'document'),
+              ),
+              _AttachTile(
+                icon: Icons.person_outline,
+                color: const Color(0xFF009EE6),
+                label: 'Contact',
+                onTap: () => Navigator.pop(ctx, 'contact'),
+              ),
+              _AttachTile(
+                icon: Icons.location_on_outlined,
+                color: const Color(0xFF0F9D58),
+                label: 'Location',
+                onTap: () => Navigator.pop(ctx, 'location'),
+              ),
+              _AttachTile(
+                icon: Icons.filter_1_outlined,
+                color: const Color(0xFF00897B),
+                label: 'Once photo',
+                onTap: () => Navigator.pop(ctx, 'once_photo'),
+              ),
+              _AttachTile(
+                icon: Icons.filter_1,
+                color: const Color(0xFF00897B),
+                label: 'Once video',
+                onTap: () => Navigator.pop(ctx, 'once_video'),
+              ),
             ],
           ),
         ),
       ),
     );
     if (choice == null || !mounted) return;
+    if (choice == 'once_video') {
+      await _pickAndSendVideo(false, viewOnce: true);
+      return;
+    }
+    if (choice == 'document') {
+      await _pickDocument();
+      return;
+    }
+    if (choice == 'contact') {
+      await _pickAndSendContact();
+      return;
+    }
+    if (choice == 'location') {
+      await _pickAndSendLocation();
+      return;
+    }
+    if (choice == 'voice_record') {
+      await _recordAndSendVoice();
+      return;
+    }
     if (choice.startsWith('video_')) {
       await _pickAndSendVideo(choice == 'video_camera');
       return;
     }
     XFile? picked;
     try {
-      picked = choice == 'photo_gallery'
+      picked = choice == 'photo_gallery' || choice == 'once_photo'
           ? await media.pickGalleryImage()
           : await media.pickCameraImage();
-    } on Exception catch (e) {
-      if (mounted) setState(() => _error = 'Could not open images: $e');
+    } on Exception {
+      if (mounted) setState(() => _error = 'Could not open your gallery.');
       return;
     }
     if (picked == null || !mounted) return;
@@ -615,7 +842,9 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
     final send = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Send image'),
+        title: Text(
+          choice == 'once_photo' ? 'Send view-once photo' : 'Send image',
+        ),
         content: SingleChildScrollView(
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -665,6 +894,7 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
           caption.text.trim(),
           key: sealed.key,
           nonce: sealed.nonce,
+          viewOnce: choice == 'once_photo',
         ),
       );
       if (sent && mounted) {
@@ -678,7 +908,7 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
       }
     } catch (e) {
       if (mounted) {
-        setState(() => _error = 'Image failed: $e');
+        setState(() => _error = _friendlyMediaError('Image upload', e));
       }
     } finally {
       if (mounted) setState(() => _sendingMedia = false);
@@ -793,15 +1023,18 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
     }
   }
 
-  Future<void> _pickAndSendVideo(bool fromCamera) async {
+  Future<void> _pickAndSendVideo(
+    bool fromCamera, {
+    bool viewOnce = false,
+  }) async {
     if (_sendingMedia) return;
     XFile? picked;
     try {
       picked = fromCamera
           ? await media.pickCameraVideo()
           : await media.pickGalleryVideo();
-    } on Exception catch (e) {
-      if (mounted) setState(() => _error = 'Could not open videos: $e');
+    } on Exception {
+      if (mounted) setState(() => _error = 'Could not open your videos.');
       return;
     }
     if (picked == null || !mounted) return;
@@ -821,7 +1054,7 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
     final send = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Send video'),
+        title: Text(viewOnce ? 'Send view-once video' : 'Send video'),
         content: SingleChildScrollView(
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -880,6 +1113,7 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
           thumbKey: sealed.thumbKey.isEmpty ? null : sealed.thumbKey,
           thumbNonce: sealed.thumbNonce.isEmpty ? null : sealed.thumbNonce,
           durationSec: durationSec,
+          viewOnce: viewOnce,
         ),
       );
       if (sent && mounted) {
@@ -893,10 +1127,297 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
       }
     } catch (e) {
       if (mounted) {
-        setState(() => _error = 'Video failed: $e');
+        setState(() => _error = _friendlyMediaError('Video upload', e));
       }
     } finally {
       if (mounted) setState(() => _sendingMedia = false);
+    }
+  }
+
+  Future<void> _pickDocument() async {
+    if (_sendingMedia) return;
+    final selected = await FilePicker.platform.pickFiles(withData: false);
+    if (!mounted || selected == null || selected.files.single.path == null)
+      return;
+    final picked = selected.files.single;
+    if (picked.size > DocumentTransfer.maxBytes) {
+      setState(() => _error = 'Documents must be 200 MB or smaller.');
+      return;
+    }
+    try {
+      final usage =
+          await widget.client.rpc('chat_media_usage') as Map<String, dynamic>?;
+      final used = (usage?['bytes'] as num?)?.toInt() ?? 0;
+      if (used + picked.size > 300 * 1024 * 1024) {
+        if (mounted) {
+          setState(
+            () => _error = 'Storage budget exhausted. Delete old media or documents and try again.',
+          );
+        }
+        return;
+      }
+    } catch (_) {
+      // Usage check is advisory; the server enforces the real quota.
+    }
+    setState(() {
+      _sendingMedia = true;
+      _error = null;
+      _documentControl = TransferControl();
+      _documentProgress = 0;
+    });
+    try {
+      final encoded = await documents.upload(
+        File(picked.path!),
+        widget.peerId,
+        name: picked.name,
+        control: _documentControl,
+        onProgress: (p) {
+          if (mounted) setState(() => _documentProgress = p);
+        },
+      );
+      if (await _transmit(encoded))
+        unawaited(
+          NotifyService.poke(
+            widget.client,
+            kind: 'message',
+            peer: widget.peerId,
+          ),
+        );
+    } on TransferCancelled {
+      // User cancelled the upload; partial chunks are cleaned up in upload().
+    } catch (e) {
+      if (mounted) {
+        final message = e.toString();
+        setState(
+          () => _error = message.contains('Storage budget exhausted')
+              ? 'Storage budget exhausted. Delete old media or documents and try again.'
+              : message.contains('single-object limit')
+              ? 'That file exceeds the 64 MB single-object limit.'
+              : 'Document upload failed. Check your connection and storage allowance.',
+        );
+      }
+    } finally {
+      if (mounted)
+        setState(() {
+          _sendingMedia = false;
+          _documentControl = null;
+        });
+    }
+  }
+
+  Future<void> _pickAndSendContact() async {
+    if (_sendingMedia) return;
+    setState(() => _error = null);
+    List<device_contacts.Contact> deviceContacts;
+    try {
+      final status = await device_contacts.FlutterContacts.permissions.request(
+        device_contacts.PermissionType.read,
+      );
+      if (status != device_contacts.PermissionStatus.granted) {
+        throw StateError('Contacts permission is required to share.');
+      }
+      deviceContacts = await device_contacts.FlutterContacts.getAll(
+        properties: {
+          device_contacts.ContactProperty.name,
+          device_contacts.ContactProperty.phone,
+        },
+      );
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () => _error = e is StateError
+              ? e.message.toString()
+              : 'Could not read your contacts.',
+        );
+      }
+      return;
+    }
+    deviceContacts.removeWhere((c) => c.phones.isEmpty);
+    if (!mounted) return;
+    final picked = await showModalBottomSheet<device_contacts.Contact>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Padding(
+              padding: EdgeInsets.all(16),
+              child: Text(
+                'Share contact',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+              ),
+            ),
+            Flexible(
+              child: ListView.builder(
+                shrinkWrap: true,
+                itemCount: deviceContacts.length,
+                itemBuilder: (ctx, i) {
+                  final c = deviceContacts[i];
+                  final name = c.displayName ?? '';
+                  return ListTile(
+                    leading: CircleAvatar(
+                      child: Text(name.isEmpty ? '?' : name[0].toUpperCase()),
+                    ),
+                    title: Text(name.isEmpty ? 'Unnamed contact' : name),
+                    subtitle: Text(c.phones.first.number),
+                    onTap: () => Navigator.pop(ctx, c),
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (picked == null || !mounted) return;
+    final pickedName = picked.displayName ?? '';
+    final name = pickedName.isEmpty ? 'Shared contact' : pickedName;
+    final phones = picked.phones.map((p) => p.number).take(5).toList();
+    if (await _transmit(encodeContactBody(name, phones))) {
+      unawaited(
+        NotifyService.poke(widget.client, kind: 'message', peer: widget.peerId),
+      );
+    }
+  }
+
+  Future<void> _pickAndSendLocation() async {
+    if (_sendingMedia) return;
+    setState(() {
+      _sendingMedia = true;
+      _error = null;
+    });
+    try {
+      var permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission == LocationPermission.denied ||
+          permission == LocationPermission.deniedForever) {
+        throw StateError('Location permission is required to share.');
+      }
+      final position = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.medium,
+        ),
+      ).timeout(const Duration(seconds: 20));
+      if (!mounted) return;
+      final labelController = TextEditingController();
+      final label = await showDialog<String>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Share location'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                '${position.latitude.toStringAsFixed(5)}, ${position.longitude.toStringAsFixed(5)}',
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: labelController,
+                decoration: const InputDecoration(
+                  labelText: 'Label (optional)',
+                  hintText: 'e.g. Home',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, labelController.text.trim()),
+              child: const Text('Send'),
+            ),
+          ],
+        ),
+      );
+      labelController.dispose();
+      if (label == null || !mounted) return;
+      if (await _transmit(
+        encodeLocationBody(
+          position.latitude,
+          position.longitude,
+          label: label.isEmpty ? null : label,
+        ),
+      )) {
+        unawaited(
+          NotifyService.poke(
+            widget.client,
+            kind: 'message',
+            peer: widget.peerId,
+          ),
+        );
+      }
+    } on TimeoutException {
+      if (mounted)
+        setState(
+          () => _error = 'Could not get your location. Try again outdoors.',
+        );
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () => _error = e is StateError
+              ? e.message.toString()
+              : 'Location failed. Check your connection.',
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _sendingMedia = false);
+    }
+  }
+
+  Future<void> _recordAndSendVoice() async {
+    final recorder = VoiceNoteRecorder(
+      maxDuration: const Duration(minutes: 2),
+      onRecorded: (file, duration, waveform) async {
+        if (!mounted) return;
+        setState(() {
+          _sendingMedia = true;
+          _error = null;
+        });
+        try {
+          final sealed = await media.uploadSealed(file, widget.peerId);
+          final sent = await _transmit(
+            encodeVoiceBody(
+              sealed.path,
+              duration.inSeconds,
+              key: sealed.key,
+              nonce: sealed.nonce,
+              waveform: waveform,
+            ),
+          );
+          if (!sent) throw StateError('Voice note not sent');
+          if (mounted) {
+            unawaited(
+              NotifyService.poke(
+                widget.client,
+                kind: 'message',
+                peer: widget.peerId,
+              ),
+            );
+          }
+        } catch (e) {
+          if (mounted)
+            setState(() => _error = _friendlyMediaError('Voice note', e));
+          rethrow;
+        } finally {
+          if (mounted) setState(() => _sendingMedia = false);
+        }
+      },
+    );
+    if (mounted) {
+      // Show the recorder as a modal bottom sheet
+      await showModalBottomSheet(
+        context: context,
+        isScrollControlled: true,
+        showDragHandle: true,
+        builder: (ctx) => recorder,
+      );
     }
   }
 
@@ -1008,6 +1529,14 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
   }
 
   String _quoteSummary(MediaBody body) {
+    if (body.isVoice) return 'Voice note (${body.durationSec}s)';
+    if (body.isContact) return 'Contact: ${body.contactName}';
+    if (body.isLocation) {
+      return body.text.isNotEmpty
+          ? 'Location: ${body.text}'
+          : 'Shared location';
+    }
+    if (body.isDocument) return body.fileName;
     if (body.isImage) return body.text.isEmpty ? 'Photo' : body.text;
     if (body.isVideo) return body.text.isEmpty ? 'Video' : body.text;
     if (body.isPoll) return body.question ?? 'Poll';
@@ -1034,6 +1563,25 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
   Future<void> _messageActions(SecureMessage msg) async {
     final body = parseMessageBody(msg.text);
     if (body.isTombstone) return;
+    if (body.viewOnce) {
+      final remove = await showModalBottomSheet<bool>(
+        context: context,
+        builder: (ctx) => SafeArea(
+          child: ListTile(
+            leading: const Icon(Icons.delete_outline),
+            title: const Text('Delete for me'),
+            onTap: () => Navigator.pop(ctx, true),
+          ),
+        ),
+      );
+      if (remove == true)
+        await widget.store.removeSecureMessage(
+          accountId,
+          widget.peerId,
+          msg.ref,
+        );
+      return;
+    }
     final stars = await widget.store.secureStars(accountId, widget.peerId);
     final pins = await widget.store.securePins(accountId, widget.peerId);
     if (!mounted) return;
@@ -1264,6 +1812,10 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
               for (final c in contacts)
                 ListTile(
                   leading: CircleAvatar(
+                    foregroundImage:
+                        (c.avatarUrl != null && c.avatarUrl!.isNotEmpty)
+                        ? NetworkImage(c.avatarUrl!)
+                        : null,
                     child: Text(c.name.isEmpty ? '?' : c.name[0].toUpperCase()),
                   ),
                   title: Text(c.name),
@@ -1278,7 +1830,28 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
     if (target == null || !mounted) return;
     setState(() => _error = null);
     try {
-      final forwarded = await media.forwardBody(body, target.userId);
+      String forwarded;
+      if (body.isDocument) {
+        final dir = await (await getTemporaryDirectory()).createTemp(
+          'oc-forward-',
+        );
+        try {
+          final file = await documents.download(
+            body,
+            File('${dir.path}/document'),
+          );
+          forwarded = await documents.upload(
+            file,
+            target.userId,
+            name: body.fileName,
+            forwarded: true,
+          );
+        } finally {
+          await dir.delete(recursive: true);
+        }
+      } else {
+        forwarded = await media.forwardBody(body, target.userId);
+      }
       final sent = await _transmit(forwarded, toPeer: target.userId);
       if (sent && mounted) {
         unawaited(
@@ -1371,16 +1944,13 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                           padding: const EdgeInsets.symmetric(horizontal: 5),
                           decoration: (votes[e] == 'mine' || votes[e] == 'both')
                               ? BoxDecoration(
-                                  color: Theme.of(
-                                    ctx,
-                                  ).colorScheme.primaryContainer,
+                                  color: Theme.of(ctx)
+                                      .colorScheme
+                                      .primaryContainer,
                                   borderRadius: BorderRadius.circular(20),
                                 )
                               : null,
-                          child: Text(
-                            e,
-                            style: const TextStyle(fontSize: 30),
-                          ),
+                          child: Text(e, style: const TextStyle(fontSize: 30)),
                         ),
                       ),
                     GestureDetector(
@@ -1392,17 +1962,15 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                         margin: const EdgeInsets.only(left: 2),
                         padding: const EdgeInsets.all(6),
                         decoration: BoxDecoration(
-                          color: Theme.of(
-                            ctx,
-                          ).colorScheme.surfaceContainerHighest,
+                          color: Theme.of(ctx)
+                              .colorScheme
+                              .surfaceContainerHighest,
                           shape: BoxShape.circle,
                         ),
                         child: Icon(
                           Icons.add,
                           size: 22,
-                          color: Theme.of(
-                            ctx,
-                          ).colorScheme.onSurfaceVariant,
+                          color: Theme.of(ctx).colorScheme.onSurfaceVariant,
                         ),
                       ),
                     ),
@@ -1638,6 +2206,8 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _documentControl?.cancelled = true;
     _hideReactBar();
     composer.removeListener(_saveDraft);
     scroll.removeListener(_hideReactBar);
@@ -1655,6 +2225,18 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
 
   @override
   Widget build(BuildContext context) {
+    if (!_accessGranted) {
+      return Scaffold(
+        appBar: AppBar(title: const Text('Locked chat')),
+        body: Center(
+          child: FilledButton.icon(
+            onPressed: _unlockChat,
+            icon: const Icon(Icons.lock),
+            label: const Text('Unlock with chat PIN'),
+          ),
+        ),
+      );
+    }
     return Scaffold(
       appBar: AppBar(
         title: _searching
@@ -1668,7 +2250,36 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                 onChanged: (v) =>
                     setState(() => _searchQuery = v.trim().toLowerCase()),
               )
-            : Text(widget.peerName),
+            : Row(
+                children: [
+                  CircleAvatar(
+                    radius: 18,
+                    backgroundColor: const Color(0xFFE4EBFF),
+                    foregroundImage:
+                        (widget.peerAvatarUrl != null &&
+                            widget.peerAvatarUrl!.isNotEmpty)
+                        ? NetworkImage(widget.peerAvatarUrl!)
+                        : null,
+                    child: Text(
+                      widget.peerName.isEmpty
+                          ? '?'
+                          : widget.peerName[0].toUpperCase(),
+                      style: const TextStyle(
+                        color: Color(0xFF245CDB),
+                        fontWeight: FontWeight.w800,
+                        fontSize: 14,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      widget.peerName,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
+              ),
 
         actions: [
           IconButton(
@@ -1707,6 +2318,21 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
             icon: const Icon(Icons.more_vert),
             onSelected: (value) async {
               switch (value) {
+                case 'lock':
+                  final wasLocked =
+                      widget.store.preferences.getBool(_lockKey) == true;
+                  final hasPin = await ChatLock.hasPin();
+                  if (!context.mounted) return;
+                  final ok = hasPin
+                      ? await ChatLock.promptVerify(context)
+                      : await ChatLock.promptSetup(context);
+                  if (ok) {
+                    await widget.store.preferences.setBool(
+                      _lockKey,
+                      !wasLocked,
+                    );
+                    if (mounted) setState(() {});
+                  }
                 case 'starred':
                   await _showStarred();
                 case 'verify':
@@ -1740,6 +2366,14 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
               }
             },
             itemBuilder: (context) => const [
+              PopupMenuItem(
+                value: 'lock',
+                child: ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: Icon(Icons.lock_outline),
+                  title: Text('Toggle chat PIN lock'),
+                ),
+              ),
               PopupMenuItem(
                 value: 'starred',
                 child: ListTile(
@@ -1778,6 +2412,18 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
       ),
       body: Column(
         children: [
+          if (_documentControl != null)
+            ListTile(
+              title: LinearProgressIndicator(value: _documentProgress),
+              subtitle: Text(
+                'Uploading document ${(100 * _documentProgress).round()}%',
+              ),
+              trailing: IconButton(
+                tooltip: 'Cancel upload',
+                icon: const Icon(Icons.close),
+                onPressed: () => _documentControl?.cancelled = true,
+              ),
+            ),
           if (_error != null)
             Padding(
               padding: const EdgeInsets.all(16),
@@ -1837,7 +2483,40 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                           _noticeVisible(msg);
                           final body = parseMessageBody(msg.text);
                           Widget bubble;
-                          if (body.isTombstone) {
+                          if (body.viewOnce) {
+                            bubble = Align(
+                              alignment: msg.mine
+                                  ? Alignment.centerRight
+                                  : Alignment.centerLeft,
+                              child: Card(
+                                child: ListTile(
+                                  leading: const Icon(Icons.filter_1_outlined),
+                                  title: Text(
+                                    msg.mine
+                                        ? 'View-once media sent'
+                                        : 'View-once ${body.isVideo ? 'video' : 'photo'}',
+                                  ),
+                                  subtitle: Text(
+                                    msg.mine ? 'Recipients can open it once.' : 'Tap to open once. Capture protection required.',
+                                  ),
+                                  onTap: msg.mine
+                                      ? null
+                                      : () => Navigator.of(context).push(
+                                          MaterialPageRoute<void>(
+                                            builder: (_) => ViewOnceScreen(
+                                              body: body,
+                                              media: media,
+                                              store: widget.store,
+                                              account: accountId,
+                                              peer: widget.peerId,
+                                              messageRef: msg.ref,
+                                            ),
+                                          ),
+                                        ),
+                                ),
+                              ),
+                            );
+                          } else if (body.isTombstone) {
                             bubble = _SecureBubble(
                               text: 'This message was deleted',
                               deleted: true,
@@ -1872,9 +2551,40 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                               mine: msg.mine,
                               time: msg.at.toLocal(),
                               status: msg.status,
-                              onVote: (choices) => _transmit(
-                                encodeVoteBody(body.pollId!, choices),
-                              ),
+                              onVote: (choices) async {
+                                final sent = await _transmit(
+                                  encodeVoteBody(body.pollId!, choices),
+                                );
+                                if (!sent && context.mounted) {
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    const SnackBar(
+                                      content: Text(
+                                        'Vote failed to send. Check your connection.',
+                                      ),
+                                    ),
+                                  );
+                                }
+                              },
+                            );
+                          } else if (body.isDocument) {
+                            bubble = DocumentBubble(
+                              body: body,
+                              transfer: documents,
+                              mine: msg.mine,
+                            );
+                          } else if (body.isContact) {
+                            bubble = ContactBubble(body: body, mine: msg.mine);
+                          } else if (body.isLocation &&
+                              body.latitude != null &&
+                              body.longitude != null) {
+                            bubble = LocationBubble(body: body, mine: msg.mine);
+                          } else if (body.isVoice && body.path != null) {
+                            bubble = VoiceNoteBubble(
+                              media: media,
+                              body: body,
+                              mine: msg.mine,
+                              time: msg.at.toLocal(),
+                              status: msg.status,
                             );
                           } else if (body.isVideo && body.path != null) {
                             bubble = _SecureVideoBubble(
@@ -1940,17 +2650,21 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                               !body.isTombstone &&
                               !body.isImage &&
                               !body.isVideo &&
+                              !body.isVoice &&
+                              !body.isDocument &&
+                              !body.isContact &&
+                              !body.isLocation &&
                               !body.isPoll &&
                               !body.isVote;
-                          return GestureDetector(
+                          final showDay =
+                              i == ordered.length - 1 ||
+                              !sameDay(msg.at, ordered[i + 1].at);
+                          final tile = GestureDetector(
                             key: ValueKey(msg.ref),
                             onTapDown: tappable
-                                ? (details) =>
-                                      _tapPos = details.globalPosition
+                                ? (details) => _tapPos = details.globalPosition
                                 : null,
-                            onTap: tappable
-                                ? () => _showReactBar(msg)
-                                : null,
+                            onTap: tappable ? () => _showReactBar(msg) : null,
                             onHorizontalDragEnd: body.isTombstone
                                 ? null
                                 : (details) {
@@ -1979,7 +2693,10 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                                   : CrossAxisAlignment.start,
                               mainAxisSize: MainAxisSize.min,
                               children: [
-                                bubble,
+                                AppearOnce(
+                                  key: ValueKey('msg-${msg.ref}'),
+                                  child: bubble,
+                                ),
                                 if ((reactions[msg.ref] ?? {}).isNotEmpty)
                                   Padding(
                                     padding: const EdgeInsets.only(
@@ -2034,6 +2751,14 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
                                   ),
                               ],
                             ),
+                          );
+                          if (!showDay) return tile;
+                          return Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Center(child: DayPill(at: msg.at)),
+                              tile,
+                            ],
                           );
                         },
                       );
@@ -2769,13 +3494,18 @@ class _SecurePollBubbleState extends State<_SecurePollBubble> {
               final isMine = selected.contains(i);
               final fg = widget.mine ? Colors.white : const Color(0xFF22334E);
               return InkWell(
-                onTap: () => setState(() {
+                onTap: () {
                   if (widget.multi) {
-                    isMine ? selected.remove(i) : selected.add(i);
+                    setState(() {
+                      isMine ? selected.remove(i) : selected.add(i);
+                    });
                   } else {
-                    selected = {i};
+                    // Single choice: tapping an option votes immediately
+                    // (WhatsApp-style). The Vote button remains as backup.
+                    setState(() => selected = {i});
+                    widget.onVote([i]);
                   }
-                }),
+                },
                 child: Padding(
                   padding: const EdgeInsets.symmetric(vertical: 4),
                   child: Column(

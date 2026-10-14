@@ -37,7 +37,11 @@ class _SealedVideoScreenState extends State<SealedVideoScreen> {
       final controller = VideoPlayerController.file(file);
       await controller.initialize();
       controller.setLooping(true);
-      if (!mounted) return;
+      if (!mounted) {
+        await controller.dispose();
+        if (await file.exists()) await file.delete();
+        return;
+      }
       setState(() => _controller = controller);
       await controller.play();
     } catch (_) {

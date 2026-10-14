@@ -5,6 +5,7 @@ import android.util.AtomicFile
 import android.util.Base64
 import java.io.File
 import java.util.UUID
+import org.signal.libsignal.protocol.IdentityKey
 import org.signal.libsignal.protocol.SignalProtocolAddress
 
 /** Android binding: Keystore-backed encrypted store file plus base64 codec.
@@ -65,6 +66,10 @@ class SignalBridge(private val context: Context) {
         require(id is String) { "Account required" }
         return SignalProtocolAddress(UUID.fromString(id).toString(), 1)
     }
+    private fun groupAddress(groupId: String, epoch: Int, senderId: String): SignalProtocolAddress {
+        require(groupId.isNotBlank() && senderId.isNotBlank() && epoch > 0) { "Invalid group key context" }
+        return SignalProtocolAddress("openchat-group:$groupId:$epoch:$senderId", 1)
+    }
     private fun store(accountId: String) = DeviceSignalStore(context, accountId).open()
 
     fun publish(accountId: String): Map<String, Any> {
@@ -105,6 +110,54 @@ class SignalBridge(private val context: Context) {
         return mapOf("plain" to b64(plain))
     }
 
+    fun createGroupSenderKey(accountId: String, groupId: String, epoch: Int): Map<String, Any> {
+        val sender = groupAddress(groupId, epoch, accountId)
+        val distribution = SignalSessions.createGroupSenderKey(store(accountId), sender)
+        return mapOf(
+            "distributionId" to distribution.distributionId.toString(),
+            "created" to distribution.created,
+            "distribution" to (distribution.packet?.let(::b64) ?: ""),
+        )
+    }
+
+    fun markGroupSenderKeyPublished(accountId: String, groupId: String, epoch: Int): Map<String, Any> {
+        SignalSessions.markGroupSenderKeyPublished(
+            store(accountId),
+            groupAddress(groupId, epoch, accountId),
+        )
+        return mapOf("ok" to true)
+    }
+
+    fun processGroupSenderKey(
+        accountId: String,
+        groupId: String,
+        epoch: Int,
+        senderId: String,
+        distributionB64: String,
+    ): Map<String, Any> {
+        SignalSessions.processGroupSenderKey(
+            store(accountId),
+            groupAddress(groupId, epoch, senderId),
+            unb64(distributionB64),
+        )
+        return mapOf("ok" to true)
+    }
+
+    fun encryptGroup(accountId: String, groupId: String, epoch: Int, plainB64: String): Map<String, Any> =
+        mapOf("ciphertext" to b64(SignalSessions.encryptGroup(
+            store(accountId), groupAddress(groupId, epoch, accountId), unb64(plainB64),
+        )))
+
+    fun decryptGroup(
+        accountId: String,
+        groupId: String,
+        epoch: Int,
+        senderId: String,
+        ciphertextB64: String,
+    ): Map<String, Any> = mapOf("plain" to b64(SignalSessions.decryptGroup(
+        store(accountId), groupAddress(groupId, epoch, senderId), unb64(ciphertextB64),
+    )))
+
     fun seal(accountId: String, dataB64: String): Map<String, Any> =
         mapOf("blob" to b64(DeviceSignalStore(context, accountId).sealBlob(unb64(dataB64))))
 
@@ -113,5 +166,19 @@ class SignalBridge(private val context: Context) {
 
     fun hasSession(accountId: String, peerId: String): Boolean {
         return store(accountId).containsSession(address(peerId))
+    }
+
+    fun resetSession(accountId: String, peerId: String) {
+        store(accountId).deleteSession(address(peerId))
+    }
+
+    /** Drops the session and optionally trusts a rotated peer identity, so a
+     *  reinstall on the other side heals instead of failing forever. */
+    fun resetPeer(accountId: String, peerId: String, identityKeyB64: String?) {
+        val s = store(accountId)
+        s.deleteSession(address(peerId))
+        if (identityKeyB64 != null) {
+            s.saveIdentity(address(peerId), IdentityKey(unb64(identityKeyB64)))
+        }
     }
 }
