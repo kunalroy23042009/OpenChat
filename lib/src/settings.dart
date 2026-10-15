@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'chat_lock.dart';
+import 'chat_preferences.dart';
 import 'chat_store.dart';
 import 'auth/password_auth.dart';
 import 'auth/password_field.dart';
@@ -17,9 +18,7 @@ import 'local_profile.dart';
 import 'profile_page.dart';
 import 'push/push_service.dart';
 import 'recovery_page.dart';
-import 'security/security_page.dart';
 import 'theme/app_theme.dart';
-import 'ai/ai_settings_page.dart';
 import 'backup/backup_page.dart';
 import 'privacy_settings_page.dart';
 import 'security/app_lock.dart';
@@ -51,10 +50,15 @@ class _SettingsPageState extends State<SettingsPage> {
   String? feedback;
   StreamSubscription<AuthState>? authSubscription;
   late AppThemeController theme;
+  late bool hdMedia;
+  late bool lowDataMode;
   @override
   void initState() {
     super.initState();
     theme = widget.theme ?? AppThemeController(widget.store.preferences);
+    final chatPrefs = ChatPreferences(widget.store.preferences);
+    hdMedia = chatPrefs.hdMedia;
+    lowDataMode = chatPrefs.lowDataMode;
     authSubscription = widget.client?.auth.onAuthStateChange.listen(
       (_) {
         if (mounted) setState(() {});
@@ -113,50 +117,88 @@ class _SettingsPageState extends State<SettingsPage> {
     }
   }
 
+  static Widget _section(String title) => Padding(
+    padding: const EdgeInsets.only(top: 24, bottom: 4),
+    child: Text(
+      title,
+      style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: Color(0xFF66748A)),
+    ),
+  );
+
+  Future<void> _setHdMedia(bool value) async {
+    await ChatPreferences(widget.store.preferences).setHdMedia(value);
+    if (mounted) setState(() => hdMedia = value);
+  }
+
+  Future<void> _setLowData(bool value) async {
+    await ChatPreferences(widget.store.preferences).setLowDataMode(value);
+    if (mounted) setState(() => lowDataMode = value);
+  }
+
   @override
   Widget build(BuildContext context) => Scaffold(
-    appBar: AppBar(title: const Text('Settings & account')),
+    appBar: AppBar(title: const Text('Settings')),
     body: Center(
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 600),
         child: ListView(
           padding: const EdgeInsets.all(24),
           children: [
-            const Text(
-              'Your space.',
-              style: TextStyle(fontSize: 32, fontWeight: FontWeight.w800),
-            ),
-            const SizedBox(height: 8),
-            const Text(
-              'Connect your real account and contacts below. Chat conversations are still a local demo.',
-            ),
-            const SizedBox(height: 28),
-            const ListTile(
-              contentPadding: EdgeInsets.zero,
-              leading: Icon(Icons.science_outlined),
-              title: Text('Local demo storage'),
-              subtitle: Text(
-                'Unencrypted sample data. Use fictional messages only.',
-              ),
-            ),
-            ListTile(
-              contentPadding: EdgeInsets.zero,
-              leading: const Icon(Icons.account_circle_outlined),
-              title: const Text('My profile'),
-              subtitle: const Text(
-                'Photo, name, and about — the way contacts see you.',
-              ),
-              trailing: const Icon(Icons.chevron_right),
-              onTap: () => Navigator.push(
-                context,
-                MaterialPageRoute<void>(
-                  builder: (_) => ProfilePage(
-                    profile: widget.profile,
-                    client: widget.client,
+            ListenableBuilder(
+              listenable: widget.profile,
+              builder: (context, _) {
+                final name = widget.profile.name.isEmpty
+                    ? 'Add your name'
+                    : widget.profile.name;
+                final avatar = widget.profile.avatarFile;
+                return ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: CircleAvatar(
+                    radius: 30,
+                    backgroundColor: const Color(0xFFDDE5FF),
+                    backgroundImage: avatar != null
+                        ? FileImage(avatar)
+                        : null,
+                    child: avatar == null
+                        ? Text(
+                            name.isEmpty
+                                ? '?'
+                                : name[0].toUpperCase(),
+                            style: const TextStyle(
+                              fontSize: 28,
+                              color: Color(0xFF245CDB),
+                              fontWeight: FontWeight.w700,
+                            ),
+                          )
+                        : null,
                   ),
-                ),
-              ),
+                  title: Text(
+                    name,
+                    style: const TextStyle(
+                      fontSize: 20,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  subtitle: Text(
+                    widget.profile.about,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  trailing: const Icon(Icons.qr_code_2_outlined),
+                  onTap: () => Navigator.push(
+                    context,
+                    MaterialPageRoute<void>(
+                      builder: (_) => ProfilePage(
+                        profile: widget.profile,
+                        client: widget.client,
+                      ),
+                    ),
+                  ),
+                );
+              },
             ),
+            const Divider(height: 32),
+            _section('Notifications'),
             ListTile(
               contentPadding: EdgeInsets.zero,
               leading: const Icon(Icons.notifications_outlined),
@@ -176,60 +218,123 @@ class _SettingsPageState extends State<SettingsPage> {
                 if (mounted) setState(() {});
               },
             ),
-            ListTile(
-              contentPadding: EdgeInsets.zero,
-              leading: const Icon(Icons.lock_outline),
-              title: const Text('Device security'),
-              subtitle: const Text(
-                'Create a local identity and run Signal encryption checks.',
-              ),
-              trailing: const Icon(Icons.chevron_right),
-              onTap: () => Navigator.push(
-                context,
-                MaterialPageRoute<void>(
-                  builder: (_) => _SecurityRoute(client: widget.client),
-                ),
-              ),
-            ),
-            ValueListenableBuilder<bool>(valueListenable: AppLock.enabled, builder: (context, enabled, _) => SwitchListTile(
-              contentPadding: EdgeInsets.zero, secondary: const Icon(Icons.fingerprint), title: const Text('App lock'),
-              subtitle: const Text('Biometric or device PIN.'), value: enabled,
-              onChanged: (value) async {
-                final messenger = ScaffoldMessenger.of(context);
-                try {
-                  if (!await AppLock.setEnabled(value)) messenger.showSnackBar(const SnackBar(content: Text('Authentication was not completed. Set up a device screen lock first.')));
-                } catch (_) { messenger.showSnackBar(const SnackBar(content: Text('App lock could not be changed.'))); }
-                finally { if (mounted) setState(() {}); }
-              })),
-            if (AppLock.enabled.value)
-              ValueListenableBuilder<Duration>(valueListenable: AppLock.timeout, builder: (context, current, _) => ListTile(
+            _section('Privacy'),
+            ValueListenableBuilder<bool>(
+              valueListenable: AppLock.enabled,
+              builder: (context, enabled, _) => SwitchListTile(
                 contentPadding: EdgeInsets.zero,
-                leading: const Icon(Icons.timer_outlined),
-                title: const Text('Automatically lock'),
-                subtitle: Text(AppLock.timeoutLabel(current)),
-                onTap: () async {
-                  final picked = await showDialog<Duration>(context: context, builder: (ctx) => SimpleDialog(
-                    title: const Text('Automatically lock'),
-                    children: [for (final option in AppLock.timeoutOptions)
-                      SimpleDialogOption(
-                        onPressed: () => Navigator.pop(ctx, option),
-                        child: Row(children: [
-                          if (option == current) const Icon(Icons.check, size: 18),
-                          if (option != current) const SizedBox(width: 18),
-                          const SizedBox(width: 8),
-                          Text(AppLock.timeoutLabel(option)),
-                        ]),
-                      )],
-                  ));
-                  if (picked != null) {
-                    try {
-                      await AppLock.setTimeout(picked);
-                    } catch (_) {
-                      if (context.mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Lock timer could not be changed.')));
-                    }
+                secondary: const Icon(Icons.fingerprint),
+                title: const Text('App lock'),
+                subtitle: const Text('Biometric or device PIN.'),
+                value: enabled,
+                onChanged: (value) async {
+                  final messenger = ScaffoldMessenger.of(context);
+                  try {
+                    if (!await AppLock.setEnabled(value))
+                      messenger.showSnackBar(
+                        const SnackBar(
+                          content: Text(
+                            'Authentication was not completed. Set up a device screen lock first.',
+                          ),
+                        ),
+                      );
+                  } catch (_) {
+                    messenger.showSnackBar(
+                      const SnackBar(
+                        content: Text('App lock could not be changed.'),
+                      ),
+                    );
+                  } finally {
+                    if (mounted) setState(() {});
                   }
                 },
-              )),
+              ),
+            ),
+            if (AppLock.enabled.value)
+              ValueListenableBuilder<Duration>(
+                valueListenable: AppLock.timeout,
+                builder: (context, current, _) => ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: const Icon(Icons.timer_outlined),
+                  title: const Text('Automatically lock'),
+                  subtitle: Text(AppLock.timeoutLabel(current)),
+                  onTap: () async {
+                    final picked = await showDialog<Duration>(
+                      context: context,
+                      builder: (ctx) => SimpleDialog(
+                        title: const Text('Automatically lock'),
+                        children: [
+                          for (final option in AppLock.timeoutOptions)
+                            SimpleDialogOption(
+                              onPressed: () => Navigator.pop(ctx, option),
+                              child: Row(
+                                children: [
+                                  if (option == current)
+                                    const Icon(Icons.check, size: 18),
+                                  if (option != current)
+                                    const SizedBox(width: 18),
+                                  const SizedBox(width: 8),
+                                  Text(AppLock.timeoutLabel(option)),
+                                ],
+                              ),
+                            ),
+                        ],
+                      ),
+                    );
+                    if (picked != null) {
+                      try {
+                        await AppLock.setTimeout(picked);
+                      } catch (_) {
+                        if (context.mounted)
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                              content: Text('Lock timer could not be changed.'),
+                            ),
+                          );
+                      }
+                    }
+                  },
+                ),
+              ),
+            _section('Chats'),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.wallpaper_outlined),
+              title: const Text('Default wallpaper'),
+              subtitle: Text(
+                ChatPreferences(
+                  widget.store.preferences,
+                ).defaultWallpaper.label,
+              ),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () async {
+                final prefs = ChatPreferences(widget.store.preferences);
+                final picked = await chooseChatWallpaper(
+                  context,
+                  prefs.defaultWallpaper,
+                );
+                if (picked != null) {
+                  await prefs.setDefaultWallpaper(picked);
+                  if (mounted) setState(() {});
+                }
+              },
+            ),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              secondary: const Icon(Icons.hd_outlined),
+              title: const Text('HD media sharing'),
+              subtitle: const Text('Higher photo quality when sharing.'),
+              value: hdMedia,
+              onChanged: _setHdMedia,
+            ),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              secondary: const Icon(Icons.data_saver_on_outlined),
+              title: const Text('Use less data for calls'),
+              subtitle: const Text('Lighter media profile on mobile data.'),
+              value: lowDataMode,
+              onChanged: _setLowData,
+            ),
             if (widget.client?.auth.currentUser != null)
               ListTile(
                 contentPadding: EdgeInsets.zero,
@@ -242,10 +347,8 @@ class _SettingsPageState extends State<SettingsPage> {
                 onTap: () => Navigator.push(
                   context,
                   MaterialPageRoute<void>(
-                    builder: (_) => BackupPage(
-                      store: widget.store,
-                      client: widget.client!,
-                    ),
+                    builder: (_) =>
+                        BackupPage(store: widget.store, client: widget.client!),
                   ),
                 ),
               ),
@@ -267,22 +370,6 @@ class _SettingsPageState extends State<SettingsPage> {
                 ),
               ),
             ),
-            ListTile(
-              contentPadding: EdgeInsets.zero,
-              leading: const Icon(Icons.auto_awesome_outlined),
-              title: const Text('AI Assistants (ChatGPT, Claude, Gemini)'),
-              subtitle: const Text(
-                'Configure API keys and add LLMs directly to your WhatsApp chats.',
-              ),
-              trailing: const Icon(Icons.chevron_right),
-              onTap: () => Navigator.push(
-                context,
-                MaterialPageRoute<void>(
-                  builder: (_) => AiSettingsPage(store: widget.store),
-                ),
-              ),
-            ),
-            const Divider(height: 40),
             ListTile(
               contentPadding: EdgeInsets.zero,
               leading: const Icon(Icons.lock_outline),
@@ -308,11 +395,7 @@ class _SettingsPageState extends State<SettingsPage> {
               },
             ),
             const Divider(height: 40),
-            const Text(
-              'Appearance',
-              style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
-            ),
-            const SizedBox(height: 12),
+            _section('Appearance'),
             ValueListenableBuilder<AppThemeMode>(
               valueListenable: theme,
               builder: (context, mode, _) => SegmentedButton<AppThemeMode>(
@@ -346,22 +429,20 @@ class _SettingsPageState extends State<SettingsPage> {
               style: TextStyle(fontSize: 12, color: Color(0xFF66748A)),
             ),
             const Divider(height: 40),
-            if (widget.startupError != null) Text(widget.startupError!),
-            if (widget.client == null) ...[
-              const Text(
-                'Connect Supabase',
-                style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
+            if (widget.client == null)
+              const Card(
+                child: ListTile(
+                  leading: Icon(Icons.cloud_off_outlined),
+                  title: Text('Not connected to cloud'),
+                  subtitle: Text(
+                    'Chats stay on this device. Reinstall the app from the latest build to connect.',
+                  ),
+                ),
               ),
+            if (widget.client == null)
               const SizedBox(height: 12),
-              const Text(
-                'Run with SUPABASE_URL and SUPABASE_ANON_KEY using --dart-define-from-file. Setup instructions are in README.md.',
-              ),
-            ] else ...[
-              const Text(
-                'Cloud account',
-                style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
-              ),
-              const SizedBox(height: 12),
+            if (widget.client != null) ...[
+              _section('Account'),
               if (widget.client!.auth.currentUser != null) ...[
                 Text('Signed in as ${widget.client!.auth.currentUser!.email}'),
                 const SizedBox(height: 12),
@@ -541,54 +622,19 @@ class _SettingsPageState extends State<SettingsPage> {
                 child: Semantics(liveRegion: true, child: Text(feedback!)),
               ),
             const Divider(height: 40),
-            OutlinedButton.icon(
-              onPressed: () async {
-                final confirmed = await showDialog<bool>(
-                  context: context,
-                  builder: (context) => AlertDialog(
-                    title: const Text('Reset demo conversations?'),
-                    content: const Text(
-                      'This removes your local demo messages and restores the sample conversations.',
-                    ),
-                    actions: [
-                      TextButton(
-                        onPressed: () => Navigator.pop(context, false),
-                        child: const Text('Cancel'),
-                      ),
-                      FilledButton(
-                        onPressed: () => Navigator.pop(context, true),
-                        child: const Text('Reset'),
-                      ),
-                    ],
-                  ),
-                );
-                if (confirmed == true) {
-                  await widget.store.reset();
-                  if (mounted) {
-                    setState(() => feedback = 'Demo conversations restored.');
-                  }
-                }
-              },
-              icon: const Icon(Icons.restart_alt),
-              label: const Text('Reset demo data'),
+            _section('Help'),
+            const ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.info_outline),
+              title: Text('About OpenChat'),
+              subtitle: Text(
+                'Version 1.0.0. Chats and calls are end-to-end encrypted.',
+              ),
             ),
           ],
         ),
       ),
     ),
-  );
-}
-
-class _SecurityRoute extends StatelessWidget {
-  const _SecurityRoute({this.client});
-  final SupabaseClient? client;
-  @override
-  Widget build(BuildContext context) => StreamBuilder<AuthState>(
-    stream: client?.auth.onAuthStateChange,
-    builder: (context, _) {
-      final id = client?.auth.currentUser?.id;
-      return SecurityPage(key: ValueKey(id), accountId: id);
-    },
   );
 }
 

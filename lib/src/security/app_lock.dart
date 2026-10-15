@@ -56,21 +56,41 @@ class AppLock {
 
   static Future<bool> authenticate() async {
     try {
+      // biometricOnly:false allows device PIN/pattern/password fallback.
       return await auth.authenticate(
         localizedReason: 'Unlock OpenChat',
+        biometricOnly: false,
         persistAcrossBackgrounding: true,
       );
-    } catch (_) {
+    } catch (e) {
+      debugPrint('AppLock authenticate error: $e');
       return false;
     }
   }
 
   static Future<bool> setEnabled(bool value) async {
-    if (!await auth.isDeviceSupported() || !await authenticate()) return false;
+    if (value) {
+      if (!await auth.isDeviceSupported()) return false;
+      if (!await authenticate()) return false;
+    }
     await _storage.write(key: _key, value: value.toString());
     enabled.value = value;
     return true;
   }
+
+  /// Emergency reset when biometrics/device PIN are broken.
+  /// Prevents reinstall lockout: clears the flag without requiring auth.
+  static Future<void> clear() async {
+    try {
+      await _storage.delete(key: _key);
+    } catch (_) {}
+    enabled.value = false;
+  }
+
+  /// Set before launching an external activity (gallery, camera, file
+  /// picker, contact picker) so the resume right after does not relock.
+  /// Consumed once on the next resume.
+  static bool suppressRelockOnce = false;
 }
 
 /// Wraps the entire Navigator, including notification/deep-link routes.
@@ -140,26 +160,36 @@ class _AppLockGateState extends State<AppLockGate> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (!AppLock.enabled.value || _authenticating || !mounted) return;
     if (state == AppLifecycleState.resumed) {
-      // Relock only once the chosen grace period has elapsed.
-      if (_locked) return;
+      // External pickers (gallery/camera/files) pause the activity and
+      // resume right after: never relock for that single resume.
+      if (AppLock.suppressRelockOnce) {
+        AppLock.suppressRelockOnce = false;
+        _backgroundedAt = null;
+        return;
+      }
+      if (_locked) {
+        _backgroundedAt = null;
+        return;
+      }
       final left = _backgroundedAt;
       _backgroundedAt = null;
-      if (left == null ||
-          DateTime.now().difference(left) >= AppLock.timeout.value) {
+      // Immediately = lock on any real backgrounding. Otherwise lock only
+      // once the chosen grace period has elapsed. `inactive` (dialogs,
+      // permission sheets, calls) never arms the lock by itself.
+      if (left != null &&
+          (AppLock.timeout.value == Duration.zero ||
+              DateTime.now().difference(left) >= AppLock.timeout.value)) {
         setState(() => _locked = true);
       }
       return;
     }
-    // WhatsApp-style: only a real backgrounding arms the lock. The
-    // `inactive` state fires for in-app flows (image picker, permission
-    // dialogs, calls) and must never demand the lock on return.
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.detached ||
         state == AppLifecycleState.hidden) {
+      // Record only. Locking happens on resume, so a transient pause
+      // (auth prompt, picker, call UI) can never trap the user on the
+      // lock screen while they are still inside the app flow.
       _backgroundedAt ??= DateTime.now();
-      if (AppLock.timeout.value == Duration.zero) {
-        setState(() => _locked = true);
-      }
     }
   }
 
@@ -167,7 +197,14 @@ class _AppLockGateState extends State<AppLockGate> with WidgetsBindingObserver {
     if (_authenticating) return;
     setState(() => _authenticating = true);
     final granted = await AppLock.authenticate();
-    if (granted) _backgroundedAt = null;
+    if (granted) {
+      _backgroundedAt = null;
+    } else if (mounted) {
+      // Show error if authentication failed
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Authentication failed. Try again.')),
+      );
+    }
     if (mounted)
       setState(() {
         _authenticating = false;
@@ -181,6 +218,33 @@ class _AppLockGateState extends State<AppLockGate> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     if (_protected) unawaited(SecureDisplay.release());
     super.dispose();
+  }
+
+  Future<void> _resetLock() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Reset app lock?'),
+        content: const Text(
+          'This turns off App lock on this device without biometrics. Your chats are kept.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Reset'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      await AppLock.clear();
+      _backgroundedAt = null;
+      if (mounted) setState(() => _locked = false);
+    }
   }
 
   @override
@@ -210,6 +274,10 @@ class _AppLockGateState extends State<AppLockGate> with WidgetsBindingObserver {
                             onPressed: _authenticating ? null : _unlock,
                             icon: const Icon(Icons.fingerprint),
                             label: const Text('Unlock'),
+                          ),
+                          TextButton(
+                            onPressed: _authenticating ? null : _resetLock,
+                            child: const Text('Forgot? Reset lock'),
                           ),
                         ],
                       ),

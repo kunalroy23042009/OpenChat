@@ -1,12 +1,17 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:qr_flutter/qr_flutter.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../widgets/formatted_text.dart';
 import '../widgets/message_actions.dart';
 import '../widgets/status_ticks.dart';
 import '../widgets/whatsapp_wallpaper.dart';
+import '../chat_preferences.dart';
 import '../calling/call_screen.dart';
 import '../contacts_repository.dart';
 import 'conversation_repository.dart';
@@ -60,6 +65,21 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   bool _loadingOlder = false;
   bool _hasMoreHistory = true;
   String? _error;
+  SharedPreferences? _preferences;
+  ChatWallpaperPreset _wallpaperPreset = ChatWallpaperPreset.classic;
+
+  /// Local "clear chat" cursor: messages at or before this time are hidden
+  /// on this device only (WhatsApp-style clear), without deleting for others.
+  DateTime? _clearedAt;
+
+  /// Live group settings, editable by admins (falls back to widget values).
+  String? _groupTitle;
+  String? _groupDescription;
+  String? _groupAvatar;
+  late int _memberCount = widget.memberCount;
+
+  String get _title => _groupTitle ?? widget.conversationTitle;
+  String? get _description => _groupDescription;
 
   // Realtime Presence
   TypingPresence? _typingPresence;
@@ -69,9 +89,15 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   GroupMessage? _replyingTo;
   GroupMessage? _editingMessage;
 
-  /// Sender profile photos by user id, resolved through contacts.
-  /// Server rows carry no avatar (profiles are self-read-only), so the
-  /// contacts listing is the accessible source of truth.
+  /// @mentions state
+  bool _showMentions = false;
+  String _mentionQuery = '';
+  List<Map<String, dynamic>> _mentionSuggestions = [];
+  OverlayEntry? _mentionOverlay;
+  final LayerLink _mentionLayerLink = LayerLink();
+
+  /// Sender profile photos by user id, resolved from group member roster
+  /// (server now returns avatar_url) and contacts as fallback.
   final Map<String, String> _senderAvatars = {};
 
   String? _senderAvatarFor(GroupMessage msg) {
@@ -83,22 +109,151 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
 
   Future<void> _loadSenderAvatars() async {
     try {
-      final contacts = await SupabaseContactsRepository(
-        Supabase.instance.client,
-      ).contacts();
+      // Load from group member roster (includes avatar_url from server)
+      final members = await _repo.members(widget.conversationId);
       if (!mounted) return;
       setState(() {
-        for (final c in contacts) {
-          if (c.avatarUrl != null && c.avatarUrl!.isNotEmpty) {
-            _senderAvatars[c.userId] = c.avatarUrl!;
+        _memberCount = members.length;
+        for (final m in members) {
+          final avatar = m['avatar_url'] as String?;
+          if (avatar != null && avatar.isNotEmpty) {
+            _senderAvatars[m['member_id'] as String? ??
+                    m['user_id'] as String] =
+                avatar;
           }
         }
       });
-    } catch (_) {}
+    } catch (_) {
+      // Fallback to contacts if roster fails
+      try {
+        final contacts = await SupabaseContactsRepository(
+          Supabase.instance.client,
+        ).contacts();
+        if (!mounted) return;
+        setState(() {
+          for (final c in contacts) {
+            if (c.avatarUrl != null && c.avatarUrl!.isNotEmpty) {
+              _senderAvatars[c.userId] = c.avatarUrl!;
+            }
+          }
+        });
+      } catch (_) {}
+    }
   }
 
   String get _currentUserId =>
       Supabase.instance.client.auth.currentUser?.id ?? '';
+
+  Future<void> _syncGroupMeta() async {
+    try {
+      await _repo.loadConversations();
+      if (!mounted) return;
+      for (final c in _repo.conversations) {
+        if (c.id == widget.conversationId) {
+          setState(() {
+            _groupTitle = c.title;
+            _groupDescription = c.description;
+            _groupAvatar = c.avatarUrl;
+          });
+          break;
+        }
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _editGroupInfo() async {
+    final nameController = TextEditingController(text: _title);
+    final descController = TextEditingController(text: _description ?? '');
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Edit group info'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: nameController,
+              maxLength: 100,
+              decoration: const InputDecoration(labelText: 'Group name'),
+            ),
+            TextField(
+              controller: descController,
+              maxLines: 3,
+              maxLength: 500,
+              decoration: const InputDecoration(labelText: 'Description'),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    if (saved != true || !mounted) return;
+    final newTitle = nameController.text.trim();
+    if (newTitle.isEmpty) {
+      _showToast('Group name cannot be empty.');
+      return;
+    }
+    try {
+      await _repo.updateConversation(
+        widget.conversationId,
+        title: newTitle,
+        description: descController.text.trim(),
+      );
+      if (!mounted) return;
+      setState(() {
+        _groupTitle = newTitle;
+        _groupDescription = descController.text.trim();
+      });
+      _showToast('Group info updated.');
+    } catch (_) {
+      if (mounted) _showToast('Could not update group info.');
+    }
+  }
+
+  Future<void> _pickGroupPhoto() async {
+    final picked = await ImagePicker().pickImage(
+      source: ImageSource.gallery,
+      imageQuality: 86,
+      maxWidth: 1440,
+    );
+    if (picked == null || !mounted) return;
+    final userId = _currentUserId;
+    if (userId.isEmpty) return;
+    try {
+      final path =
+          '$userId/group_${widget.conversationId}_${DateTime.now().millisecondsSinceEpoch}.jpg';
+      await Supabase.instance.client.storage
+          .from('avatars')
+          .uploadBinary(
+            path,
+            await picked.readAsBytes(),
+            fileOptions: const FileOptions(
+              contentType: 'image/jpeg',
+              upsert: true,
+            ),
+          );
+      final url = Supabase.instance.client.storage
+          .from('avatars')
+          .getPublicUrl(path);
+      await _repo.updateConversation(widget.conversationId, avatarUrl: url);
+      if (!mounted) return;
+      setState(() => _groupAvatar = url);
+      _showToast('Group photo updated.');
+    } catch (_) {
+      if (mounted) {
+        _showToast('Could not update group photo. Try another image.');
+      }
+    }
+  }
 
   @override
   void initState() {
@@ -116,7 +271,165 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     );
     _repo.addListener(_onRepoChanged);
     _scrollController.addListener(_onHistoryScroll);
+    _textController.addListener(_onTextChanged);
     _initChat();
+  }
+
+  void _onTextChanged() {
+    final text = _textController.text;
+    if (text.isNotEmpty) {
+      _typingPresence?.onKeystroke();
+    } else {
+      _typingPresence?.stopTyping();
+    }
+    final cursorPos = _textController.selection.baseOffset;
+    // Check if we're typing @mention
+    if (cursorPos > 0 && text.length >= cursorPos) {
+      final beforeCursor = text.substring(0, cursorPos);
+      final lastAtIndex = beforeCursor.lastIndexOf('@');
+      if (lastAtIndex >= 0 &&
+          (lastAtIndex == 0 ||
+              beforeCursor[lastAtIndex - 1] == ' ' ||
+              beforeCursor[lastAtIndex - 1] == '\n')) {
+        final query = beforeCursor.substring(lastAtIndex + 1);
+        if (query.isNotEmpty && !query.contains(' ') && !query.contains('\n')) {
+          _showMentionSuggestions(query);
+          return;
+        }
+      }
+    }
+    _hideMentionOverlay();
+  }
+
+  void _showMentionSuggestions(String query) async {
+    _mentionQuery = query.toLowerCase();
+    final members = await _repo.members(widget.conversationId);
+    if (!mounted) return;
+    final suggestions = members
+        .where(
+          (m) =>
+              m['user_id'] != _currentUserId &&
+              ((m['display_name'] as String? ?? '').toLowerCase().contains(
+                    _mentionQuery,
+                  ) ||
+                  (m['username'] as String? ?? '').toLowerCase().contains(
+                    _mentionQuery,
+                  )),
+        )
+        .toList();
+    setState(() {
+      _mentionSuggestions = suggestions;
+      _showMentions = suggestions.isNotEmpty;
+    });
+    if (_showMentions) {
+      _showMentionOverlay();
+    } else {
+      _hideMentionOverlay();
+    }
+  }
+
+  void _showMentionOverlay() {
+    _hideMentionOverlay();
+    _mentionOverlay = OverlayEntry(
+      builder: (context) => CompositedTransformFollower(
+        link: _mentionLayerLink,
+        showWhenUnlinked: false,
+        offset: const Offset(0, -200),
+        child: Material(
+          color: Colors.transparent,
+          child: Container(
+            constraints: const BoxConstraints(maxHeight: 200, maxWidth: 300),
+            margin: const EdgeInsets.only(bottom: 50),
+            decoration: BoxDecoration(
+              color: Theme.of(context).cardColor,
+              borderRadius: BorderRadius.circular(12),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: 0.2),
+                  blurRadius: 8,
+                  offset: const Offset(0, 2),
+                ),
+              ],
+            ),
+            child: ListView.builder(
+              shrinkWrap: true,
+              itemCount: _mentionSuggestions.length,
+              itemBuilder: (context, index) {
+                final member = _mentionSuggestions[index];
+                final name = member['display_name'] as String? ?? 'Unknown';
+                final username = member['username'] as String? ?? '';
+                return ListTile(
+                  dense: true,
+                  leading: CircleAvatar(
+                    radius: 16,
+                    backgroundColor: const Color(0xFF00A884)
+                        .withValues(alpha: 0.2),
+                    child: Text(
+                      name.isNotEmpty ? name[0].toUpperCase() : '?',
+                      style: const TextStyle(
+                        color: Color(0xFF00A884),
+                        fontWeight: FontWeight.bold,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ),
+                  title: Text(name, style: const TextStyle(fontSize: 14)),
+                  subtitle: username.isNotEmpty
+                      ? Text('@$username', style: const TextStyle(fontSize: 12))
+                      : null,
+                  onTap: () => _insertMention(member),
+                );
+              },
+            ),
+          ),
+        ),
+      ),
+    );
+    Overlay.of(context).insert(_mentionOverlay!);
+  }
+
+  void _hideMentionOverlay() {
+    _mentionOverlay?.remove();
+    _mentionOverlay = null;
+    if (_showMentions) {
+      setState(() => _showMentions = false);
+    }
+  }
+
+  void _insertMention(Map<String, dynamic> member) {
+    final username = member['username'] as String? ?? '';
+    if (username.isEmpty) return;
+
+    final text = _textController.text;
+    final cursorPos = _textController.selection.baseOffset;
+    final beforeCursor = text.substring(0, cursorPos);
+    final lastAtIndex = beforeCursor.lastIndexOf('@');
+
+    if (lastAtIndex >= 0) {
+      final newText =
+          '${beforeCursor.substring(0, lastAtIndex)}@$username ${text.substring(cursorPos)}';
+      _textController.value = TextEditingValue(
+        text: newText,
+        selection: TextSelection.collapsed(
+          offset: lastAtIndex + username.length + 2,
+        ),
+      );
+    }
+    _hideMentionOverlay();
+    _focusNode.requestFocus();
+  }
+
+  @override
+  void dispose() {
+    _mentionOverlay?.remove();
+    _textController.removeListener(_onTextChanged);
+    _repo.removeListener(_onRepoChanged);
+    _repo.dispose();
+    _textController.dispose();
+    _scrollController.dispose();
+    _focusNode.dispose();
+    _typingPresence?.dispose();
+    super.dispose();
   }
 
   void _onHistoryScroll() {
@@ -162,6 +475,16 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   }
 
   Future<void> _initChat() async {
+    final preferences = await SharedPreferences.getInstance();
+    final clearedRaw = preferences.getString(_clearedAtKey());
+    if (mounted) {
+      setState(() {
+        _preferences = preferences;
+        _clearedAt = clearedRaw == null ? null : DateTime.tryParse(clearedRaw);
+        _wallpaperPreset = ChatPreferences(preferences)
+            .wallpaperFor(widget.conversationId);
+      });
+    }
     final client = Supabase.instance.client;
     final myId = client.auth.currentUser?.id;
     final myName =
@@ -188,10 +511,17 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
 
     try {
       unawaited(_loadSenderAvatars());
+      unawaited(_syncGroupMeta());
       if (!widget.readOnlyArchive) {
         unawaited(_repo.updatePresence(isOnline: true));
       }
       final count = await _repo.loadMessages(widget.conversationId);
+      // Mark messages as read up to the newest loaded message
+      if (!widget.readOnlyArchive &&
+          _repo.messagesFor(widget.conversationId).isNotEmpty) {
+        final newest = _repo.messagesFor(widget.conversationId).first;
+        unawaited(_repo.markGroupRead(widget.conversationId, newest.createdAt));
+      }
       _hasMoreHistory = count == ConversationRepository.messagePageSize;
       if (widget.e2eeEnabled && !widget.readOnlyArchive) {
         await _repo.retryPendingGroupMessages(widget.conversationId);
@@ -210,30 +540,6 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
         });
       }
     }
-
-    _textController.addListener(_onTextChanged);
-  }
-
-  void _onTextChanged() {
-    if (_textController.text.isNotEmpty) {
-      _typingPresence?.onKeystroke();
-    }
-  }
-
-  @override
-  void dispose() {
-    if (!widget.readOnlyArchive) {
-      unawaited(_repo.updatePresence(isOnline: false));
-    }
-    _textController.dispose();
-    _scrollController.removeListener(_onHistoryScroll);
-    _scrollController.dispose();
-    _focusNode.dispose();
-    _typingPresence?.dispose();
-    _repo.removeListener(_onRepoChanged);
-    _repo.unsubscribeFromConversation();
-    _repo.dispose();
-    super.dispose();
   }
 
   void _scrollToBottom() {
@@ -283,11 +589,12 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
           return;
         }
       } else {
-        await _repo.sendMessage(
+        final messageId = await _repo.sendMessage(
           widget.conversationId,
           text,
           parentMessageId: replyId,
         );
+        unawaited(_repo.notifyGroup(widget.conversationId, messageId));
       }
       _textController.clear();
       if (mounted) setState(() => _replyingTo = null);
@@ -327,10 +634,258 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     );
   }
 
+  Future<void> _chooseWallpaper() async {
+    final preferences = _preferences;
+    if (preferences == null) return;
+    final picked = await chooseChatWallpaper(context, _wallpaperPreset);
+    if (picked == null || !mounted) return;
+    await ChatPreferences(preferences)
+        .setWallpaper(widget.conversationId, picked);
+    setState(() => _wallpaperPreset = picked);
+  }
+
+  void _showInvite() {
+    final link =
+        'openchat://join?group=${widget.conversationId}&title=${Uri.encodeComponent(widget.conversationTitle)}';
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Invite to group'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            QrImageView(data: link, version: QrVersions.auto, size: 200),
+            const SizedBox(height: 12),
+            SelectableText(link, style: const TextStyle(fontSize: 12)),
+            const SizedBox(height: 8),
+            const Text(
+              'New members in legacy groups can load recent history. '
+              'E2EE groups start fresh by design.',
+              style: TextStyle(fontSize: 12),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: link));
+              Navigator.pop(ctx);
+              _showToast('Invite link copied');
+            },
+            child: const Text('Copy link'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
   void _startGroupCall(CallType type) {
     // No group-call media path exists (1:1 LiveKit calls only). Opening the
     // call screen here would land on a dead-end placeholder, so fail loudly.
     _showToast('Group calls aren\'t available yet. Use 1:1 encrypted chats.');
+  }
+
+  String _clearedAtKey() =>
+      'openchat.groupClearedAt.v1.$_currentUserId.${widget.conversationId}';
+
+  Future<void> _toggleMute() async {
+    GroupConversation? conv;
+    for (final c in _repo.conversations) {
+      if (c.id == widget.conversationId) {
+        conv = c;
+        break;
+      }
+    }
+    final muted = conv?.isMutedNow ?? false;
+    try {
+      await _repo.setConversationFlags(widget.conversationId, muted: !muted);
+      if (mounted) {
+        _showToast(muted ? 'Notifications unmuted' : 'Notifications muted');
+      }
+    } catch (_) {
+      if (mounted) _showToast('Could not update notifications.');
+    }
+  }
+
+  Future<void> _searchInChat() async {
+    final query = await showDialog<String>(
+      context: context,
+      builder: (ctx) {
+        final controller = TextEditingController();
+        return AlertDialog(
+          title: const Text('Search in chat'),
+          content: TextField(
+            controller: controller,
+            autofocus: true,
+            decoration: const InputDecoration(hintText: 'Search messages'),
+            onSubmitted: (v) => Navigator.pop(ctx, v),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, controller.text),
+              child: const Text('Search'),
+            ),
+          ],
+        );
+      },
+    );
+    if (query == null || query.trim().isEmpty || !mounted) return;
+    final q = query.toLowerCase();
+    final matches = _repo
+        .messagesFor(widget.conversationId)
+        .where((m) => m.content.toLowerCase().contains(q))
+        .toList();
+    if (!mounted) return;
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: matches.isEmpty
+            ? const Padding(
+                padding: EdgeInsets.all(24),
+                child: Text('No matching messages.'),
+              )
+            : ListView.builder(
+                shrinkWrap: true,
+                itemCount: matches.length,
+                itemBuilder: (ctx, i) => ListTile(
+                  leading: const Icon(Icons.chat_bubble_outline),
+                  title: Text(
+                    matches[i].content,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  subtitle: Text(
+                    '${matches[i].createdAt.toLocal()}'.split('.').first,
+                  ),
+                ),
+              ),
+      ),
+    );
+  }
+
+  Future<void> _showGroupMedia() async {
+    final media = _repo
+        .messagesFor(widget.conversationId)
+        .where(
+          (m) =>
+              m.type == 'image' ||
+              m.type == 'video' ||
+              m.type == 'document' ||
+              m.type == 'audio' ||
+              (m.mediaUrl != null && m.mediaUrl!.isNotEmpty),
+        )
+        .toList();
+    if (!mounted) return;
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: media.isEmpty
+            ? const Padding(
+                padding: EdgeInsets.all(24),
+                child: Text('No media or documents yet.'),
+              )
+            : ListView.builder(
+                shrinkWrap: true,
+                itemCount: media.length,
+                itemBuilder: (ctx, i) {
+                  final m = media[i];
+                  return ListTile(
+                    leading: Icon(
+                      m.type == 'video'
+                          ? Icons.videocam_outlined
+                          : m.type == 'audio'
+                          ? Icons.mic_none
+                          : m.type == 'document'
+                          ? Icons.description_outlined
+                          : Icons.image_outlined,
+                    ),
+                    title: Text(
+                      m.mediaUrl ?? m.content,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    subtitle: Text(m.type),
+                  );
+                },
+              ),
+      ),
+    );
+  }
+
+  Future<void> _clearChat() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Clear this chat?'),
+        content: const Text(
+          'Messages will be hidden on this device only. Other members keep '
+          'their copy.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Clear'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    final now = DateTime.now().toUtc();
+    await _preferences?.setString(_clearedAtKey(), now.toIso8601String());
+    if (mounted) {
+      setState(() => _clearedAt = now);
+      _showToast('Chat cleared.');
+    }
+  }
+
+  Future<void> _deleteGroup() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete group permanently?'),
+        content: Text(
+          '“$_title” and its messages will be deleted for all members. '
+          'This cannot be undone.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(ctx).colorScheme.error,
+            ),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Delete group'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    try {
+      await _repo.deleteGroup(widget.conversationId);
+      if (!mounted) return;
+      // Close the member sheet and then the group screen.
+      Navigator.of(context).pop();
+      Navigator.of(context).pop();
+    } catch (_) {
+      if (mounted) _showToast('Could not delete group. Only its owner can.');
+    }
   }
 
   void _openMessageActions(GroupMessage msg) {
@@ -542,6 +1097,104 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
 
   /// Member roster with role badges. Admins/owners can remove members;
   /// anyone can leave. Backed by list_conversation_members.
+  Future<void> _addMembers() async {
+    List<Map<String, dynamic>> roster = [];
+    try {
+      roster = await _repo.members(widget.conversationId);
+    } catch (_) {}
+    final existing = roster.map((m) => (m['user_id'] ?? '').toString()).toSet();
+    List<CloudContact> contacts = [];
+    try {
+      contacts = await SupabaseContactsRepository(Supabase.instance.client)
+          .contacts();
+    } catch (_) {}
+    final candidates = contacts
+        .where(
+          (c) => c.userId != _currentUserId && !existing.contains(c.userId),
+        )
+        .toList();
+    if (!mounted) return;
+    if (candidates.isEmpty) {
+      _showToast('No contacts left to add.');
+      return;
+    }
+    final selected = <String>{};
+    final confirmed = await showModalBottomSheet<bool>(
+      context: context,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSheet) => SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Padding(
+                padding: EdgeInsets.all(16),
+                child: Text(
+                  'Add members',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+                ),
+              ),
+              Flexible(
+                child: ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: candidates.length,
+                  itemBuilder: (ctx, i) {
+                    final c = candidates[i];
+                    return CheckboxListTile(
+                      value: selected.contains(c.userId),
+                      onChanged: (v) => setSheet(() {
+                        if (v == true) {
+                          selected.add(c.userId);
+                        } else {
+                          selected.remove(c.userId);
+                        }
+                      }),
+                      title: Text(c.name),
+                      subtitle: Text('@${c.username}'),
+                      secondary: CircleAvatar(
+                        foregroundImage: (c.avatarUrl ?? '').isNotEmpty
+                            ? NetworkImage(c.avatarUrl!)
+                            : null,
+                        child: Text(
+                          c.name.isEmpty ? '?' : c.name[0].toUpperCase(),
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.all(12),
+                child: SizedBox(
+                  width: double.infinity,
+                  child: FilledButton(
+                    onPressed: selected.isEmpty
+                        ? null
+                        : () => Navigator.pop(ctx, true),
+                    child: Text('Add ${selected.length} member(s)'),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    var added = 0;
+    for (final id in selected) {
+      try {
+        await _repo.addMember(widget.conversationId, id);
+        added++;
+      } catch (_) {}
+    }
+    if (mounted) {
+      _showToast('Added $added member(s).');
+      await _showMembers();
+    }
+  }
+
   Future<void> _showMembers() async {
     List<Map<String, dynamic>> roster = [];
     String? error;
@@ -551,6 +1204,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       error = 'Could not load members. Check your connection.';
     }
     if (!mounted) return;
+    setState(() => _memberCount = roster.length);
     final myId = _currentUserId;
     var myRole = 'member';
     for (final m in roster) {
@@ -565,13 +1219,111 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
           mainAxisSize: MainAxisSize.min,
           children: [
             Padding(
-              padding: const EdgeInsets.all(16),
-              child: Text(
-                '${widget.conversationTitle} • ${roster.length} members',
-                style: const TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.w700,
-                ),
+              padding: const EdgeInsets.fromLTRB(20, 8, 20, 14),
+              child: Column(
+                children: [
+                  Stack(
+                    alignment: Alignment.bottomRight,
+                    children: [
+                      CircleAvatar(
+                        radius: 42,
+                        backgroundColor: const Color(0xFF00A884)
+                            .withValues(alpha: .14),
+                        foregroundImage:
+                            ((_groupAvatar ?? widget.avatarUrl) ?? '')
+                                .isNotEmpty
+                            ? NetworkImage(_groupAvatar ?? widget.avatarUrl!)
+                            : null,
+                        child:
+                            ((_groupAvatar ?? widget.avatarUrl) ?? '').isEmpty
+                            ? const Icon(
+                                Icons.groups_rounded,
+                                size: 38,
+                                color: Color(0xFF00A884),
+                              )
+                            : null,
+                      ),
+                      if (canManage)
+                        Material(
+                          color: Theme.of(ctx).colorScheme.primary,
+                          shape: const CircleBorder(),
+                          child: IconButton(
+                            tooltip: 'Change group photo',
+                            visualDensity: VisualDensity.compact,
+                            iconSize: 18,
+                            color: Theme.of(ctx).colorScheme.onPrimary,
+                            onPressed: () {
+                              Navigator.pop(context);
+                              _pickGroupPhoto();
+                            },
+                            icon: const Icon(Icons.camera_alt_outlined),
+                          ),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    _title,
+                    textAlign: TextAlign.center,
+                    style: Theme.of(ctx).textTheme.titleLarge
+                        ?.copyWith(fontWeight: FontWeight.w700),
+                  ),
+                  if ((_description ?? '').trim().isNotEmpty) ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      _description!,
+                      textAlign: TextAlign.center,
+                      style: Theme.of(ctx).textTheme.bodyMedium?.copyWith(
+                        color: Theme.of(ctx).colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                  const SizedBox(height: 4),
+                  Text(
+                    '${roster.length} members · ${myRole == 'owner'
+                        ? 'You own this group'
+                        : myRole == 'admin'
+                        ? 'Group admin'
+                        : 'Group member'}',
+                    style: Theme.of(ctx).textTheme.bodySmall?.copyWith(
+                      color: Theme.of(ctx).colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Wrap(
+                    alignment: WrapAlignment.center,
+                    spacing: 10,
+                    runSpacing: 8,
+                    children: [
+                      if (canManage)
+                        ActionChip(
+                          avatar: const Icon(Icons.edit_outlined, size: 18),
+                          label: const Text('Edit'),
+                          onPressed: () async {
+                            Navigator.pop(context);
+                            await _editGroupInfo();
+                          },
+                        ),
+                      if (canManage)
+                        ActionChip(
+                          avatar: const Icon(Icons.person_add_alt_1, size: 18),
+                          label: const Text('Add'),
+                          onPressed: () async {
+                            Navigator.pop(context);
+                            await _addMembers();
+                          },
+                        ),
+                      ActionChip(
+                        avatar: const Icon(Icons.qr_code_2, size: 18),
+                        label: const Text('Invite'),
+                        onPressed: () {
+                          Navigator.pop(context);
+                          _showInvite();
+                        },
+                      ),
+                    ],
+                  ),
+                ],
               ),
             ),
             if (error != null)
@@ -590,7 +1342,6 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                         : 'Member ${id.length >= 8 ? id.substring(0, 8) : id}';
                     final role = (m['role'] as String?) ?? 'member';
                     final isMe = id == myId;
-                    final kickable = canManage && !isMe && role != 'owner';
                     return ListTile(
                       leading: CircleAvatar(
                         foregroundImage: (_senderAvatars[id] ?? '').isNotEmpty
@@ -610,17 +1361,16 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                               label: Text(role),
                               visualDensity: VisualDensity.compact,
                             ),
-                          if (kickable)
-                            IconButton(
-                              tooltip: 'Remove member',
-                              icon: const Icon(Icons.person_remove_outlined),
+                          if (isMe && role != 'owner')
+                            TextButton(
                               onPressed: () async {
                                 final confirmed = await showDialog<bool>(
                                   context: ctx,
                                   builder: (dctx) => AlertDialog(
-                                    title: Text('Remove $name?'),
+                                    title: const Text('Leave this group?'),
                                     content: const Text(
-                                      'They will stop receiving new messages.',
+                                      'You will stop receiving new messages. '
+                                      'An admin can add you back later.',
                                     ),
                                     actions: [
                                       TextButton(
@@ -631,36 +1381,12 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                                       FilledButton(
                                         onPressed: () =>
                                             Navigator.pop(dctx, true),
-                                        child: const Text('Remove'),
+                                        child: const Text('Leave group'),
                                       ),
                                     ],
                                   ),
                                 );
                                 if (confirmed != true) return;
-                                try {
-                                  await _repo.removeMember(
-                                    widget.conversationId,
-                                    id,
-                                  );
-                                  if (!mounted) return;
-                                  Navigator.pop(context);
-                                  _showToast('$name removed.');
-                                } catch (_) {
-                                  if (ctx.mounted) {
-                                    ScaffoldMessenger.of(ctx).showSnackBar(
-                                      const SnackBar(
-                                        content: Text(
-                                          'Could not remove member.',
-                                        ),
-                                      ),
-                                    );
-                                  }
-                                }
-                              },
-                            ),
-                          if (isMe)
-                            TextButton(
-                              onPressed: () async {
                                 try {
                                   await _repo.removeMember(
                                     widget.conversationId,
@@ -680,11 +1406,180 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                                 }
                               },
                               child: const Text('Leave'),
+                            )
+                          else if (canManage &&
+                              role != 'owner' &&
+                              (role == 'member' || myRole == 'owner'))
+                            PopupMenuButton<String>(
+                              tooltip: 'Member options',
+                              onSelected: (action) async {
+                                if (action == 'remove') {
+                                  final confirmed = await showDialog<bool>(
+                                    context: ctx,
+                                    builder: (dctx) => AlertDialog(
+                                      title: Text('Remove $name?'),
+                                      content: const Text(
+                                        'They will stop receiving new '
+                                        'messages.',
+                                      ),
+                                      actions: [
+                                        TextButton(
+                                          onPressed: () =>
+                                              Navigator.pop(dctx, false),
+                                          child: const Text('Cancel'),
+                                        ),
+                                        FilledButton(
+                                          onPressed: () =>
+                                              Navigator.pop(dctx, true),
+                                          child: const Text('Remove'),
+                                        ),
+                                      ],
+                                    ),
+                                  );
+                                  if (confirmed != true) return;
+                                  try {
+                                    await _repo.removeMember(
+                                      widget.conversationId,
+                                      id,
+                                    );
+                                    if (!mounted) return;
+                                    Navigator.pop(context);
+                                    _showToast('$name removed.');
+                                    await _showMembers();
+                                  } catch (_) {
+                                    if (ctx.mounted) {
+                                      ScaffoldMessenger.of(ctx).showSnackBar(
+                                        const SnackBar(
+                                          content: Text(
+                                            'Could not remove member.',
+                                          ),
+                                        ),
+                                      );
+                                    }
+                                  }
+                                  return;
+                                }
+                                if (action == 'transfer') {
+                                  final confirmed = await showDialog<bool>(
+                                    context: ctx,
+                                    builder: (dctx) => AlertDialog(
+                                      title: const Text('Transfer ownership?'),
+                                      content: Text(
+                                        '$name will become the owner, and you '
+                                        'will remain a group admin.',
+                                      ),
+                                      actions: [
+                                        TextButton(
+                                          onPressed: () =>
+                                              Navigator.pop(dctx, false),
+                                          child: const Text('Cancel'),
+                                        ),
+                                        FilledButton(
+                                          onPressed: () =>
+                                              Navigator.pop(dctx, true),
+                                          child: const Text('Transfer'),
+                                        ),
+                                      ],
+                                    ),
+                                  );
+                                  if (confirmed != true) return;
+                                  try {
+                                    await _repo.transferOwnership(
+                                      widget.conversationId,
+                                      id,
+                                    );
+                                    if (!mounted) return;
+                                    Navigator.pop(context);
+                                    _showToast(
+                                      'Ownership transferred to $name.',
+                                    );
+                                    await _showMembers();
+                                  } catch (_) {
+                                    if (ctx.mounted) {
+                                      ScaffoldMessenger.of(ctx).showSnackBar(
+                                        const SnackBar(
+                                          content: Text(
+                                            'Could not transfer ownership.',
+                                          ),
+                                        ),
+                                      );
+                                    }
+                                  }
+                                  return;
+                                }
+                                final newRole = action == 'promote'
+                                    ? 'admin'
+                                    : 'member';
+                                try {
+                                  await _repo.setMemberRole(
+                                    widget.conversationId,
+                                    id,
+                                    newRole,
+                                  );
+                                  if (!mounted) return;
+                                  Navigator.pop(context);
+                                  _showToast(
+                                    action == 'promote'
+                                        ? '$name is now an admin.'
+                                        : '$name is now a member.',
+                                  );
+                                  await _showMembers();
+                                } catch (_) {
+                                  if (ctx.mounted) {
+                                    ScaffoldMessenger.of(ctx).showSnackBar(
+                                      const SnackBar(
+                                        content: Text(
+                                          'Could not change that role.',
+                                        ),
+                                      ),
+                                    );
+                                  }
+                                }
+                              },
+                              itemBuilder: (_) => [
+                                if (role == 'member')
+                                  const PopupMenuItem(
+                                    value: 'promote',
+                                    child: Text('Make group admin'),
+                                  ),
+                                if (role == 'admin' && myRole == 'owner')
+                                  const PopupMenuItem(
+                                    value: 'demote',
+                                    child: Text('Dismiss as admin'),
+                                  ),
+                                if (myRole == 'owner' &&
+                                    widget.conversationType == 'group')
+                                  const PopupMenuItem(
+                                    value: 'transfer',
+                                    child: Text('Transfer ownership'),
+                                  ),
+                                if (role == 'member' ||
+                                    (role == 'admin' && myRole == 'owner'))
+                                  const PopupMenuItem(
+                                    value: 'remove',
+                                    child: Text('Remove from group'),
+                                  ),
+                              ],
                             ),
                         ],
                       ),
                     );
                   },
+                ),
+              ),
+            if (myRole == 'owner' && widget.conversationType == 'group')
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+                child: SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton.icon(
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Theme.of(context).colorScheme.error,
+                    ),
+                    onPressed: _deleteGroup,
+                    icon: const Icon(Icons.delete_outline),
+                    label: const Text('Delete group for everyone'),
+                  ),
                 ),
               ),
           ],
@@ -696,7 +1591,10 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   @override
   Widget build(BuildContext context) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
-    final messages = _repo.messagesFor(widget.conversationId);
+    final allMessages = _repo.messagesFor(widget.conversationId);
+    final messages = _clearedAt == null
+        ? allMessages
+        : allMessages.where((m) => m.createdAt.isAfter(_clearedAt!)).toList();
     final pinnedMessages = messages.where((m) => m.isPinned).toList();
 
     return Scaffold(
@@ -707,10 +1605,10 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
             CircleAvatar(
               radius: 18,
               backgroundColor: const Color(0xFF00A884).withValues(alpha: 0.2),
-              backgroundImage: widget.avatarUrl != null
-                  ? NetworkImage(widget.avatarUrl!)
+              backgroundImage: (_groupAvatar ?? widget.avatarUrl) != null
+                  ? NetworkImage(_groupAvatar ?? widget.avatarUrl!)
                   : null,
-              child: widget.avatarUrl == null
+              child: (_groupAvatar ?? widget.avatarUrl) == null
                   ? Icon(
                       widget.conversationType == 'channel'
                           ? Icons.campaign
@@ -729,7 +1627,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     Text(
-                      widget.conversationTitle,
+                      _title,
                       style: const TextStyle(
                         fontSize: 16,
                         fontWeight: FontWeight.w600,
@@ -743,8 +1641,8 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                           : _presenceStatus != null &&
                                 _presenceStatus!.isNotEmpty
                           ? _presenceStatus!
-                          : widget.memberCount > 0
-                          ? '${widget.memberCount} members'
+                          : _memberCount > 0
+                          ? '$_memberCount members'
                           : widget.conversationType,
                       style: TextStyle(
                         fontSize: 12,
@@ -780,11 +1678,11 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
             onPressed: () => _startGroupCall(CallType.voice),
           ),
           PopupMenuButton<String>(
-            onSelected: (val) {
+            onSelected: (val) async {
               if (val == 'info') {
-                _showToast('Group info');
+                await _showMembers();
               } else if (val == 'clear') {
-                _showToast('Clear chat');
+                await _clearChat();
               } else if (val == 'tasks') {
                 Navigator.push(
                   context,
@@ -804,6 +1702,16 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                     ),
                   ),
                 );
+              } else if (val == 'media') {
+                await _showGroupMedia();
+              } else if (val == 'search') {
+                await _searchInChat();
+              } else if (val == 'mute') {
+                await _toggleMute();
+              } else if (val == 'wallpaper') {
+                await _chooseWallpaper();
+              } else if (val == 'invite') {
+                _showInvite();
               }
             },
             itemBuilder: (ctx) => [
@@ -817,6 +1725,14 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                 value: 'vault',
                 child: Text('Resource vault'),
               ),
+              const PopupMenuItem(
+                value: 'wallpaper',
+                child: Text('Chat wallpaper & theme'),
+              ),
+              const PopupMenuItem(
+                value: 'invite',
+                child: Text('Invite via link / QR'),
+              ),
               const PopupMenuItem(value: 'search', child: Text('Search')),
               const PopupMenuItem(
                 value: 'mute',
@@ -828,6 +1744,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
         ],
       ),
       body: WhatsAppWallpaper(
+        preset: _wallpaperPreset,
         child: Column(
           children: [
             Container(
@@ -1330,17 +2247,20 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                       onPressed: () => _showToast('Emoji picker'),
                     ),
                     Expanded(
-                      child: TextField(
-                        controller: _textController,
-                        focusNode: _focusNode,
-                        maxLines: 5,
-                        minLines: 1,
-                        textCapitalization: TextCapitalization.sentences,
-                        decoration: const InputDecoration(
-                          hintText: 'Message',
-                          border: InputBorder.none,
-                          isDense: true,
-                          contentPadding: EdgeInsets.symmetric(vertical: 8),
+                      child: CompositedTransformTarget(
+                        link: _mentionLayerLink,
+                        child: TextField(
+                          controller: _textController,
+                          focusNode: _focusNode,
+                          maxLines: 5,
+                          minLines: 1,
+                          textCapitalization: TextCapitalization.sentences,
+                          decoration: const InputDecoration(
+                            hintText: 'Message (@ to mention)',
+                            border: InputBorder.none,
+                            isDense: true,
+                            contentPadding: EdgeInsets.symmetric(vertical: 8),
+                          ),
                         ),
                       ),
                     ),
@@ -1470,11 +2390,35 @@ class _GroupPollCardState extends State<_GroupPollCard> {
   List<Map<String, dynamic>> _votes = [];
   bool _loading = true;
   bool _voting = false;
+  RealtimeChannel? _votesChannel;
 
   @override
   void initState() {
     super.initState();
     _load();
+    try {
+      _votesChannel = Supabase.instance.client.channel('poll:${widget.msg.id}')
+        ..onPostgresChanges(
+          event: PostgresChangeEvent.all,
+          schema: 'public',
+          table: 'poll_votes',
+          filter: PostgresChangeFilter(
+            type: PostgresChangeFilterType.eq,
+            column: 'message_id',
+            value: widget.msg.id,
+          ),
+          callback: (_) => _load(),
+        )
+        ..subscribe();
+    } catch (_) {}
+  }
+
+  @override
+  void dispose() {
+    try {
+      _votesChannel?.unsubscribe();
+    } catch (_) {}
+    super.dispose();
   }
 
   Future<void> _load() async {

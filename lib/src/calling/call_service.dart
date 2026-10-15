@@ -5,12 +5,16 @@ import 'package:flutter/foundation.dart';
 import 'package:livekit_client/livekit_client.dart';
 import 'package:permission_handler/permission_handler.dart';
 
-/// Deterministic 1:1 room for two user ids. Both sides compute the same
-/// name, so no room bookkeeping is needed anywhere.
-String callRoomFor(String a, String b) {
-  final ids = [a, b]..sort();
-  return 'dm_${ids[0]}_${ids[1]}';
-}
+/// Per-call rooms are generated server-side (`call_<32 hex>`). The legacy
+/// deterministic `dm_<uuid>_<uuid>` form is still accepted so in-flight calls
+/// survive a deploy. Both the app and the token function share this shape.
+final RegExp callRoomPattern = RegExp(
+  r'^(call_[0-9a-f]{32}|dm_[0-9a-f-]{36}_[0-9a-f-]{36})$',
+);
+
+/// True when [room] looks like a valid call room name.
+bool isValidCallRoom(String room) =>
+    room.isNotEmpty && room.length <= 128 && callRoomPattern.hasMatch(room);
 
 enum LiveCallState {
   idle,

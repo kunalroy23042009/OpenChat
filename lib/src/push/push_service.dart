@@ -62,6 +62,15 @@ Future<void> renderPushMessage(
           snippet: data['snippet'] as String? ?? '',
           event: data['event'] as String?,
         );
+      case 'group':
+        final groupId = data['peer'] as String? ?? '';
+        if (groupId.isEmpty) return;
+        await NotifyService.instance.showGroup(
+          groupId: groupId,
+          groupName: _orContact(data['name'] as String?),
+          senderName: _orContact(data['sender'] as String?),
+          event: data['event'] as String?,
+        );
     }
   } catch (_) {
     // A failed background render must never crash the isolate.
@@ -84,8 +93,17 @@ class PushService {
   StreamSubscription<RemoteMessage>? _foregroundSubscription;
   PushState state = PushState.disabled;
   String? lastError;
+  Future<PushState>? _initFuture;
 
-  Future<PushState> initialize(SupabaseClient? client) async {
+  Future<PushState> initialize(SupabaseClient? client) {
+    debugPrint('PushService: initialize() called');
+    // Coalesce concurrent calls (startup + sign-in) onto one init.
+    return _initFuture ??= _initialize(client).whenComplete(() {
+      _initFuture = null;
+    });
+  }
+
+  Future<PushState> _initialize(SupabaseClient? client) async {
     debugPrint('PushService: initialize() called');
     if (kIsWeb) {
       debugPrint('PushService: Web platform, disabling');

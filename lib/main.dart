@@ -2,10 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import 'src/avatar_sync.dart';
 import 'src/chat_store.dart';
 import 'src/auth/password_page.dart';
 import 'src/auth/recovery_controller.dart';
-import 'src/ai/ai_service.dart';
 import 'src/home.dart';
 import 'src/local_profile.dart';
 import 'src/onboarding.dart';
@@ -46,9 +46,6 @@ Future<void> main() async {
   );
   final profile = LocalProfile(preferences);
   final theme = AppThemeController(preferences);
-  // Load saved AI provider keys before any screen reads them; the ChatStore
-  // constructor only fires off an unawaited load as a fallback.
-  await AiService.instance.init(preferences);
   final onboarded = preferences.getBool('openchat.onboarding.v1') ?? false;
   final push = PushService();
   runApp(
@@ -111,6 +108,24 @@ class _OpenChatAppState extends State<OpenChatApp> {
             : RecoveryController(widget.client!.auth.onAuthStateChange));
     recovery?.addListener(openRecovery);
     openRecovery();
+    
+    // Listen for auth changes to sync avatar
+    widget.client?.auth.onAuthStateChange.listen((data) async {
+      if (data.event == AuthChangeEvent.signedIn && data.session != null) {
+        final avatarSync = AvatarSyncService(
+          client: widget.client!,
+          preferences: widget.preferences,
+        );
+        avatarSync.onSignIn(widget.profile);
+        // Register/refresh the FCM token the moment we have a session, so
+        // background notifications work without waiting for Settings.
+        if (widget.push.state != PushState.ready) {
+          await widget.push.initialize(widget.client);
+        } else {
+          await widget.push.syncAccount(widget.client!);
+        }
+      }
+    });
   }
 
   void openRecovery() {

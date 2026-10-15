@@ -12,9 +12,14 @@ import 'voice_note_player.dart';
 /// on interaction, never when a chat is opened.
 class VoiceNoteRecorder extends StatefulWidget {
   const VoiceNoteRecorder({super.key, required this.onRecorded,
-    this.maxDuration = const Duration(minutes: 2)});
+    this.maxDuration = const Duration(minutes: 2),
+    this.onRecordingStateChanged});
   final Future<void> Function(File file, Duration duration, List<double> waveform) onRecorded;
   final Duration maxDuration;
+
+  /// Fires true when capture starts, false when it stops/previews/discards,
+  /// so chats can broadcast WhatsApp-style "recording audio..." presence.
+  final ValueChanged<bool>? onRecordingStateChanged;
   @override
   State<VoiceNoteRecorder> createState() => _VoiceNoteRecorderState();
 }
@@ -61,6 +66,7 @@ class _VoiceNoteRecorderState extends State<VoiceNoteRecorder> with WidgetsBindi
       _clock..reset()..start();
       _samples.clear();
       _recording = true;
+      widget.onRecordingStateChanged?.call(true);
       _amplitudes = _recorder.onAmplitudeChanged(const Duration(milliseconds: 100)).listen((amplitude) {
         if (!mounted || !_recording || _paused) return;
         _samples.add(pow(10, amplitude.current.clamp(-60, 0) / 20).toDouble());
@@ -98,6 +104,7 @@ class _VoiceNoteRecorderState extends State<VoiceNoteRecorder> with WidgetsBindi
     _paused = false;
     _locked = false;
     _busy = false;
+    widget.onRecordingStateChanged?.call(false);
     if (mounted) setState(() {});
   }
 
@@ -115,6 +122,7 @@ class _VoiceNoteRecorderState extends State<VoiceNoteRecorder> with WidgetsBindi
 
   Future<void> _discard() async {
     _cancelled = true;
+    widget.onRecordingStateChanged?.call(false);
     await _starting;
     _timer?.cancel();
     await _amplitudes?.cancel();

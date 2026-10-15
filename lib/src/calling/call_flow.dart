@@ -34,10 +34,19 @@ Future<void> startOutgoingCall(
     return;
   }
   final me = client.auth.currentUser!.id;
-  final room = callRoomFor(me, peerId);
   final mediaKey = base64UrlEncode(
     List<int>.generate(32, (_) => Random.secure().nextInt(256)),
   ).replaceAll('=', '');
+  String friendlyCallError(Object e) {
+    final msg = e.toString();
+    // place_call raises 'Contact unavailable' when the pair has no accepted
+    // contact request (or a block either way). Say what to do, not just no.
+    if (msg.contains('Contact unavailable')) {
+      return 'Not connected yet. Add $peerName in People by username, wait for accept, then call.';
+    }
+    return msg.replaceFirst('Exception: ', '');
+  }
+
   late final String encryptedCallKey;
   try {
     encryptedCallKey = await SignalCrypto(
@@ -52,18 +61,10 @@ Future<void> startOutgoingCall(
     service.dispose();
     return;
   }
-  late final String url;
-  late final String token;
-  try {
-    final creds = await CallSignaling.token(client, room: room, name: peerName);
-    url = creds.url;
-    token = creds.token;
-  } catch (e) {
-    messenger.showSnackBar(SnackBar(content: Text('$e')));
-    service.dispose();
-    return;
-  }
+  // Place the invite first so the per-call room exists; the token function
+  // only mints credentials for a live invitation.
   late final String inviteId;
+  late final String room;
   try {
     final invite = await CallSignaling.place(
       client,
@@ -72,6 +73,7 @@ Future<void> startOutgoingCall(
       encryptedCallKey: encryptedCallKey,
     );
     inviteId = invite.inviteId;
+    room = invite.room;
     // Ring a killed/background callee via FCM; foreground callees ring
     // through their realtime invite watcher instead.
     unawaited(
@@ -84,7 +86,21 @@ Future<void> startOutgoingCall(
       ),
     );
   } catch (e) {
+    messenger.showSnackBar(SnackBar(content: Text(friendlyCallError(e))));
+    service.dispose();
+    return;
+  }
+  late final String url;
+  late final String token;
+  try {
+    final creds = await CallSignaling.token(client, room: room, name: peerName);
+    url = creds.url;
+    token = creds.token;
+  } catch (e) {
     messenger.showSnackBar(SnackBar(content: Text('$e')));
+    try {
+      await CallSignaling.finish(client, inviteId: inviteId);
+    } catch (_) {}
     service.dispose();
     return;
   }

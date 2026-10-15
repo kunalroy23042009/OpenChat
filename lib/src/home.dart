@@ -10,6 +10,7 @@ import 'package:flutter_contacts/flutter_contacts.dart';
 
 import 'chat_store.dart';
 import 'chat_lock.dart';
+import 'chat_preferences.dart';
 import 'contacts_repository.dart';
 import 'contacts_sync.dart';
 import 'local_profile.dart';
@@ -26,14 +27,16 @@ import 'calling/call_repository.dart';
 import 'calling/call_service.dart';
 import 'calling/call_signaling.dart';
 import 'calling/call_screen.dart';
-import 'ai/ai_settings_page.dart';
 import 'backup/chat_backup.dart';
+import 'backup/google_drive_backup.dart';
 import 'chat/conversation_repository.dart';
 import 'chat/group_chat_screen.dart';
 import 'security/secure_history_database.dart';
 import 'security/signal_crypto.dart';
 import 'widgets/whatsapp_bubble.dart';
 import 'widgets/status_ticks.dart';
+import 'widgets/whatsapp_wallpaper.dart';
+import 'features_page.dart';
 
 class ChatHome extends StatefulWidget {
   const ChatHome({
@@ -107,9 +110,6 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
     WidgetsBinding.instance.addPostFrameCallback(
       (_) => _maybeAutoSyncContacts(),
     );
-    // OpenChat AI works with the app sign-in alone: ensure its chat exists
-    // once per account so nobody must configure API keys.
-    WidgetsBinding.instance.addPostFrameCallback((_) => _maybeAddOpenChatAi());
   }
 
   Future<void> _publishSignalKeys() async {
@@ -171,39 +171,43 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
     }
   }
 
-  /// Ensures the keyless OpenChat AI assistant chat exists once per
-  /// account. Runs silently; failures never block startup.
-  Future<void> _maybeAddOpenChatAi() async {
-    final uid = widget.client?.auth.currentUser?.id;
-    if (uid == null) return;
-    try {
-      final flag = 'openchat.ai.seeded.v1.$uid';
-      if (widget.store.preferences.getBool(flag) == true) return;
-      if (widget.store.conversations.any((c) => c.isAi)) {
-        await widget.store.preferences.setBool(flag, true);
-        return;
-      }
-      await widget.store.createAiChat(
-        name: 'OpenChat AI',
-        provider: 'openchat',
-        color: 0xFF245CDB,
-      );
-      await widget.store.preferences.setBool(flag, true);
-    } catch (_) {}
-  }
-
   Future<void> _maybeAutoBackup() async {
     final client = widget.client;
     final uid = client?.auth.currentUser?.id;
     if (uid == null) return;
+    var backedUp = false;
     try {
-      await ChatBackup.maybeAutoBackup(
-        client: client!,
-        store: widget.store,
-        uid: uid,
-        prefs: widget.store.preferences,
-      );
+      backedUp = await ChatBackup.maybeAutoBackup(
+            client: client!,
+            store: widget.store,
+            uid: uid,
+            prefs: widget.store.preferences,
+          ) !=
+          null;
     } catch (_) {}
+    // WhatsApp-style: mirror the fresh encrypted snapshot to Drive on the
+    // same schedule. Silent, Wi-Fi-aware, Drive-signed-in only.
+    if (backedUp) {
+      try {
+        if (!await GoogleDriveBackup.isSignedIn()) return;
+        if (!await GoogleDriveBackup.networkAllowed(
+          widget.store.preferences,
+          uid,
+        )) {
+          return;
+        }
+        final bytes = await ChatBackup.downloadBackup(client!, uid);
+        if (bytes == null) return;
+        await GoogleDriveBackup.uploadBackupBytes(
+          bytes,
+          GoogleDriveBackup.fileName(
+            uid,
+            DateTime.now().toUtc().microsecondsSinceEpoch.toString(),
+          ),
+        );
+        await GoogleDriveBackup.pruneOld(3);
+      } catch (_) {}
+    }
     // Cooperative expiry sweep for envelopes/receipts. Best-effort.
     try {
       await client!.rpc('cleanup_expired');
@@ -281,6 +285,12 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
         )) {
       return;
     }
+    // Respect a per-chat mute: a muted conversation stays silent.
+    if (widget.store.isPeerMuted(uid, sender)) return;
+    // Per-chat tone: 'Silent' posts without sound or vibration.
+    final tone =
+        widget.store.preferences.getString('openchat.tone.v1.$uid.$sender') ??
+        'Default';
     var name = _notifyNames[sender];
     if (name == null) {
       await _refreshNotifyNames();
@@ -290,6 +300,7 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
       peerId: sender,
       name: name,
       event: record['client_message_id'] as String?,
+      silent: tone == 'Silent',
     );
   }
 
@@ -641,8 +652,8 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
         } catch (_) {}
       }
     }
-    remoteWatch =
-        client.channel('invite:$inviteId')
+
+    remoteWatch = client.channel('invite:$inviteId')
       ..onPostgresChanges(
         event: PostgresChangeEvent.update,
         schema: 'public',
@@ -722,7 +733,7 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
       }
       _groupsKey.currentState?.refresh();
       if (!mounted) return;
-      Navigator.push(
+      await Navigator.push(
         context,
         MaterialPageRoute<void>(
           builder: (_) => GroupChatScreen(
@@ -733,6 +744,7 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
           ),
         ),
       );
+      _groupsKey.currentState?.refresh();
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -766,6 +778,22 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
               onTap: () => Navigator.pop(ctx, 'favourite'),
             ),
             ListTile(
+              leading: Icon(
+                chat.isMutedNow
+                    ? Icons.volume_off_outlined
+                    : Icons.notifications_outlined,
+              ),
+              title: Text(chat.isMutedNow ? 'Unmute' : 'Mute notifications'),
+              subtitle: chat.isMutedNow
+                  ? Text(
+                      chat.mutedUntilMs == null
+                          ? 'Muted always'
+                          : 'Muted until ${DateTime.fromMillisecondsSinceEpoch(chat.mutedUntilMs!).toLocal().toString().split('.').first}',
+                    )
+                  : null,
+              onTap: () => Navigator.pop(ctx, 'mute'),
+            ),
+            ListTile(
               leading: const Icon(Icons.lock_outline),
               title: Text(chat.locked ? 'Unlock chat' : 'Lock chat'),
               subtitle: chat.locked
@@ -797,6 +825,40 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
         await store.setPinned(chat.id, !chat.pinned);
       case 'favourite':
         await store.setFavourite(chat.id, !chat.favourite);
+      case 'mute':
+        if (chat.isMutedNow) {
+          await store.toggleMute(chat);
+          break;
+        }
+        final choice = await showDialog<String>(
+          context: context,
+          builder: (ctx) => SimpleDialog(
+            title: const Text('Mute notifications'),
+            children: [
+              SimpleDialogOption(
+                onPressed: () => Navigator.pop(ctx, '8h'),
+                child: const Text('For 8 hours'),
+              ),
+              SimpleDialogOption(
+                onPressed: () => Navigator.pop(ctx, '1w'),
+                child: const Text('For 1 week'),
+              ),
+              SimpleDialogOption(
+                onPressed: () => Navigator.pop(ctx, 'always'),
+                child: const Text('Always'),
+              ),
+            ],
+          ),
+        );
+        if (!mounted || choice == null) break;
+        await store.setMute(
+          chat,
+          switch (choice) {
+            '8h' => const Duration(hours: 8),
+            '1w' => const Duration(days: 7),
+            _ => null,
+          },
+        );
       case 'lock':
         if (chat.locked) {
           await store.setLocked(chat.id, false);
@@ -865,6 +927,7 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
           if (c.archived) return false;
           if (filter == 'unread' && c.unread == 0) return false;
           if (filter == 'favourites' && !c.favourite) return false;
+          if (filter == 'groups') return false;
           if (c.locked && !lockRevealed) return false;
           return true;
         }).toList();
@@ -903,55 +966,52 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
                 ),
                 child: Row(
                   children: [
-                    Semantics(
-                      label: 'OpenChat logo',
-                      image: true,
-                      child: Image.asset(
-                        Theme.of(context).brightness == Brightness.dark
-                            ? 'assets/logos/openchat_dove_white.png'
-                            : 'assets/logos/openchat_dove.png',
-                        width: 30,
-                        height: 30,
-                        fit: BoxFit.contain,
+                    GestureDetector(
+                      onTap: () => Navigator.push(
+                        context,
+                        MaterialPageRoute<void>(
+                          builder: (_) => ProfilePage(
+                            profile: widget.profile,
+                            client: widget.client,
+                          ),
+                        ),
+                      ),
+                      child: Semantics(
+                        label: 'OpenChat logo',
+                        image: true,
+                        child: Image.asset(
+                          Theme.of(context).brightness == Brightness.dark
+                              ? 'assets/logos/openchat_dove_white.png'
+                              : 'assets/logos/openchat_dove.png',
+                          width: 30,
+                          height: 30,
+                          fit: BoxFit.contain,
+                        ),
                       ),
                     ),
-                    const SizedBox(width: 12),
-                    const Expanded(
-                      child: Text(
-                        'OpenChat',
-                        style: TextStyle(
-                          fontSize: 27,
-                          fontWeight: FontWeight.w800,
-                          letterSpacing: -1.2,
+                    const Spacer(),
+                    IconButton(
+                      tooltip: 'Camera — new status',
+                      icon: const Icon(Icons.photo_camera_outlined),
+                      onPressed: () => setState(() => activeTab = 1),
+                    ),
+                    IconButton(
+                      tooltip: 'My profile',
+                      icon: const Icon(Icons.account_circle_outlined),
+                      onPressed: () => Navigator.push(
+                        context,
+                        MaterialPageRoute<void>(
+                          builder: (_) => ProfilePage(
+                            profile: widget.profile,
+                            client: widget.client,
+                          ),
                         ),
                       ),
                     ),
                     IconButton(
-                      tooltip: 'AI Assistants (ChatGPT, Claude, Gemini)',
-                      onPressed: () => Navigator.push(
-                        context,
-                        MaterialPageRoute<void>(
-                          builder: (_) => AiSettingsPage(store: widget.store),
-                        ),
-                      ),
-                      icon: Container(
-                        padding: const EdgeInsets.all(4),
-                        decoration: const BoxDecoration(
-                          shape: BoxShape.circle,
-                          gradient: LinearGradient(
-                            colors: [
-                              Color(0xFF245CDB),
-                              Color(0xFF00C6FF),
-                              Color(0xFF9D50BB),
-                            ],
-                          ),
-                        ),
-                        child: const Icon(
-                          Icons.auto_awesome,
-                          size: 18,
-                          color: Colors.white,
-                        ),
-                      ),
+                      tooltip: 'Settings',
+                      icon: const Icon(Icons.settings_outlined),
+                      onPressed: () => setState(() => activeTab = 3),
                     ),
                     PopupMenuButton<String>(
                       tooltip: 'More options',
@@ -972,6 +1032,17 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
                             newChat(wide);
                           case 'group':
                             _createGroup();
+                          case 'features':
+                            Navigator.push(
+                              context,
+                              MaterialPageRoute<void>(
+                                builder: (_) => FeatureHubPage(
+                                  preferences: ChatPreferences(
+                                    widget.store.preferences,
+                                  ),
+                                ),
+                              ),
+                            );
                           case 'settings':
                             setState(() => activeTab = 3);
                         }
@@ -999,6 +1070,14 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
                             contentPadding: EdgeInsets.zero,
                             leading: Icon(Icons.group_add_outlined),
                             title: Text('New group'),
+                          ),
+                        ),
+                        PopupMenuItem(
+                          value: 'features',
+                          child: ListTile(
+                            contentPadding: EdgeInsets.zero,
+                            leading: Icon(Icons.auto_awesome_outlined),
+                            title: Text('OpenChat features'),
                           ),
                         ),
                         PopupMenuItem(
@@ -1061,6 +1140,13 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
                             ),
                             const SizedBox(width: 8),
                             ChoiceChip(
+                              label: const Text('Groups'),
+                              selected: filter == 'groups',
+                              onSelected: (_) =>
+                                  setState(() => filter = 'groups'),
+                            ),
+                            const SizedBox(width: 8),
+                            ChoiceChip(
                               avatar: const Icon(
                                 Icons.archive_outlined,
                                 size: 18,
@@ -1083,7 +1169,8 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
                 ),
               ),
               SizedBox(height: compact ? 6 : 16),
-              if (widget.client?.auth.currentUser != null)
+              if (widget.client?.auth.currentUser != null &&
+                  filter != 'groups')
                 _SecureSection(
                   client: widget.client!,
                   store: widget.store,
@@ -1095,36 +1182,50 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
                   key: _groupsKey,
                   client: widget.client!,
                   secureHistory: widget.store.secureHistory,
+                  onCreateGroup: _createGroup,
+                  query: query,
+                  filter: filter,
                 ),
               if (lockedCount > 0)
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(24, 0, 24, 8),
-                  child: ListTile(
-                    contentPadding: EdgeInsets.zero,
-                    leading: const CircleAvatar(
-                      child: Icon(Icons.lock_outline, size: 20),
-                    ),
-                    title: Text(
-                      lockRevealed
-                          ? 'Hide locked chats'
-                          : 'Locked chats ($lockedCount)',
-                      style: const TextStyle(fontWeight: FontWeight.w700),
-                    ),
-                    subtitle: lockRevealed
-                        ? null
-                        : const Text('Verify your PIN to reveal them.'),
-                    trailing: const Icon(Icons.chevron_right),
-                    onTap: () async {
-                      if (lockRevealed) {
-                        setState(() => lockRevealed = false);
-                        return;
-                      }
-                      if (await ChatLock.promptVerify(context)) {
-                        if (!mounted) return;
-                        setState(() => lockRevealed = true);
-                      }
-                    },
-                  ),
+                FutureBuilder<String?>(
+                  future: ChatLock.secretCode(),
+                  builder: (context, snapshot) {
+                    final secret = (snapshot.data ?? '').trim();
+                    // Secret-code mode: hide folder unless query matches code
+                    // or chats already revealed via PIN.
+                    if (secret.isNotEmpty &&
+                        !lockRevealed &&
+                        query.trim() != secret) {
+                      return const SizedBox.shrink();
+                    }
+                    return Padding(
+                      padding: const EdgeInsets.fromLTRB(24, 0, 24, 8),
+                      child: ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        leading: const CircleAvatar(
+                          child: Icon(Icons.lock_outline, size: 20),
+                        ),
+                        title: Text(
+                          lockRevealed
+                              ? 'Hide locked chats'
+                              : 'Locked chats ($lockedCount)',
+                          style: const TextStyle(fontWeight: FontWeight.w700),
+                        ),
+                        subtitle: lockRevealed ? null : Text(secret.isEmpty ? 'Verify your PIN to reveal them.' : 'Type secret code in search or verify PIN.'),
+                        trailing: const Icon(Icons.chevron_right),
+                        onTap: () async {
+                          if (lockRevealed) {
+                            setState(() => lockRevealed = false);
+                            return;
+                          }
+                          if (await ChatLock.promptVerify(context)) {
+                            if (!mounted) return;
+                            setState(() => lockRevealed = true);
+                          }
+                        },
+                      ),
+                    );
+                  },
                 ),
               if (archivedChats.isNotEmpty)
                 Padding(
@@ -1192,7 +1293,7 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
                     ],
                   ),
                 ),
-              chats.isEmpty
+              chats.isEmpty && filter != 'groups'
                   ? const Center(
                       child: Padding(
                         padding: EdgeInsets.symmetric(vertical: 48),
@@ -1322,7 +1423,7 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
                                         ),
                                       ),
                                       const SizedBox(height: 6),
-                                      if (chat.muted)
+                                      if (chat.isMutedNow)
                                         const Padding(
                                           padding: EdgeInsets.only(bottom: 4),
                                           child: Icon(
@@ -1403,6 +1504,13 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
                   )
                 : currentBody,
           ),
+          floatingActionButton: activeTab == 0
+              ? FloatingActionButton(
+                  tooltip: 'New chat',
+                  onPressed: () => newChat(wide),
+                  child: const Icon(Icons.chat_outlined),
+                )
+              : null,
           bottomNavigationBar: NavigationBar(
             selectedIndex: activeTab,
             onDestinationSelected: (index) {
@@ -1484,16 +1592,14 @@ class ContactAvatar extends StatelessWidget {
   Widget build(BuildContext context) => CircleAvatar(
     radius: 25,
     backgroundColor: Color(chat.color),
-    child: chat.isAi
-        ? const Icon(Icons.auto_awesome, color: Colors.white, size: 22)
-        : Text(
-            chat.initials,
-            style: const TextStyle(
-              color: Color(0xFF23344F),
-              fontWeight: FontWeight.w700,
-              fontSize: 16,
-            ),
-          ),
+    child: Text(
+      chat.initials,
+      style: const TextStyle(
+        color: Color(0xFF23344F),
+        fontWeight: FontWeight.w700,
+        fontSize: 16,
+      ),
+    ),
   );
 }
 
@@ -1800,9 +1906,20 @@ class _GroupSection extends StatefulWidget {
     super.key,
     required this.client,
     required this.secureHistory,
+    required this.onCreateGroup,
+    this.query = '',
+    this.filter = 'all',
   });
   final SupabaseClient client;
   final SecureHistoryDatabase? secureHistory;
+  final VoidCallback onCreateGroup;
+
+  /// Title filter from the home search box (member-name search needs a
+  /// per-group member fetch and stays a follow-up).
+  final String query;
+
+  /// Active home filter: all / unread / favourites / groups.
+  final String filter;
   @override
   State<_GroupSection> createState() => _GroupSectionState();
 }
@@ -1819,6 +1936,7 @@ class _GroupSectionState extends State<_GroupSection> {
     );
     _repo.addListener(_changed);
     refresh();
+    _repo.subscribeToMembership();
   }
 
   void _changed() {
@@ -1827,18 +1945,153 @@ class _GroupSectionState extends State<_GroupSection> {
 
   Future<void> refresh() => _repo.loadConversations();
 
+  /// WhatsApp-style long-press menu for group/channel rows.
+  Future<void> _groupActions(GroupConversation group) async {
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: Icon(group.isPinned ? Icons.push_pin : Icons.push_pin_outlined),
+              title: Text(group.isPinned ? 'Unpin chat' : 'Pin to top'),
+              onTap: () => Navigator.pop(ctx, 'pin'),
+            ),
+            ListTile(
+              leading: Icon(group.isFavourite ? Icons.star : Icons.star_outline),
+              title: Text(
+                group.isFavourite ? 'Remove from favourites' : 'Add to favourites',
+              ),
+              onTap: () => Navigator.pop(ctx, 'favourite'),
+            ),
+            ListTile(
+              leading: Icon(group.isMuted ? Icons.notifications_off : Icons.notifications),
+              title: Text(group.isMuted ? 'Unmute notifications' : 'Mute notifications'),
+              onTap: () => Navigator.pop(ctx, 'mute'),
+            ),
+            ListTile(
+              leading: Icon(group.isArchived ? Icons.unarchive : Icons.archive_outlined),
+              title: Text(group.isArchived ? 'Unarchive' : 'Archive'),
+              onTap: () => Navigator.pop(ctx, 'archive'),
+            ),
+            ListTile(
+              leading: Icon(group.isLocked ? Icons.lock_open : Icons.lock_outline),
+              title: Text(group.isLocked ? 'Unlock chat' : 'Lock chat'),
+              onTap: () => Navigator.pop(ctx, 'lock'),
+            ),
+            ListTile(
+              leading: Icon(
+                group.markedUnread || group.unreadCount > 0
+                    ? Icons.mark_chat_read_outlined
+                    : Icons.mark_chat_unread_outlined,
+              ),
+              title: Text(
+                group.markedUnread || group.unreadCount > 0
+                    ? 'Mark as read'
+                    : 'Mark as unread',
+              ),
+              onTap: () => Navigator.pop(ctx, 'unread'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (action == null || !mounted) return;
+    switch (action) {
+      case 'pin':
+        await _repo.setConversationFlags(group.id, pinned: !group.isPinned);
+      case 'favourite':
+        await _repo.setConversationFlags(group.id, favourite: !group.isFavourite);
+      case 'mute':
+        if (group.isMuted) {
+          await _repo.setConversationFlags(group.id, muted: false);
+        } else {
+          final choice = await _pickMuteDuration();
+          if (choice.cancelled) return;
+          await _repo.setConversationFlags(
+            group.id,
+            muted: true,
+            mutedUntil: choice.until,
+          );
+        }
+      case 'archive':
+        await _repo.setConversationFlags(group.id, archived: !group.isArchived);
+      case 'lock':
+        await _repo.setConversationFlags(group.id, locked: !group.isLocked);
+      case 'unread':
+        final hasUnread = group.markedUnread || group.unreadCount > 0;
+        await _repo.setConversationFlags(group.id, markedUnread: !hasUnread);
+    }
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Chat updated.')),
+    );
+  }
+
+  /// Returns the mute expiry and whether the picker was cancelled.
+  Future<({bool cancelled, DateTime? until})> _pickMuteDuration() async {
+    final value = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            for (final option in const [
+              ('8 hours', 8),
+              ('1 week', 24 * 7),
+              ('Always', 0),
+            ])
+              ListTile(
+                title: Text('Mute for ${option.$1}'),
+                onTap: () => Navigator.pop(ctx, '${option.$2}'),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (value == null) return (cancelled: true, until: null);
+    final hours = int.parse(value);
+    if (hours == 0) return (cancelled: false, until: null);
+    return (
+      cancelled: false,
+      until: DateTime.now().add(Duration(hours: hours)),
+    );
+  }
+
   @override
   void dispose() {
     _repo.removeListener(_changed);
+    _repo.unsubscribeFromMembership();
     _repo.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    final groups = _repo.conversations
+    final q = widget.query.trim().toLowerCase();
+    final matches = _repo.conversations
         .where((c) => c.isGroup || c.isChannel)
-        .toList();
+        .where(
+          (c) =>
+              q.isEmpty ||
+              (c.title ?? '').toLowerCase().contains(q) ||
+              (c.lastMessage ?? '').toLowerCase().contains(q),
+        );
+    final filter = widget.filter;
+    // Archived groups leave the main list (they surface in the Archive view);
+    // the "groups" filter explicitly lists archives too.
+    final groups = matches.where((c) {
+      if (filter == 'groups') return true;
+      if (c.isArchived) return false;
+      if (filter == 'unread' && c.unreadCount == 0 && !c.markedUnread) {
+        return false;
+      }
+      if (filter == 'favourites' && !c.isFavourite) return false;
+      return true;
+    }).toList();
     if (_repo.loading && groups.isEmpty) {
       return const Padding(
         padding: EdgeInsets.symmetric(vertical: 8),
@@ -1849,6 +2102,9 @@ class _GroupSectionState extends State<_GroupSection> {
       return const SizedBox.shrink();
     }
     if (groups.isEmpty) return const SizedBox.shrink();
+    final sectionTitle = filter == 'favourites'
+        ? 'Favourite groups'
+        : 'Groups';
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -1858,11 +2114,17 @@ class _GroupSectionState extends State<_GroupSection> {
             children: [
               const Icon(Icons.group_outlined, size: 18),
               const SizedBox(width: 8),
-              const Text(
-                'Groups',
-                style: TextStyle(fontWeight: FontWeight.w700),
+              Text(
+                sectionTitle,
+                style: const TextStyle(fontWeight: FontWeight.w700),
               ),
               const Spacer(),
+              IconButton(
+                tooltip: 'New group',
+                visualDensity: VisualDensity.compact,
+                onPressed: widget.onCreateGroup,
+                icon: const Icon(Icons.group_add_outlined, size: 18),
+              ),
               IconButton(
                 tooltip: 'Refresh groups',
                 visualDensity: VisualDensity.compact,
@@ -1934,19 +2196,24 @@ class _GroupSectionState extends State<_GroupSection> {
                       ),
                     )
                   : const Icon(Icons.chevron_right),
-              onTap: () => Navigator.push(
-                context,
-                MaterialPageRoute<void>(
-                  builder: (_) => GroupChatScreen(
-                    conversationId: group.id,
-                    conversationTitle: group.title ?? 'Group',
-                    avatarUrl: group.avatarUrl,
-                    secureHistory: widget.secureHistory,
-                    readOnlyArchive: group.isArchivedBackup,
-                    e2eeEnabled: group.e2eeEnabled,
+              onLongPress: () => _groupActions(group),
+              onTap: () async {
+                await Navigator.push(
+                  context,
+                  MaterialPageRoute<void>(
+                    builder: (_) => GroupChatScreen(
+                      conversationId: group.id,
+                      conversationTitle: group.title ?? 'Group',
+                      avatarUrl: group.avatarUrl,
+                      secureHistory: widget.secureHistory,
+                      readOnlyArchive: group.isArchivedBackup,
+                      e2eeEnabled: group.e2eeEnabled,
+                    ),
                   ),
-                ),
-              ),
+                );
+                // Refresh group list to update unread count
+                refresh();
+              },
             ),
           ),
         const Divider(height: 16),
@@ -2128,6 +2395,17 @@ class ChatPane extends StatefulWidget {
 class _ChatPaneState extends State<ChatPane> {
   final composer = TextEditingController();
   final scroll = ScrollController();
+  late final ChatPreferences _chatPreferences = ChatPreferences(
+    widget.store.preferences,
+  );
+  late ChatWallpaperPreset _wallpaperPreset;
+
+  @override
+  void initState() {
+    super.initState();
+    _wallpaperPreset = _chatPreferences.wallpaperFor(widget.chat.id);
+  }
+
   @override
   void dispose() {
     composer.dispose();
@@ -2140,6 +2418,53 @@ class _ChatPaneState extends State<ChatPane> {
     widget.store.send(widget.chat, composer.text);
     composer.clear();
     if (scroll.hasClients) scroll.jumpTo(0);
+  }
+
+  Future<void> _chooseWallpaper() async {
+    final picked = await chooseChatWallpaper(context, _wallpaperPreset);
+    if (picked == null || !mounted) return;
+    await _chatPreferences.setWallpaper(widget.chat.id, picked);
+    setState(() => _wallpaperPreset = picked);
+  }
+
+  /// Mute with WhatsApp-style durations. Extracted so narrow screens can
+  /// reach it from the overflow menu too.
+  Future<void> _muteAction() async {
+    if (widget.chat.isMutedNow) {
+      await widget.store.toggleMute(widget.chat);
+      setState(() {});
+      return;
+    }
+    final choice = await showDialog<String>(
+      context: context,
+      builder: (ctx) => SimpleDialog(
+        title: const Text('Mute notifications'),
+        children: [
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(ctx, '8h'),
+            child: const Text('For 8 hours'),
+          ),
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(ctx, '1w'),
+            child: const Text('For 1 week'),
+          ),
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(ctx, 'always'),
+            child: const Text('Always'),
+          ),
+        ],
+      ),
+    );
+    if (choice == null || !mounted) return;
+    await widget.store.setMute(
+      widget.chat,
+      switch (choice) {
+        '8h' => const Duration(hours: 8),
+        '1w' => const Duration(days: 7),
+        _ => null,
+      },
+    );
+    setState(() {});
   }
 
   @override
@@ -2169,11 +2494,7 @@ class _ChatPaneState extends State<ChatPane> {
                     ),
                   ),
                   Text(
-                    widget.chat.isAi
-                        ? (widget.chat.isTyping
-                              ? 'Thinking…'
-                              : 'AI Assistant (${widget.chat.aiProvider ?? "OpenChat"})')
-                        : 'Demo contact',
+                    'Demo contact',
                     style: TextStyle(
                       color: widget.chat.isTyping
                           ? const Color(0xFF245CDB)
@@ -2187,20 +2508,49 @@ class _ChatPaneState extends State<ChatPane> {
                 ],
               ),
             ),
-            IconButton(
-              tooltip: widget.chat.muted
-                  ? 'Unmute conversation'
-                  : 'Mute conversation',
-              onPressed: () {
-                widget.store.toggleMute(widget.chat);
-                setState(() {});
-              },
-              icon: Icon(
-                widget.chat.muted
-                    ? Icons.volume_off_outlined
-                    : Icons.notifications_outlined,
+            if (MediaQuery.sizeOf(context).width >= 400)
+              IconButton(
+                tooltip: widget.chat.isMutedNow
+                    ? 'Unmute conversation'
+                    : 'Mute conversation',
+                onPressed: _muteAction,
+                icon: Icon(
+                  widget.chat.isMutedNow
+                      ? Icons.volume_off_outlined
+                      : Icons.notifications_outlined,
+                ),
               ),
-            ),
+            if (MediaQuery.sizeOf(context).width >= 400)
+              IconButton(
+                tooltip: 'Chat wallpaper & theme',
+                onPressed: _chooseWallpaper,
+                icon: const Icon(Icons.wallpaper_outlined),
+              ),
+            if (MediaQuery.sizeOf(context).width < 400)
+              PopupMenuButton<String>(
+                tooltip: 'More options',
+                icon: const Icon(Icons.more_vert),
+                onSelected: (value) {
+                  switch (value) {
+                    case 'wallpaper':
+                      _chooseWallpaper();
+                    case 'mute':
+                      _muteAction();
+                  }
+                },
+                itemBuilder: (context) => [
+                  const PopupMenuItem(
+                    value: 'wallpaper',
+                    child: Text('Chat wallpaper & theme'),
+                  ),
+                  PopupMenuItem(
+                    value: 'mute',
+                    child: Text(
+                      widget.chat.isMutedNow ? 'Unmute' : 'Mute notifications',
+                    ),
+                  ),
+                ],
+              ),
             IconButton(
               tooltip: 'Voice call',
               onPressed: () {
@@ -2253,9 +2603,7 @@ class _ChatPaneState extends State<ChatPane> {
             : const Color(0xFFEBF0FC),
         padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
         child: Text(
-          widget.chat.isAi
-              ? '🔒 AI Assistant • Connected via ${widget.chat.aiProvider ?? "OpenChat"} LLM'
-              : '💬 Demo conversation · stored only on this device',
+          '💬 Demo conversation · stored only on this device',
           textAlign: TextAlign.center,
           style: TextStyle(
             fontSize: 11,
@@ -2266,12 +2614,8 @@ class _ChatPaneState extends State<ChatPane> {
         ),
       ),
       Expanded(
-        child: Container(
-          decoration: BoxDecoration(
-            color: Theme.of(context).brightness == Brightness.dark
-                ? const Color(0xFF0B141A)
-                : const Color(0xFFEFEAE2),
-          ),
+        child: WhatsAppWallpaper(
+          preset: _wallpaperPreset,
           child: ListenableBuilder(
             listenable: widget.store,
             builder: (context, _) {

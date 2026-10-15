@@ -7,7 +7,11 @@ class SecureDisplay {
   static const channel = MethodChannel('dev.openchat/privacy');
   static int _users = 0;
   static Future<void> acquire() async {
-    if (defaultTargetPlatform != TargetPlatform.android) throw UnsupportedError('Capture protection requires Android.');
+    if (defaultTargetPlatform != TargetPlatform.android) {
+      // Non-Android platforms don't support FLAG_SECURE, silently succeed
+      _users++;
+      return;
+    }
     _users++;
     try {
       final ok = await channel.invokeMethod<bool>('setSecure', {'enabled': true});
@@ -17,6 +21,9 @@ class SecureDisplay {
   static Future<void> release() async {
     if (_users <= 0) return;
     _users--;
-    if (_users == 0) await channel.invokeMethod('setSecure', {'enabled': false});
+    if (_users == 0) {
+      if (defaultTargetPlatform != TargetPlatform.android) return;
+      await channel.invokeMethod('setSecure', {'enabled': false});
+    }
   }
 }

@@ -101,14 +101,14 @@ serve(async (req) => {
     return json({ error: "FCM sender is misconfigured." }, 503);
   }
 
-  let body: { kind?: unknown; peer?: unknown; invite?: unknown; video?: unknown };
+  let body: { kind?: unknown; peer?: unknown; invite?: unknown; video?: unknown; group?: unknown; event?: unknown };
   try {
     body = await req.json();
   } catch {
     return json({ error: "Invalid request." }, 400);
   }
   const kind = body.kind;
-  if (kind !== "message" && kind !== "call" && kind !== "status") {
+  if (kind !== "message" && kind !== "call" && kind !== "status" && kind !== "group") {
     return json({ error: "Invalid kind." }, 400);
   }
 
@@ -133,6 +133,8 @@ serve(async (req) => {
   let targets: string[] = [];
   let eventId = '';
   let video = false;
+  let groupId = '';
+  let groupName = '';
   const recent = new Date(Date.now() - 120000).toISOString();
   const { data: links, error: linkError } = await admin.from('contact_requests')
     .select('sender_id,recipient_id').eq('status', 'accepted')
@@ -143,7 +145,31 @@ serve(async (req) => {
   const blocked = new Set((blocks ?? []).map((r) => r.owner_id === me ? r.blocked_id : r.owner_id));
   const accepted = [...new Set((links ?? []).map((r) => r.sender_id === me ? r.recipient_id : r.sender_id))]
     .filter((id) => !blocked.has(id));
-  if (kind === "message" || kind === "call") {
+  if (kind === 'group') {
+    groupId = typeof body.group === 'string' ? body.group : '';
+    const event = typeof body.event === 'string' ? body.event : '';
+    if (!/^[0-9a-f-]{36}$/.test(groupId) || !/^[0-9a-f-]{36}$/.test(event)) {
+      return json({ error: 'Invalid group event.' }, 400);
+    }
+    const { data: membership, error: memberError } = await admin.from('conversation_members')
+      .select('user_id,is_muted,muted_until,joined_at').eq('conversation_id', groupId);
+    if (memberError) return json({ error: 'Membership lookup failed.' }, 503);
+    if (!membership?.some((m) => m.user_id === me)) return json({ delivered: 0 });
+    const { data: eventRow, error: eventError } = await admin.from('group_messages')
+      .select('id,created_at').eq('id', event).eq('conversation_id', groupId)
+      .eq('sender_id', me).eq('is_deleted', false).gt('created_at', recent).maybeSingle();
+    if (eventError) return json({ error: 'Group event lookup failed.' }, 503);
+    if (!eventRow) return json({ delivered: 0 });
+    const { data: group, error: groupError } = await admin.from('conversations')
+      .select('title').eq('id', groupId).maybeSingle();
+    if (groupError || !group) return json({ error: 'Group lookup failed.' }, 503);
+    groupName = group.title || 'Group';
+    eventId = eventRow.id;
+    targets = membership.filter((m) => m.user_id !== me && !blocked.has(m.user_id) &&
+      Date.parse(m.joined_at) <= Date.parse(eventRow.created_at) &&
+      !(m.is_muted && (!m.muted_until || Date.parse(m.muted_until) > Date.now())))
+      .map((m) => m.user_id);
+  } else if (kind === "message" || kind === "call") {
     const peer = typeof body.peer === "string" ? body.peer : "";
     if (!/^[0-9a-f-]{36}$/.test(peer) || peer === me) {
       return json({ error: "Invalid peer." }, 400);
@@ -153,7 +179,8 @@ serve(async (req) => {
       if (typeof body.invite !== 'string' || !/^[0-9a-f-]{36}$/.test(body.invite)) return json({ error: 'Invalid invite.' }, 400);
       const { data: invite } = await admin.from('call_invites').select('id,call_type,created_at')
         .eq('id', body.invite).eq('caller_id', me).eq('callee_id', peer).eq('status', 'ringing')
-        .gt('created_at', new Date(Date.now() - 60000).toISOString()).maybeSingle();
+        .gt('created_at', new Date(Date.now() - 60000).toISOString())
+        .gt('expires_at', new Date().toISOString()).maybeSingle();
       if (!invite) return json({ delivered: 0 });
       eventId = invite.id;
       video = invite.call_type === 'video';
@@ -197,7 +224,9 @@ serve(async (req) => {
   if (!tokens?.length) return json({ delivered: 0, reason: 'no_registered_devices' });
 
   const data: Record<string, string> =
-    kind === "message"
+    kind === 'group'
+      ? { kind, peer: me, group: groupId, name: groupName }
+      : kind === "message"
       ? { kind, peer: me, name: myName }
       : kind === "call"
         ? {
@@ -223,8 +252,10 @@ serve(async (req) => {
   let delivered = 0;
   let failed = 0;
   for (const { token, user_id: recipient } of tokens) {
-    const { data: claimed, error } = await admin.rpc('claim_notification_dispatch',
-      { p_actor: me, p_recipient: recipient, p_kind: kind, p_event: eventId });
+    const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token));
+    const deviceHash = b64urlBytes(new Uint8Array(hash));
+    const { data: claimed, error } = await admin.rpc('claim_device_notification',
+      { p_actor: me, p_recipient: recipient, p_kind: kind, p_event: eventId, p_device_hash: deviceHash });
     if (error) return json({ error: 'Dispatch registration failed.' }, 503);
     if (!claimed) continue;
     try {
@@ -244,9 +275,16 @@ serve(async (req) => {
       );
       if (res.ok) {
         delivered++;
-        await admin.from('notification_dispatches').update({ sent: true })
-          .eq('actor_id', me).eq('recipient_id', recipient).eq('kind', kind).eq('event_id', eventId);
-      } else { failed++; }
+        await admin.from('device_notification_dispatches').update({ sent: true })
+          .eq('actor_id', me).eq('recipient_id', recipient).eq('kind', kind).eq('event_id', eventId)
+          .eq('device_hash', deviceHash);
+      } else {
+        failed++;
+        const failure = await res.json().catch(() => null);
+        if (failure?.error?.details?.some((d: { errorCode?: string }) => d.errorCode === 'UNREGISTERED')) {
+          await admin.from('push_tokens').delete().eq('token', token).eq('user_id', recipient);
+        }
+      }
     } catch {
       failed++;
     }

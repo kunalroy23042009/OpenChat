@@ -128,7 +128,7 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
-    expect(find.text('OpenChat'), findsOneWidget);
+    expect(find.bySemanticsLabel('OpenChat logo'), findsOneWidget);
     expect(find.textContaining('Good conversations'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });

@@ -3,10 +3,12 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:qr_flutter/qr_flutter.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'contacts_repository.dart';
 import 'local_profile.dart';
+import 'security/app_lock.dart';
 
 /// WhatsApp-style profile: photo, name, and about line.
 /// The photo stays on this device; name/about sync to the cloud account.
@@ -138,6 +140,7 @@ class _ProfilePageState extends State<ProfilePage> {
         await widget.profile.removeAvatar();
         await _syncAvatarUrl(null);
       } else {
+        AppLock.suppressRelockOnce = true;
         final picked = await ImagePicker().pickImage(
           source: choice == 'camera' ? ImageSource.camera : ImageSource.gallery,
           maxWidth: 512,
@@ -289,9 +292,58 @@ class _ProfilePageState extends State<ProfilePage> {
     }
   }
 
+  void _showQr() {
+    final handle = (cloudUsername?.isNotEmpty == true)
+        ? '@${cloudUsername!}'
+        : widget.profile.name;
+    final data =
+        'openchat://add?username=${cloudUsername ?? ''}&name=${Uri.encodeComponent(widget.profile.name)}';
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Share profile'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            QrImageView(data: data, version: QrVersions.auto, size: 200),
+            const SizedBox(height: 12),
+            SelectableText(handle, style: const TextStyle(fontSize: 16)),
+            const SizedBox(height: 8),
+            TextButton.icon(
+              onPressed: () {
+                Clipboard.setData(ClipboardData(text: handle));
+                Navigator.pop(ctx);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Copied to clipboard')),
+                );
+              },
+              icon: const Icon(Icons.copy_outlined),
+              label: const Text('Copy'),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) => Scaffold(
-    appBar: AppBar(title: const Text('Profile')),
+    appBar: AppBar(
+      title: const Text('Profile'),
+      actions: [
+        IconButton(
+          tooltip: 'Share via QR',
+          icon: const Icon(Icons.qr_code_2_outlined),
+          onPressed: _showQr,
+        ),
+      ],
+    ),
     body: Center(
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 560),

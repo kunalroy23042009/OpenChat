@@ -5,10 +5,30 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 /// (Android Keystore / iOS Keychain), never in plain preferences.
 class ChatLock {
   static const _pinKey = 'openchat.lock_pin';
+  static const _secretKey = 'openchat.lock_secret';
   static const _storage = FlutterSecureStorage();
 
   static Future<bool> hasPin() async =>
       (await _storage.read(key: _pinKey))?.isNotEmpty == true;
+
+  static Future<String?> secretCode() async {
+    try {
+      return await _storage.read(key: _secretKey);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Future<void> setSecretCode(String? code) async {
+    final clean = (code ?? '').trim();
+    if (clean.isEmpty) {
+      try {
+        await _storage.delete(key: _secretKey);
+      } catch (_) {}
+      return;
+    }
+    await _storage.write(key: _secretKey, value: clean);
+  }
 
   static Future<bool> verifyPin(String pin) async =>
       (await _storage.read(key: _pinKey)) == pin && pin.isNotEmpty;

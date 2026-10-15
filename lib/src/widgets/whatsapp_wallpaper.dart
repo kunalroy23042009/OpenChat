@@ -1,22 +1,28 @@
 import 'package:flutter/material.dart';
 
+import '../chat_preferences.dart';
+
 /// Authentic WhatsApp chat wallpaper with subtle background doodles.
 class WhatsAppWallpaper extends StatelessWidget {
-  const WhatsAppWallpaper({super.key, required this.child});
+  const WhatsAppWallpaper({super.key, required this.child, this.preset});
 
   final Widget child;
+  final ChatWallpaperPreset? preset;
 
   @override
   Widget build(BuildContext context) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
-    final bgColor = isDark ? const Color(0xFF0B141A) : const Color(0xFFEFEAE2);
+    final selected = preset ?? ChatWallpaperPreset.classic;
+    final bgColor = selected.background(context);
 
     return Container(
       color: bgColor,
-      child: CustomPaint(
-        painter: _WhatsAppDoodlePainter(isDark: isDark),
-        child: child,
-      ),
+      child: selected.hasDoodles
+          ? CustomPaint(
+              painter: _WhatsAppDoodlePainter(isDark: isDark),
+              child: child,
+            )
+          : child,
     );
   }
 }

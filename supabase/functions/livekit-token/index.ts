@@ -49,7 +49,11 @@ serve(async (req) => {
     return json({ error: "Invalid request." }, 400);
   }
   const room = typeof body.room === "string" ? body.room.trim() : "";
-  if (!room || room.length > 128 || !/^dm_[0-9a-f-]{36}_[0-9a-f-]{36}$/.test(room)) {
+  if (
+    !room ||
+    room.length > 128 ||
+    !/^(call_[0-9a-f]{32}|dm_[0-9a-f-]{36}_[0-9a-f-]{36})$/.test(room)
+  ) {
     return json({ error: "Invalid room." }, 400);
   }
 
@@ -66,7 +70,30 @@ serve(async (req) => {
   } catch {
     return json({ error: "Account check failed. Try again." }, 503);
   }
-  if (!room.includes(userId)) {
+
+  // Only a party to a live invitation for this room may mint a token. This
+  // blocks replay after a call ends/expires and forged room names.
+  let authorized = false;
+  try {
+    const authRes = await fetch(
+      `${supabaseUrl}/rest/v1/rpc/authorize_call_room`,
+      {
+        method: "POST",
+        headers: {
+          apikey: anonKey,
+          Authorization: auth,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ p_room: room, p_user_id: userId }),
+      },
+    );
+    if (authRes.ok) {
+      authorized = (await authRes.json()) === true;
+    }
+  } catch {
+    return json({ error: "Account check failed. Try again." }, 503);
+  }
+  if (!authorized) {
     return json({ error: "Not your call." }, 403);
   }
   const name =

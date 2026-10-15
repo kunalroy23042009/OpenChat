@@ -212,7 +212,7 @@ void main() {
     },
   );
 
-  test('deletes outside the hour or before the original are ignored', () async {
+  test('deletes outside 60 hours or before the original are ignored', () async {
     final store = await secureStore();
     await store.addSecureMessage(
       'me',
@@ -222,7 +222,7 @@ void main() {
       peerClientId: 'x',
       at: sentAt,
     );
-    for (final minutes in [-1, 61]) {
+    for (final minutes in [-1, 3601]) {
       await store.addSecureMessage(
         'me',
         'peer',

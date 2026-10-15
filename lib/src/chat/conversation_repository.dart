@@ -27,6 +27,10 @@ class GroupConversation {
     this.isMuted = false,
     this.isPinned = false,
     this.isArchived = false,
+    this.isLocked = false,
+    this.isFavourite = false,
+    this.markedUnread = false,
+    this.mutedUntilMs,
     this.unreadCount = 0,
     this.lastActivity,
     this.lastMessage,
@@ -47,6 +51,10 @@ class GroupConversation {
   final bool isMuted;
   final bool isPinned;
   final bool isArchived;
+  final bool isLocked;
+  final bool isFavourite;
+  final bool markedUnread;
+  final int? mutedUntilMs;
   final int unreadCount;
   final DateTime? lastActivity;
   final String? lastMessage;
@@ -57,6 +65,10 @@ class GroupConversation {
   bool get isChannel => type == 'channel';
   bool get isAdmin => myRole == 'admin' || myRole == 'owner';
   bool get isOwner => myRole == 'owner';
+  bool get isMutedNow =>
+      isMuted &&
+      (mutedUntilMs == null ||
+          DateTime.now().millisecondsSinceEpoch < mutedUntilMs!);
 
   factory GroupConversation.fromJson(Map<String, dynamic> json) =>
       GroupConversation(
@@ -75,6 +87,13 @@ class GroupConversation {
         isMuted: json['is_muted'] as bool? ?? false,
         isPinned: json['is_pinned'] as bool? ?? false,
         isArchived: json['is_archived'] as bool? ?? false,
+        isLocked: json['is_locked'] as bool? ?? false,
+        isFavourite: json['is_favourite'] as bool? ?? false,
+        markedUnread: json['marked_unread'] as bool? ?? false,
+        mutedUntilMs: json['muted_until'] != null
+            ? DateTime.tryParse(json['muted_until'] as String)
+                  ?.millisecondsSinceEpoch
+            : null,
         unreadCount: json['unread_count'] as int? ?? 0,
         lastActivity: json['last_activity'] != null
             ? DateTime.tryParse(json['last_activity'] as String)
@@ -473,6 +492,105 @@ class ConversationRepository extends ChangeNotifier {
     );
   }
 
+  /// Promotes ('admin') or demotes ('member') a group member.
+  Future<void> setMemberRole(
+    String conversationId,
+    String userId,
+    String role,
+  ) async {
+    await client.rpc(
+      'set_conversation_member_role',
+      params: {
+        'p_conversation_id': conversationId,
+        'p_user_id': userId,
+        'p_role': role,
+      },
+    );
+  }
+
+  /// Updates group settings (title/description/photo). Admins/owners only.
+  Future<void> updateConversation(
+    String conversationId, {
+    String? title,
+    String? description,
+    String? avatarUrl,
+  }) async {
+    await client.rpc(
+      'update_conversation',
+      params: {
+        'p_conversation_id': conversationId,
+        'p_title': title,
+        'p_description': description,
+        'p_avatar_url': avatarUrl,
+      },
+    );
+    await loadConversations();
+  }
+
+  /// Gets the group invite code (creates if missing).
+  Future<String> getGroupInviteCode(String conversationId) async {
+    final result = await client.rpc(
+      'group_invite_link',
+      params: {'p_conversation_id': conversationId, 'p_reset': false},
+    ) as String;
+    return result;
+  }
+
+  /// Resets the group invite code.
+  Future<String> resetGroupInviteCode(String conversationId) async {
+    final result = await client.rpc(
+      'group_invite_link',
+      params: {'p_conversation_id': conversationId, 'p_reset': true},
+    ) as String;
+    return result;
+  }
+
+  /// Previews a group invite by code (without joining).
+  Future<Map<String, dynamic>> previewGroupInvite(String code) async {
+    final result = await client.rpc(
+      'preview_group_invite',
+      params: {'p_code': code},
+    ) as Map<String, dynamic>;
+    return result;
+  }
+
+  /// Joins a group by invite code.
+  Future<String> joinGroupByInvite(String code) async {
+    final result = await client.rpc(
+      'join_group_by_invite',
+      params: {'p_code': code},
+    ) as String;
+    await loadConversations();
+    return result;
+  }
+
+  /// Permanently deletes a group and its server-owned data. Owner-only RPC.
+  Future<void> deleteGroup(String conversationId) async {
+    await client.rpc(
+      'delete_conversation_group',
+      params: {'p_conversation_id': conversationId},
+    );
+    _conversations = _conversations
+        .where((conversation) => conversation.id != conversationId)
+        .toList();
+    notifyListeners();
+  }
+
+  /// Transfers group ownership to an existing member. Owner-only RPC.
+  Future<void> transferOwnership(
+    String conversationId,
+    String newOwnerId,
+  ) async {
+    await client.rpc(
+      'transfer_conversation_ownership',
+      params: {
+        'p_conversation_id': conversationId,
+        'p_new_owner_id': newOwnerId,
+      },
+    );
+    await loadConversations();
+  }
+
   /// Roster with roles for the member sheet. Caller must belong to the
   /// conversation; each row carries user_id, role, display_name, username.
   Future<List<Map<String, dynamic>>> members(String conversationId) async {
@@ -492,6 +610,57 @@ class ConversationRepository extends ChangeNotifier {
     return (rows as List)
         .map((row) => Map<String, dynamic>.from(row as Map))
         .toList();
+  }
+
+  /// Marks group messages as read up to the given timestamp.
+  Future<void> markGroupRead(String conversationId, DateTime readAt) async {
+    await client.rpc(
+      'mark_group_read',
+      params: {
+        'p_conversation_id': conversationId,
+        'p_read_at': readAt.toUtc().toIso8601String(),
+      },
+    );
+  }
+
+  /// Notifies server to send FCM nudges to other group members.
+  Future<void> notifyGroup(
+    String conversationId,
+    String messageId,
+  ) async {
+    await client.functions.invoke('notify-send', body: {
+      'kind': 'group',
+      'group': conversationId,
+      'event': messageId,
+    });
+  }
+
+  /// Updates per-member conversation flags (mute/pin/archive/lock/favourite).
+  /// Only non-null arguments are applied.
+  Future<void> setConversationFlags(
+    String conversationId, {
+    bool? muted,
+    DateTime? mutedUntil,
+    bool? pinned,
+    bool? archived,
+    bool? locked,
+    bool? favourite,
+    bool? markedUnread,
+  }) async {
+    await client.rpc(
+      'set_conversation_member_flags',
+      params: {
+        'p_conversation_id': conversationId,
+        'p_is_muted': muted,
+        'p_muted_until': mutedUntil?.toUtc().toIso8601String(),
+        'p_is_pinned': pinned,
+        'p_is_archived': archived,
+        'p_is_locked': locked,
+        'p_is_favourite': favourite,
+        'p_marked_unread': markedUnread,
+      },
+    );
+    await loadConversations();
   }
 
   // ========== Messages ==========
@@ -1455,9 +1624,42 @@ class ConversationRepository extends ChangeNotifier {
     _realtimeSub = null;
   }
 
+  RealtimeChannel? _membershipSub;
+
+  /// Subscribes to conversation_members changes for the current user so the
+  /// home group list unread badges stay in sync.
+  void subscribeToMembership() {
+    if (_membershipSub != null) return;
+    final uid = client.auth.currentUser?.id;
+    if (uid == null) return;
+    _membershipSub =
+        client
+            .channel('membership:$uid')
+            .onPostgresChanges(
+              event: PostgresChangeEvent.all,
+              schema: 'public',
+              table: 'conversation_members',
+              filter: PostgresChangeFilter(
+                type: PostgresChangeFilterType.eq,
+                column: 'user_id',
+                value: uid,
+              ),
+              callback: (payload) {
+                unawaited(loadConversations());
+              },
+            )
+          ..subscribe();
+  }
+
+  void unsubscribeFromMembership() {
+    _membershipSub?.unsubscribe();
+    _membershipSub = null;
+  }
+
   @override
   void dispose() {
     _realtimeSub?.cancel();
+    _membershipSub?.unsubscribe();
     super.dispose();
   }
 }

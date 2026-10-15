@@ -1,10 +1,26 @@
 import 'package:flutter/widgets.dart';
 
-/// WhatsApp-style inline formatting for message bubbles: `*bold*`,
-/// `_italic_`, `~strike~`, triple-backtick monospace blocks, and
-/// single-backtick `code`. First match wins, no nesting, unmatched markers
-/// render literally. Code spans never format inside.
+String _formatLines(String text) {
+  final lines = text.split('\n');
+  return lines.map((line) {
+    final t = line.trimLeft();
+    if (t.startsWith('> ')) return '▎ ${t.substring(2)}';
+    if (t.startsWith('- ') || t.startsWith('* ')) {
+      return '• ${t.substring(2)}';
+    }
+    final num = RegExp(r'^(\d+)\.\s+(.*)$').firstMatch(t);
+    if (num != null) {
+      return '${num.group(1)}. ${num.group(2)}';
+    }
+    return line;
+  }).join('\n');
+}
+
+/// WhatsApp-style formatting: inline `*bold*`, `_italic_`, `~strike~`,
+/// triple-backtick mono, `code`, plus line-level `> quote`,
+/// `- / * bullet`, `1. numbered`. First match wins, no nesting.
 List<InlineSpan> formatMessageSpans(String text, TextStyle base) {
+  text = _formatLines(text);
   final pattern = RegExp(
     r'(```[\s\S]+?```)|(`[^`\n]+?`)|(\*[^*\n]+?\*)|(_[^_\n]+?_)|(~[^~\n]+?~)',
   );

@@ -1,9 +1,9 @@
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-import 'ai/ai_service.dart';
 import 'media/media_message.dart';
 import 'security/secure_history_database.dart';
 
@@ -36,6 +36,7 @@ class SecureMessage {
     this.deliveredAt,
     this.readAt,
     this.hidden = false,
+    this.edited = false,
   });
 
   /// Decrypted body: raw text or an encoded image body.
@@ -64,7 +65,10 @@ class SecureMessage {
 
   /// Retain only metadata for local deletion so redelivery cannot resurrect it.
   final bool hidden;
-  static const deleteWindow = Duration(hours: 1);
+
+  /// In-place correction marker for "(Edited)" tag.
+  final bool edited;
+  static const deleteWindow = Duration(hours: 60);
 
   bool canDeleteForEveryone(DateTime now) =>
       mine &&
@@ -74,18 +78,20 @@ class SecureMessage {
       now.difference(at) >= Duration.zero &&
       now.difference(at) <= deleteWindow;
 
-  SecureMessage withBody(String body, {bool? hidden}) => SecureMessage(
-    text: body,
-    mine: mine,
-    at: at,
-    clientId: clientId,
-    status: status,
-    envelopeId: envelopeId,
-    peerClientId: peerClientId,
-    deliveredAt: deliveredAt,
-    readAt: readAt,
-    hidden: hidden ?? this.hidden,
-  );
+  SecureMessage withBody(String body, {bool? hidden, bool? edited}) =>
+      SecureMessage(
+        text: body,
+        mine: mine,
+        at: at,
+        clientId: clientId,
+        status: status,
+        envelopeId: envelopeId,
+        peerClientId: peerClientId,
+        deliveredAt: deliveredAt,
+        readAt: readAt,
+        hidden: hidden ?? this.hidden,
+        edited: edited ?? this.edited,
+      );
   Map<String, dynamic> toJson() => {
     'text': text,
     'mine': mine,
@@ -97,6 +103,7 @@ class SecureMessage {
     'deliveredAt': deliveredAt,
     'readAt': readAt,
     'hidden': hidden,
+    'edited': edited,
   };
   factory SecureMessage.fromJson(Map<String, dynamic> json) => SecureMessage(
     text: json['text'] as String,
@@ -109,6 +116,7 @@ class SecureMessage {
     deliveredAt: json['deliveredAt'] as String?,
     readAt: json['readAt'] as String?,
     hidden: json['hidden'] as bool? ?? false,
+    edited: json['edited'] as bool? ?? false,
   );
 
   /// Stable identity for star/pin/delete: the sender-side key when known,
@@ -139,6 +147,7 @@ class Conversation {
     required this.messages,
     this.unread = 0,
     this.muted = false,
+    this.mutedUntilMs,
     this.isAi = false,
     this.aiProvider,
     this.aiModel,
@@ -153,6 +162,10 @@ class Conversation {
   final List<ChatMessage> messages;
   int unread;
   bool muted;
+
+  /// Epoch millis when a timed mute ends. Null = muted indefinitely
+  /// (Always) or not muted. Expired mutes read as unmuted via [isMutedNow].
+  int? mutedUntilMs;
   final bool isAi;
   final String? aiProvider;
   final String? aiModel;
@@ -163,6 +176,14 @@ class Conversation {
   bool favourite;
   bool locked;
   bool isTyping = false;
+
+  /// True while a mute is active. Timed mutes expire by the clock without
+  /// needing a write; the stale flag is cleared lazily on next mute change.
+  bool get isMutedNow =>
+      muted &&
+      (mutedUntilMs == null ||
+          DateTime.now().millisecondsSinceEpoch < mutedUntilMs!);
+
   String get initials => name
       .trim()
       .split(RegExp(r'\s+'))
@@ -176,6 +197,7 @@ class Conversation {
     'color': color,
     'unread': unread,
     'muted': muted,
+    'mutedUntil': mutedUntilMs,
     'isAi': isAi,
     'aiProvider': aiProvider,
     'aiModel': aiModel,
@@ -191,6 +213,7 @@ class Conversation {
     color: json['color'] as int,
     unread: json['unread'] as int,
     muted: json['muted'] as bool? ?? false,
+    mutedUntilMs: (json['mutedUntil'] as num?)?.toInt(),
     isAi: json['isAi'] as bool? ?? false,
     aiProvider: json['aiProvider'] as String?,
     aiModel: json['aiModel'] as String?,
@@ -216,7 +239,6 @@ class ChatStore extends ChangeNotifier {
     bool purgeDemoSeeds = false,
     this.secureHistory,
   }) {
-    AiService.instance.init(preferences);
     final saved = preferences.getString(storageKey);
     try {
       conversations = saved == null
@@ -235,6 +257,12 @@ class ChatStore extends ChangeNotifier {
     if (purgeDemoSeeds &&
         conversations.any((c) => demoSeedIds.contains(c.id))) {
       conversations.removeWhere((c) => demoSeedIds.contains(c.id));
+      _save();
+    }
+    // AI chatbot removed: drop any legacy AI threads without deleting
+    // real chats. Keeps home list clean after upgrade.
+    if (conversations.any((c) => c.isAi)) {
+      conversations.removeWhere((c) => c.isAi);
       _save();
     }
   }
@@ -295,68 +323,6 @@ class ChatStore extends ChangeNotifier {
     conversations.remove(chat);
     conversations.insert(0, chat);
     await _save();
-
-    if (chat.isAi && chat.aiProvider != null) {
-      _triggerAiReply(chat, clean);
-    }
-  }
-
-  Future<void> _triggerAiReply(Conversation chat, String prompt) async {
-    chat.isTyping = true;
-    notifyListeners();
-
-    try {
-      final provider = AiProviderType.values.firstWhere(
-        (p) => p.name == chat.aiProvider,
-        orElse: () => AiProviderType.openai,
-      );
-      final reply = await AiService.instance.generateReply(
-        providerType: provider,
-        userPrompt: prompt,
-        history: chat.messages,
-      );
-      chat.messages.add(
-        ChatMessage(text: reply, mine: false, at: DateTime.now()),
-      );
-    } catch (e) {
-      chat.messages.add(
-        ChatMessage(
-          text: 'Error generating AI reply: $e',
-          mine: false,
-          at: DateTime.now(),
-        ),
-      );
-    } finally {
-      chat.isTyping = false;
-      await _save();
-    }
-  }
-
-  Future<Conversation> createAiChat({
-    required String name,
-    required String provider,
-    required int color,
-    String? model,
-  }) async {
-    final chat = Conversation(
-      id: 'ai_${provider}_${DateTime.now().millisecondsSinceEpoch}',
-      name: name,
-      color: color,
-      isAi: true,
-      aiProvider: provider,
-      aiModel: model,
-      messages: [
-        ChatMessage(
-          text:
-              'Hello! I am $name inside OpenChat. Ask me anything or configure my API key in Settings → AI Providers.',
-          mine: false,
-          at: DateTime.now(),
-        ),
-      ],
-    );
-    conversations.insert(0, chat);
-    await _save();
-    return chat;
   }
 
   Future<void> markRead(Conversation chat) async {
@@ -365,7 +331,22 @@ class ChatStore extends ChangeNotifier {
   }
 
   Future<void> toggleMute(Conversation chat) async {
-    chat.muted = !chat.muted;
+    if (chat.isMutedNow) {
+      chat.muted = false;
+      chat.mutedUntilMs = null;
+    } else {
+      chat.muted = true;
+      chat.mutedUntilMs = null;
+    }
+    await _save();
+  }
+
+  /// WhatsApp-style mute durations. Null duration = Always.
+  Future<void> setMute(Conversation chat, Duration? duration) async {
+    chat.muted = true;
+    chat.mutedUntilMs = duration == null
+        ? null
+        : DateTime.now().add(duration).millisecondsSinceEpoch;
     await _save();
   }
 
@@ -440,6 +421,7 @@ class ChatStore extends ChangeNotifier {
               .toList(),
           unread: current.unread,
           muted: current.muted,
+          mutedUntilMs: current.mutedUntilMs,
           archived: current.archived,
           pinned: current.pinned,
           favourite: current.favourite,
@@ -453,6 +435,16 @@ class ChatStore extends ChangeNotifier {
 
   static String _secureId(String accountId, String peerId) =>
       '_secure_$accountId-$peerId';
+
+  /// True when the 1:1 secure chat with [peerId] is muted right now.
+  /// Used to suppress notifications for muted chats, WhatsApp-style.
+  bool isPeerMuted(String accountId, String peerId) {
+    final secureId = _secureId(accountId, peerId);
+    for (final c in conversations) {
+      if (c.id == secureId) return c.isMutedNow;
+    }
+    return false;
+  }
 
   static String _secureKey(String accountId, String peerId) =>
       '$_securePrefix$accountId-$peerId';
@@ -524,7 +516,10 @@ class ChatStore extends ChangeNotifier {
             } else if (original.isEditable) {
               // Media/poll bodies reject correction; the control is kept
               // for idempotency but changes nothing.
-              messages[i] = m.withBody(original.editedBody(body.text));
+              messages[i] = m.withBody(
+                original.editedBody(body.text),
+                edited: true,
+              );
             }
           }
         }
@@ -602,6 +597,7 @@ class ChatStore extends ChangeNotifier {
           .toList(),
       unread: current.unread,
       muted: current.muted,
+      mutedUntilMs: current.mutedUntilMs,
       archived: current.archived,
       pinned: current.pinned,
       favourite: current.favourite,
@@ -672,6 +668,7 @@ class ChatStore extends ChangeNotifier {
               peerClientId: m.peerClientId,
               deliveredAt: nextDelivered,
               readAt: nextRead,
+              edited: m.edited,
             );
             changed = true;
           }
@@ -703,6 +700,180 @@ class ChatStore extends ChangeNotifier {
       removed = true;
     });
     return removed;
+  }
+
+  /// Edits a 1:1 secure message by sending an edit control message.
+  /// Only works within 15 minutes of sending (WhatsApp parity).
+  Future<bool> editSecureMessage(
+    String accountId,
+    String peerId,
+    String ref,
+    String newText,
+    MethodChannel channel,
+  ) async {
+    if (ref.isEmpty || newText.isEmpty) return false;
+    final key = _secureKey(accountId, peerId);
+    var success = false;
+    await _queueSecureWrite(key, () async {
+      final messages = _readSecureMessages(key);
+      final i = messages.indexWhere((m) => m.ref == ref && !m.hidden && m.mine);
+      if (i < 0) return;
+      final message = messages[i];
+      if (!message.canEdit(DateTime.now())) return;
+      
+      // Send edit control message via Signal
+      try {
+        final editBody = encodeEditBody(ref, newText);
+        final result = await channel.invokeMethod('signalEncrypt', {
+          'accountId': accountId,
+          'peerId': peerId,
+          'plain': base64Encode(utf8.encode(editBody)),
+        }) as Map<dynamic, dynamic>;
+        
+        await channel.invokeMethod('sendSignalMessage', {
+          'accountId': accountId,
+          'peerId': peerId,
+          'type': result['type'],
+          'body': result['body'],
+        });
+        
+        // Update local message to the edited text (peer gets the control).
+        final original = parseMessageBody(message.text);
+        messages[i] = SecureMessage(
+          text: original.editedBody(newText),
+          mine: true,
+          at: message.at,
+          clientId: message.clientId,
+          status: message.status,
+          envelopeId: message.envelopeId,
+          peerClientId: message.peerClientId,
+          deliveredAt: message.deliveredAt,
+          readAt: message.readAt,
+          edited: true,
+        );
+        await _writeSecureMessages(accountId, peerId, messages);
+        success = true;
+      } catch (_) {
+        // Ignore failures - will retry on next send
+      }
+    });
+    return success;
+  }
+
+  /// Deletes a 1:1 secure message (for me or for everyone).
+  /// For everyone: sends delete control message within 1 hour window.
+  /// For me: marks locally as hidden.
+  Future<bool> deleteSecureMessage(
+    String accountId,
+    String peerId,
+    String ref, {
+    bool forEveryone = false,
+    MethodChannel? channel,
+  }) async {
+    if (ref.isEmpty) return false;
+    final key = _secureKey(accountId, peerId);
+    var success = false;
+    await _queueSecureWrite(key, () async {
+      final messages = _readSecureMessages(key);
+      final i = messages.indexWhere((m) => m.ref == ref && !m.hidden);
+      if (i < 0) return;
+      final message = messages[i];
+      
+      if (forEveryone) {
+        if (!message.mine || !message.canDeleteForEveryone(DateTime.now()) || channel == null) {
+          return;
+        }
+        // Send delete-for-everyone control message
+        try {
+          final deleteBody = encodeDeleteBody(ref);
+          final result = await channel.invokeMethod('signalEncrypt', {
+            'accountId': accountId,
+            'peerId': peerId,
+            'plain': base64Encode(utf8.encode(deleteBody)),
+          }) as Map<dynamic, dynamic>;
+          
+          await channel.invokeMethod('sendSignalMessage', {
+            'accountId': accountId,
+            'peerId': peerId,
+            'type': result['type'],
+            'body': result['body'],
+          });
+          
+          // Mark locally as deleted
+          messages[i] = messages[i].withBody(encodeTombstoneBody(), hidden: true);
+          await _writeSecureMessages(accountId, peerId, messages);
+          success = true;
+        } catch (_) {
+          // Ignore failures
+        }
+      } else {
+        // Delete for me only
+        messages[i] = messages[i].withBody(encodeTombstoneBody(), hidden: true);
+        await _writeSecureMessages(accountId, peerId, messages);
+        success = true;
+      }
+    });
+    return success;
+  }
+
+  /// Restores a delete-for-me tombstone within the undo window.
+  /// Returns the restored body, or null when nothing was restored.
+  Future<String?> restoreSecureMessage(
+    String accountId,
+    String peerId,
+    String ref,
+    String originalText,
+  ) async {
+    if (ref.isEmpty) return null;
+    final key = _secureKey(accountId, peerId);
+    String? done;
+    await _queueSecureWrite(key, () async {
+      final messages = _readSecureMessages(key);
+      final i = messages.indexWhere((m) => m.ref == ref);
+      if (i < 0) return;
+      messages[i] = messages[i].withBody(originalText, hidden: false);
+      await _writeSecureMessages(accountId, peerId, messages);
+      done = originalText;
+    });
+    return done;
+  }
+
+  /// Toggles a reaction on a 1:1 message by sending a reaction control message.
+  Future<void> reactToSecureMessage(
+    String accountId,
+    String peerId,
+    String ref,
+    String emoji,
+    MethodChannel channel,
+  ) async {
+    if (ref.isEmpty || emoji.isEmpty) return;
+    final key = _secureKey(accountId, peerId);
+    await _queueSecureWrite(key, () async {
+      final messages = _readSecureMessages(key);
+      final i = messages.indexWhere((m) => m.ref == ref && !m.hidden);
+      if (i < 0) return;
+      
+      // Send reaction control message
+      try {
+        final reactBody = encodeReactBody(ref, emoji);
+        final result = await channel.invokeMethod('signalEncrypt', {
+          'accountId': accountId,
+          'peerId': peerId,
+          'plain': base64Encode(utf8.encode(reactBody)),
+        }) as Map<dynamic, dynamic>;
+        
+        await channel.invokeMethod('sendSignalMessage', {
+          'accountId': accountId,
+          'peerId': peerId,
+          'type': result['type'],
+          'body': result['body'],
+        });
+      } catch (_) {
+        // Ignore failures
+      }
+    });
+    // Also apply locally for instant feedback
+    await applySecureReaction(accountId, peerId, ref, emoji, mine: true, remove: false);
   }
 
   /// Atomically consumes a received view-once body before it is shown.

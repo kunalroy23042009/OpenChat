@@ -1,5 +1,7 @@
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import 'call_service.dart';
+
 /// Call invitation signaling over the `call_invites` table + RPCs.
 /// Rooms are deterministic per pair; tokens come from the livekit-token
 /// Edge Function and are never stored.
@@ -43,6 +45,9 @@ class CallSignaling {
     required String room,
     required String name,
   }) async {
+    if (!isValidCallRoom(room)) {
+      throw StateError('This call is no longer available.');
+    }
     try {
       final response = await client.functions.invoke(
         'livekit-token',

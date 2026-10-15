@@ -5,8 +5,11 @@ import 'dart:typed_data';
 
 import 'package:image_picker/image_picker.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../backup/chat_backup.dart';
+import '../chat_preferences.dart';
+import '../security/app_lock.dart';
 import 'media_seal.dart';
 import 'media_message.dart';
 
@@ -46,8 +49,9 @@ class SealedVideo {
 /// AES-256-GCM sealed on-device with a fresh key per file; the server only
 /// ever sees ciphertext, and only the two chat parties can even read that.
 class ChatMedia {
-  ChatMedia(this.client);
+  ChatMedia(this.client, {this.preferences});
   final SupabaseClient client;
+  final SharedPreferences? preferences;
   static const bucket = 'chat-media';
   static const maxBytes = 10 * 1024 * 1024;
 
@@ -247,25 +251,53 @@ class ChatMedia {
     );
   }
 
-  Future<XFile?> pickGalleryVideo() => ImagePicker().pickVideo(
-    source: ImageSource.gallery,
-    maxDuration: const Duration(minutes: 3),
-  );
+  Future<XFile?> pickGalleryVideo() {
+    AppLock.suppressRelockOnce = true;
+    return ImagePicker().pickVideo(
+      source: ImageSource.gallery,
+      maxDuration: const Duration(minutes: 3),
+    );
+  }
 
-  Future<XFile?> pickCameraVideo() => ImagePicker().pickVideo(
-    source: ImageSource.camera,
-    maxDuration: const Duration(minutes: 3),
-  );
+  Future<XFile?> pickCameraVideo() {
+    AppLock.suppressRelockOnce = true;
+    return ImagePicker().pickVideo(
+      source: ImageSource.camera,
+      maxDuration: const Duration(minutes: 3),
+    );
+  }
 
-  Future<XFile?> pickGalleryImage() => ImagePicker().pickImage(
-    source: ImageSource.gallery,
-    maxWidth: 1600,
-    imageQuality: 85,
-  );
+  Future<XFile?> pickGalleryImage() {
+    AppLock.suppressRelockOnce = true;
+    return ImagePicker().pickImage(
+      source: ImageSource.gallery,
+      maxWidth: _imageWidth,
+      imageQuality: _imageQuality,
+    );
+  }
 
-  Future<XFile?> pickCameraImage() => ImagePicker().pickImage(
-    source: ImageSource.camera,
-    maxWidth: 1600,
-    imageQuality: 85,
-  );
+  Future<XFile?> pickCameraImage() {
+    AppLock.suppressRelockOnce = true;
+    return ImagePicker().pickImage(
+      source: ImageSource.camera,
+      maxWidth: _imageWidth,
+      imageQuality: _imageQuality,
+    );
+  }
+
+  double get _imageWidth {
+    final prefs = preferences;
+    if (prefs == null) return 1600;
+    final options = ChatPreferences(prefs);
+    if (options.lowDataMode) return 1280;
+    return options.hdMedia ? 2048 : 1600;
+  }
+
+  int get _imageQuality {
+    final prefs = preferences;
+    if (prefs == null) return 85;
+    final options = ChatPreferences(prefs);
+    if (options.lowDataMode) return 70;
+    return options.hdMedia ? 100 : 85;
+  }
 }

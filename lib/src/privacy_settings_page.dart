@@ -3,6 +3,8 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import 'chat_lock.dart';
+
 class PrivacySettingsPage extends StatefulWidget {
   const PrivacySettingsPage({
     super.key,
@@ -201,6 +203,15 @@ class _PrivacySettingsPageState extends State<PrivacySettingsPage> {
             _save();
           },
         ),
+        ListTile(
+          leading: const Icon(Icons.key_outlined),
+          title: const Text('Secret code for locked chats'),
+          subtitle: const Text(
+            'Hide the Locked folder. Type the code in search to reveal it.',
+          ),
+          trailing: const Icon(Icons.chevron_right),
+          onTap: _editSecretCode,
+        ),
         const Divider(height: 32),
         Row(
           children: [
@@ -284,6 +295,53 @@ class _PrivacySettingsPageState extends State<PrivacySettingsPage> {
       }
     },
   );
+
+  Future<void> _editSecretCode() async {
+    final current = await ChatLock.secretCode();
+    if (!mounted) return;
+    final controller = TextEditingController(text: current ?? '');
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Secret code'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          maxLength: 32,
+          decoration: const InputDecoration(
+            hintText: 'e.g. mango42 (empty = off)',
+            border: OutlineInputBorder(),
+            counterText: '',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    if (saved == true) {
+      await ChatLock.setSecretCode(controller.text);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              controller.text.trim().isEmpty
+                  ? 'Secret code off. Locked folder is visible again.'
+                  : 'Secret code saved. Locked folder is now hidden.',
+            ),
+          ),
+        );
+      }
+    }
+    controller.dispose();
+  }
 
   Future<void> _chooseTimer() async {
     final selected = await showDialog<int>(

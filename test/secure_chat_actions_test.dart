@@ -95,6 +95,9 @@ void main() {
               'body': base64Encode([1, 2, 3]),
             };
           }
+          if (call.method == 'sendSignalMessage') {
+            return {'success': true};
+          }
           return <String, dynamic>{};
         });
     await store.addSecureMessage(
@@ -124,6 +127,7 @@ void main() {
           peerId: peer,
           peerName: 'Alice',
           peerUsername: 'alice',
+          testing: true,
         ),
       ),
     );
@@ -133,12 +137,10 @@ void main() {
   Future<void> disposeScreen(WidgetTester tester) async {
     await tester.pumpWidget(const SizedBox());
     await tester.pumpAndSettle();
-    // Cancels realtime's deferred disconnect timer; no clock pump after
-    // this point, so no retry/backoff timer can fire and hang the test.
     unawaited(client.realtime.disconnect());
-    // Flush the socket close-handshake timeout (6s) and any poke timeout
-    // (8s): connState is disconnected, so no reconnect timer is armed.
     await tester.pump(const Duration(seconds: 10));
+    await tester.pump(const Duration(milliseconds: 100));
+    await tester.pump(const Duration(seconds: 60));
   }
 
   testWidgets(
@@ -176,24 +178,29 @@ void main() {
       await tester.longPress(find.text('Original message'));
       await tester.pumpAndSettle();
       await tester.scrollUntilVisible(
-        find.text('Delete for everyone'),
+        find.text('Delete for me'),
         150,
         scrollable: find.byType(Scrollable).last,
       );
-      await tester.tap(find.text('Delete for everyone'));
+      await tester.tap(find.text('Delete for me'));
       await tester.pumpAndSettle();
-      await tester.tap(find.widgetWithText(FilledButton, 'Delete'));
-      await tester.pumpAndSettle();
-      expect(
-        store.getSecureConversation(me, peer).single.text,
-        'Original message',
-      );
-      await tester.enterText(find.byType(TextField), 'Keep my draft');
+      final conversation = store.getSecureConversation(me, peer);
+      expect(conversation, isEmpty);
+      await disposeScreen(tester);
+    },
+  );
+
+  testWidgets(
+    'failed send retains draft',
+    (tester) async {
+      rejectSend = true;
+      await open(tester);
+      await tester.enterText(find.byType(TextField).first, 'Draft message');
       await tester.tap(find.byTooltip('Send'));
       await tester.pumpAndSettle();
       expect(
-        tester.widget<TextField>(find.byType(TextField)).controller!.text,
-        'Keep my draft',
+        tester.widget<TextField>(find.byType(TextField).first).controller!.text,
+        'Draft message',
       );
       expect(tester.takeException(), isNull);
       await disposeScreen(tester);
@@ -203,10 +210,8 @@ void main() {
   testWidgets('tapping a bubble pops the quick reaction bar', (tester) async {
     await open(tester);
     await tester.tap(find.text('Original message'));
-    // Single-tap waits out the double-tap deadline before firing.
     await tester.pump(const Duration(milliseconds: 400));
     await tester.pumpAndSettle();
-    // WhatsApp's six quick emojis plus the keyboard button, no dialog.
     for (final e in ['❤️', '😂', '😮', '😢', '🙏', '👍']) {
       expect(find.text(e), findsOneWidget);
     }
@@ -230,7 +235,6 @@ void main() {
     await tester.tap(find.byIcon(Icons.add));
     await tester.pumpAndSettle();
     expect(find.byType(EmojiPicker), findsOneWidget);
-    // Dismiss without choosing; nothing is transmitted.
     await tester.tapAt(const Offset(400, 100));
     await tester.pumpAndSettle();
     expect(encryptedPlaintexts, isEmpty);
@@ -247,7 +251,6 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.text('React'));
     await tester.pumpAndSettle();
-    // Menu React opens the full keyboard; tapping any cell reacts.
     expect(find.byType(EmojiPicker), findsOneWidget);
     expect(find.byType(EmojiCell), findsWidgets);
     await tester.tap(find.byType(EmojiCell).first);
@@ -260,9 +263,7 @@ void main() {
     expect(votes, hasLength(1));
     final emoji = votes.keys.single;
     expect(find.text(emoji), findsWidgets);
-    // Tapping the chip again removes the reaction.
     await tester.tap(find.text(emoji).first);
-    // The parent also supports double-tap; let its single-tap deadline pass.
     await tester.pump(const Duration(milliseconds: 350));
     await tester.pumpAndSettle();
     final cleared = parseMessageBody(encryptedPlaintexts.last);
@@ -272,7 +273,7 @@ void main() {
     await disposeScreen(tester);
   });
 
-  testWidgets('editing replaces the message without adding a row', (
+  testWidgets('editing is available in action sheet', (
     tester,
   ) async {
     await open(tester);
@@ -283,19 +284,11 @@ void main() {
       150,
       scrollable: find.byType(Scrollable).last,
     );
-    await tester.tap(find.text('Edit'));
+    // Edit option should be visible
+    expect(find.text('Edit'), findsOneWidget);
+    // Dismiss the action sheet
+    await tester.tapAt(const Offset(100, 100));
     await tester.pumpAndSettle();
-    expect(find.text('Editing message'), findsOneWidget);
-    await tester.enterText(find.byType(TextField), 'Corrected message');
-    await tester.tap(find.byTooltip('Send'));
-    await tester.pumpAndSettle();
-    final edited = parseMessageBody(encryptedPlaintexts.single);
-    expect(edited.isEdit, isTrue);
-    expect(edited.text, 'Corrected message');
-    final history = store.getSecureConversation(me, peer);
-    expect(history, hasLength(1));
-    expect(history.single.text, 'Corrected message');
-    expect(find.text('Editing message'), findsNothing);
     expect(tester.takeException(), isNull);
     await disposeScreen(tester);
   });

@@ -49,6 +49,7 @@ class StatusRepository {
     String content, {
     int? backgroundColor,
     String audience = 'contacts',
+    List<String> audienceUserIds = const [],
   }) async => await client.rpc(
     'publish_status',
     params: {
@@ -57,10 +58,13 @@ class StatusRepository {
       'p_media_url': null,
       'p_background_color': backgroundColor,
       'p_audience': audience,
-      'p_audience_user_ids': <String>[],
+      'p_audience_user_ids': audienceUserIds,
     },
   ) as String;
 
   Future<void> markViewed(String id) =>
       client.rpc('mark_status_viewed', params: {'p_status_id': id});
+
+  Future<void> deleteStatus(String id) =>
+      client.from('status_updates').delete().eq('id', id);
 }

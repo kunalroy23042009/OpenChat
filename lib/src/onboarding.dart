@@ -6,6 +6,7 @@ import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import 'avatar_sync.dart';
 import 'contacts_repository.dart';
 import 'auth/password_auth.dart';
 import 'auth/password_field.dart';
@@ -57,6 +58,7 @@ class _OnboardingFlowState extends State<OnboardingFlow> {
       _ProfileStep(
         profile: widget.profile,
         client: widget.client,
+        preferences: widget.preferences,
         onDone: finish,
       ),
     ];
@@ -360,10 +362,12 @@ class _ProfileStep extends StatefulWidget {
   const _ProfileStep({
     required this.profile,
     this.client,
+    required this.preferences,
     required this.onDone,
   });
   final LocalProfile profile;
   final SupabaseClient? client;
+  final SharedPreferences preferences;
   final VoidCallback onDone;
 
   @override
@@ -457,6 +461,13 @@ class _ProfileStepState extends State<_ProfileStep> {
             'member${client.auth.currentUser!.id.replaceAll('-', '').substring(0, 6)}';
         await SupabaseContactsRepository(client)
             .saveProfile(widget.profile.name, username, widget.profile.about);
+
+        // Sync avatar to cloud if one was set
+        final avatarSync = AvatarSyncService(
+          client: client,
+          preferences: widget.preferences,
+        );
+        await avatarSync.syncCurrentAvatar(widget.profile);
       }
       widget.onDone();
     } on ArgumentError catch (e) {

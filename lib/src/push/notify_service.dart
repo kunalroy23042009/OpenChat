@@ -51,6 +51,7 @@ class NotifyService {
   static const messagesChannel = 'openchat_messages';
   static const callsChannel = 'openchat_calls';
   static const statusChannel = 'openchat_status';
+  static const groupsChannel = 'openchat_groups';
 
   /// Peer ids with a visible chat screen. Messages for these never notify.
   final Set<String> openChats = {};
@@ -142,6 +143,17 @@ class NotifyService {
         ),
       );
       debugPrint('NotifyService: status channel created');
+      await impl.createNotificationChannel(
+        const AndroidNotificationChannel(
+          groupsChannel,
+          'Group messages',
+          description: 'New group message alerts',
+          importance: Importance.max,
+          playSound: true,
+          enableVibration: true,
+        ),
+      );
+      debugPrint('NotifyService: groups channel created');
       _ready = true;
       debugPrint('NotifyService: ready=$_ready');
     } catch (e, st) {
@@ -180,6 +192,7 @@ class NotifyService {
     required String name,
     String? event,
     bool ignoreOpenChats = false,
+    bool silent = false,
   }) async {
     if (!_ready) {
       debugPrint('NotifyService: showMessage - not ready');
@@ -203,13 +216,15 @@ class NotifyService {
       id: notificationId('msg', peerId),
       title: name,
       body: 'New message',
-      notificationDetails: const NotificationDetails(
+      notificationDetails: NotificationDetails(
         android: AndroidNotificationDetails(
           messagesChannel,
           'Messages',
-          importance: Importance.high,
-          priority: Priority.high,
+          importance: silent ? Importance.low : Importance.high,
+          priority: silent ? Priority.low : Priority.high,
           category: AndroidNotificationCategory.message,
+          playSound: !silent,
+          enableVibration: !silent,
         ),
       ),
       payload: NotifyTap(kind: 'msg', peer: peerId, name: name).encode(),
@@ -276,6 +291,36 @@ class NotifyService {
   Future<void> cancelChat(String peerId) {
     if (!_ready) return Future.value();
     return _plugin.cancel(id: notificationId('msg', peerId));
+  }
+
+  Future<void> showGroup({
+    required String groupId,
+    required String groupName,
+    required String senderName,
+    String? event,
+  }) async {
+    if (!_ready) return;
+    if (!_newEvent('group', event)) return;
+    await _plugin.show(
+      id: notificationId('group', groupId),
+      title: groupName,
+      body: '$senderName: New message',
+      notificationDetails: const NotificationDetails(
+        android: AndroidNotificationDetails(
+          groupsChannel,
+          'Group messages',
+          importance: Importance.max,
+          priority: Priority.high,
+          category: AndroidNotificationCategory.message,
+        ),
+      ),
+      payload: NotifyTap(kind: 'group', peer: groupId, name: groupName).encode(),
+    );
+  }
+
+  Future<void> cancelGroup(String groupId) {
+    if (!_ready) return Future.value();
+    return _plugin.cancel(id: notificationId('group', groupId));
   }
 
   /// Best-effort poke after a user-visible send so a killed/background peer
