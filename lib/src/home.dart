@@ -1231,6 +1231,15 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
           mainAxisSize: MainAxisSize.min,
           children: [
             ListTile(
+              leading: const Icon(Icons.mark_as_unread_sharp),
+              title: Text(
+                chat.unread > 0 || chat.markedUnread
+                    ? 'Mark as read'
+                    : 'Mark as unread',
+              ),
+              onTap: () => Navigator.pop(ctx, 'unread'),
+            ),
+            ListTile(
               leading: Icon(
                 chat.pinned ? Icons.push_pin : Icons.push_pin_outlined,
               ),
@@ -1288,6 +1297,12 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
     if (action == null || !mounted) return;
     final store = widget.store;
     switch (action) {
+      case 'unread':
+        if (chat.unread > 0 || chat.markedUnread) {
+          await store.markRead(chat);
+          break;
+        }
+        await store.setMarkedUnread(chat.id, true);
       case 'pin':
         await store.setPinned(chat.id, !chat.pinned);
       case 'favourite':
@@ -1399,7 +1414,9 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
             return false;
           }
           if (c.archived) return false;
-          if (filter == 'unread' && c.unread == 0) return false;
+          if (filter == 'unread' && c.unread == 0 && !c.markedUnread) {
+            return false;
+          }
           if (filter == 'favourites' && !c.favourite) return false;
           if (filter == 'groups') return false;
           if (c.locked && !lockRevealed) return false;
@@ -1954,6 +1971,15 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
                                               fontSize: 11,
                                               color: Colors.white,
                                             ),
+                                          ),
+                                        )
+                                      else if (chat.markedUnread)
+                                        const Padding(
+                                          padding: EdgeInsets.only(right: 4),
+                                          child: Icon(
+                                            Icons.fiber_manual_record,
+                                            size: 12,
+                                            color: Color(0xFF245CDB),
                                           ),
                                         ),
                                     ],

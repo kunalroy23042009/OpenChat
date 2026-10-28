@@ -156,12 +156,18 @@ class Conversation {
     this.pinned = false,
     this.favourite = false,
     this.locked = false,
+    this.markedUnread = false,
   });
   final String id;
   final String name;
   final int color;
   final List<ChatMessage> messages;
   int unread;
+
+  /// WhatsApp-style visual reminder: a dot without a count on a chat the
+  /// user deliberately flagged as needing another look. Cleared by
+  /// [ChatStore.markRead].
+  bool markedUnread;
   bool muted;
 
   /// Epoch millis when a timed mute ends. Null = muted indefinitely
@@ -206,6 +212,7 @@ class Conversation {
     'pinned': pinned,
     'favourite': favourite,
     'locked': locked,
+    'markedUnread': markedUnread,
     'messages': messages.map((m) => m.toJson()).toList(),
   };
   factory Conversation.fromJson(Map<String, dynamic> json) => Conversation(
@@ -222,6 +229,7 @@ class Conversation {
     pinned: json['pinned'] as bool? ?? false,
     favourite: json['favourite'] as bool? ?? false,
     locked: json['locked'] as bool? ?? false,
+    markedUnread: json['markedUnread'] as bool? ?? false,
     messages: (json['messages'] as List)
         .map((m) => ChatMessage.fromJson(Map<String, dynamic>.from(m as Map)))
         .toList(),
@@ -428,6 +436,7 @@ class ChatStore extends ChangeNotifier {
       pinned: current.pinned,
       favourite: current.favourite,
       locked: current.locked,
+      markedUnread: current.markedUnread,
     );
     await _save();
   }
@@ -443,8 +452,14 @@ class ChatStore extends ChangeNotifier {
 
   Future<void> markRead(Conversation chat) async {
     chat.unread = 0;
+    chat.markedUnread = false;
     await _save();
   }
+
+  /// WhatsApp-style flag: keeps a dot (no count) on the chat list until
+  /// the chat is opened or the flag is cleared.
+  Future<void> setMarkedUnread(String id, bool value) =>
+      _setFlag(id, (c) => c.markedUnread = value);
 
   Future<void> toggleMute(Conversation chat) async {
     if (chat.isMutedNow) {
@@ -543,6 +558,7 @@ class ChatStore extends ChangeNotifier {
           pinned: current.pinned,
           favourite: current.favourite,
           locked: current.locked,
+          markedUnread: current.markedUnread,
         );
       } else {
         await _ensureSecureConversation(accountId, peerId);
@@ -565,6 +581,7 @@ class ChatStore extends ChangeNotifier {
             pinned: conversations[newIdx].pinned,
             favourite: conversations[newIdx].favourite,
             locked: conversations[newIdx].locked,
+            markedUnread: conversations[newIdx].markedUnread,
           );
         }
       }

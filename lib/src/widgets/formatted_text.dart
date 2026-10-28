@@ -1,4 +1,6 @@
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 /// Renders WhatsApp-style rich text formatting inline within chat bubbles.
 ///
@@ -10,7 +12,7 @@ import 'package:flutter/material.dart';
 /// - > quote → blockquote
 /// - - item → bullet list
 /// - 1. item → numbered list
-class FormattedText extends StatelessWidget {
+class FormattedText extends StatefulWidget {
   const FormattedText({
     super.key,
     required this.text,
@@ -23,16 +25,53 @@ class FormattedText extends StatelessWidget {
   final Color? linkColor;
 
   @override
+  State<FormattedText> createState() => _FormattedTextState();
+}
+
+/// Owns the tap recognizers created for URL spans of one build pass.
+/// Recognizers attach to painted spans only after the frame exists, so
+/// disposal is deferred a full frame past the replacement build.
+class _LinkManager {
+  final _created = <TapGestureRecognizer>[];
+
+  TapGestureRecognizer forUrl(String url, void Function(String) open) {
+    final recognizer = TapGestureRecognizer()..onTap = () => open(url);
+    _created.add(recognizer);
+    return recognizer;
+  }
+
+  void dispose() {
+    for (final recognizer in _created) {
+      recognizer.dispose();
+    }
+    _created.clear();
+  }
+}
+
+class _FormattedTextState extends State<FormattedText> {
+  _LinkManager? _links;
+
+  void _disposeLinks() {
+    final old = _links;
+    _links = null;
+    if (old == null) return;
+    // The old spans are painted during this frame; release them next frame.
+    WidgetsBinding.instance.addPostFrameCallback((_) => old.dispose());
+  }
+
+  @override
   Widget build(BuildContext context) {
+    _disposeLinks();
+    final links = _links ??= _LinkManager();
     final isDark = Theme.of(context).brightness == Brightness.dark;
-    final base = baseStyle ??
+    final base = widget.baseStyle ??
         TextStyle(
           fontSize: 15,
           color: isDark ? Colors.white : const Color(0xFF111B21),
           height: 1.35,
         );
 
-    final lines = text.split('\n');
+    final lines = widget.text.split('\n');
     final widgets = <Widget>[];
     final buffer = <String>[];
 
@@ -40,7 +79,14 @@ class FormattedText extends StatelessWidget {
       if (buffer.isEmpty) return;
       widgets.add(
         Text.rich(
-          TextSpan(children: _parseInline(buffer.join('\n'), base, linkColor)),
+          TextSpan(
+            children: _parseInline(
+              buffer.join('\n'),
+              base,
+              widget.linkColor,
+              links,
+            ),
+          ),
           softWrap: true,
         ),
       );
@@ -51,7 +97,14 @@ class FormattedText extends StatelessWidget {
       // Block quote
       if (line.startsWith('> ')) {
         flushBuffer();
-        widgets.add(_QuoteLine(text: line.substring(2), base: base, linkColor: linkColor));
+        widgets.add(
+          _QuoteLine(
+            text: line.substring(2),
+            base: base,
+            linkColor: widget.linkColor,
+            links: links,
+          ),
+        );
         continue;
       }
 
@@ -63,7 +116,14 @@ class FormattedText extends StatelessWidget {
           continue;
         }
         flushBuffer();
-        widgets.add(_BulletLine(text: line.substring(2), base: base, linkColor: linkColor));
+        widgets.add(
+          _BulletLine(
+            text: line.substring(2),
+            base: base,
+            linkColor: widget.linkColor,
+            links: links,
+          ),
+        );
         continue;
       }
 
@@ -76,7 +136,8 @@ class FormattedText extends StatelessWidget {
             number: numMatch.group(1)!,
             text: numMatch.group(2)!,
             base: base,
-            linkColor: linkColor,
+            linkColor: widget.linkColor,
+            links: links,
           ),
         );
         continue;
@@ -106,10 +167,28 @@ class FormattedText extends StatelessWidget {
       ],
     );
   }
+
+  @override
+  void dispose() {
+    _disposeLinks();
+    super.dispose();
+  }
+}
+
+void _openLink(String url) {
+  final uri = Uri.tryParse(url.trim());
+  if (uri == null) return;
+  launchUrl(uri, mode: LaunchMode.externalApplication).catchError((_) => false);
 }
 
 /// Parses inline formatting: *bold*, _italic_, ~strikethrough~, `code`.
-List<InlineSpan> _parseInline(String text, TextStyle base, Color? linkColor) {
+/// URLs become tappable spans; recognizers are owned by [links].
+List<InlineSpan> _parseInline(
+  String text,
+  TextStyle base,
+  Color? linkColor,
+  _LinkManager links,
+) {
   final spans = <InlineSpan>[];
   final regex = RegExp(
     r'(\*(.+?)\*)'     // *bold*
@@ -157,13 +236,14 @@ List<InlineSpan> _parseInline(String text, TextStyle base, Color? linkColor) {
         ),
       ));
     } else if (match.group(9) != null) {
-      // URL link
+      // URL link: WhatsApp-style teal + tap to open externally.
       spans.add(TextSpan(
         text: match.group(9),
         style: base.copyWith(
           color: linkColor ?? const Color(0xFF34B7F1),
           decoration: TextDecoration.underline,
         ),
+        recognizer: links.forUrl(match.group(9)!, _openLink),
       ));
     }
 
@@ -183,10 +263,16 @@ List<InlineSpan> _parseInline(String text, TextStyle base, Color? linkColor) {
 }
 
 class _QuoteLine extends StatelessWidget {
-  const _QuoteLine({required this.text, required this.base, this.linkColor});
+  const _QuoteLine({
+    required this.text,
+    required this.base,
+    this.linkColor,
+    required this.links,
+  });
   final String text;
   final TextStyle base;
   final Color? linkColor;
+  final _LinkManager links;
 
   @override
   Widget build(BuildContext context) {
@@ -214,6 +300,7 @@ class _QuoteLine extends StatelessWidget {
               color: base.color?.withValues(alpha: 0.8),
             ),
             linkColor,
+            links,
           ),
         ),
       ),
@@ -222,10 +309,16 @@ class _QuoteLine extends StatelessWidget {
 }
 
 class _BulletLine extends StatelessWidget {
-  const _BulletLine({required this.text, required this.base, this.linkColor});
+  const _BulletLine({
+    required this.text,
+    required this.base,
+    this.linkColor,
+    required this.links,
+  });
   final String text;
   final TextStyle base;
   final Color? linkColor;
+  final _LinkManager links;
 
   @override
   Widget build(BuildContext context) => Padding(
@@ -237,7 +330,9 @@ class _BulletLine extends StatelessWidget {
             Text('• ', style: base.copyWith(fontWeight: FontWeight.bold)),
             Flexible(
               child: Text.rich(
-                TextSpan(children: _parseInline(text, base, linkColor)),
+                TextSpan(
+                  children: _parseInline(text, base, linkColor, links),
+                ),
               ),
             ),
           ],
@@ -251,11 +346,13 @@ class _NumberedLine extends StatelessWidget {
     required this.text,
     required this.base,
     this.linkColor,
+    required this.links,
   });
   final String number;
   final String text;
   final TextStyle base;
   final Color? linkColor;
+  final _LinkManager links;
 
   @override
   Widget build(BuildContext context) => Padding(
@@ -267,7 +364,9 @@ class _NumberedLine extends StatelessWidget {
             Text('$number. ', style: base.copyWith(fontWeight: FontWeight.w600)),
             Flexible(
               child: Text.rich(
-                TextSpan(children: _parseInline(text, base, linkColor)),
+                TextSpan(
+                  children: _parseInline(text, base, linkColor, links),
+                ),
               ),
             ),
           ],

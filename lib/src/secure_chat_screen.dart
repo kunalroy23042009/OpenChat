@@ -895,7 +895,16 @@ class _SecureChatScreenState extends State<SecureChatScreen>
     }
     _reading = true;
     try {
-      await widget.client.rpc('mark_messages_read', params: {'p_ids': ids});
+      // Read receipts are shared only with the user's consent; the local
+      // read marker (server-side) always advances so unread badges clear
+      // even when receipts stay private.
+      final shareReceipts = widget.store.preferences
+              .getBool('openchat.privacy.readReceipts') ??
+          true;
+      await widget.client.rpc('mark_messages_read', params: {
+        'p_ids': ids,
+        'p_share_receipts': shareReceipts,
+      });
       _reportedReadIds.addAll(ids);
     } catch (_) {
       // Retry after connectivity resumes. Never infer a read from a fetch.

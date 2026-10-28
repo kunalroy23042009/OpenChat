@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:emoji_picker_flutter/emoji_picker_flutter.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
@@ -738,6 +739,39 @@ class _GroupChatScreenState extends State<GroupChatScreen>
       _editingMessage = null;
       _textController.clear();
     });
+  }
+
+  /// Full emoji keyboard for the group composer, WhatsApp-style: inserts
+  /// the chosen emoji at the cursor without disturbing @-mention text.
+  Future<void> _insertEmoji() async {
+    final emoji = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (ctx) => SafeArea(
+        child: SizedBox(
+          height: MediaQuery.of(ctx).size.height * 0.55,
+          child: EmojiPicker(
+            onEmojiSelected: (category, e) => Navigator.pop(ctx, e.emoji),
+            config: const Config(
+              categoryViewConfig: CategoryViewConfig(
+                initCategory: Category.SMILEYS,
+                recentTabBehavior: RecentTabBehavior.NONE,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    if (emoji == null || emoji.isEmpty || !mounted) return;
+    final selection = _textController.selection;
+    final text = _textController.text;
+    final offset = selection.baseOffset.clamp(0, text.length);
+    _textController.text =
+        '${text.substring(0, offset)}$emoji${text.substring(offset)}';
+    _textController.selection = TextSelection.collapsed(
+      offset: offset + emoji.length,
+    );
   }
 
   void _showToast(String msg) {
@@ -2542,7 +2576,7 @@ class _GroupChatScreenState extends State<GroupChatScreen>
                     IconButton(
                       icon: const Icon(Icons.emoji_emotions_outlined),
                       color: Colors.grey[600],
-                      onPressed: () => _showToast('Emoji picker'),
+                      onPressed: _insertEmoji,
                     ),
                     Expanded(
                       child: CompositedTransformTarget(
