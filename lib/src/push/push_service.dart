@@ -45,6 +45,7 @@ Future<void> renderPushMessage(
           event: data['event'] as String?,
           ignoreOpenChats: background,
         );
+        return;
       case 'call':
         final invite = data['invite'] as String? ?? '';
         if (invite.isEmpty) return;
@@ -53,6 +54,7 @@ Future<void> renderPushMessage(
           name: _orContact(data['name'] as String?),
           video: data['video'] == 'true',
         );
+        return;
       case 'status':
         final author = data['peer'] as String? ?? '';
         if (author.isEmpty) return;
@@ -62,6 +64,7 @@ Future<void> renderPushMessage(
           snippet: data['snippet'] as String? ?? '',
           event: data['event'] as String?,
         );
+        return;
       case 'group':
         final groupId = data['peer'] as String? ?? '';
         if (groupId.isEmpty) return;
@@ -70,7 +73,18 @@ Future<void> renderPushMessage(
           groupName: _orContact(data['name'] as String?),
           senderName: _orContact(data['sender'] as String?),
           event: data['event'] as String?,
+          ignoreOpenGroups: background,
         );
+        return;
+      case 'missed_call':
+        final invite = data['invite'] as String? ?? '';
+        if (invite.isEmpty) return;
+        await NotifyService.instance.showMissedCall(
+          inviteId: invite,
+          name: _orContact(data['name'] as String?),
+          video: data['video'] == 'true',
+        );
+        return;
     }
   } catch (_) {
     // A failed background render must never crash the isolate.
@@ -91,6 +105,7 @@ class PushService {
   final FirebaseMessaging? _messaging;
   StreamSubscription<String>? _refreshSubscription;
   StreamSubscription<RemoteMessage>? _foregroundSubscription;
+  Timer? _tokenValidationTimer;
   PushState state = PushState.disabled;
   String? lastError;
   Future<PushState>? _initFuture;
@@ -116,12 +131,13 @@ class PushService {
       debugPrint('PushService: Firebase initialized');
       final messaging = _messaging ?? FirebaseMessaging.instance;
       final settings = await messaging.requestPermission();
-      debugPrint('PushService: permission status=\${settings.authorizationStatus}');
+      debugPrint(
+        'PushService: permission status=\${settings.authorizationStatus}',
+      );
       if (settings.authorizationStatus == AuthorizationStatus.denied) {
         state = PushState.denied;
         return state;
       }
-      FirebaseMessaging.onBackgroundMessage(pushBackgroundHandler);
       debugPrint('PushService: calling NotifyService.init()');
       await NotifyService.instance.init();
       debugPrint('PushService: NotifyService.init() done');
@@ -141,10 +157,25 @@ class PushService {
           await _upload(messaging, client!);
         }
       });
+      // Daily token validation: re-upload to catch silent FCM rotation or server-side deletion.
+      _tokenValidationTimer?.cancel();
+      _tokenValidationTimer = Timer.periodic(const Duration(hours: 24), (
+        _,
+      ) async {
+        final current = client?.auth.currentUser?.id;
+        if (current != null) {
+          try {
+            await _upload(messaging, client!);
+          } catch (_) {
+            // Silent; will retry next cycle.
+          }
+        }
+      });
       state = PushState.ready;
       debugPrint('PushService: ready');
     } catch (_) {
-      lastError = 'Notification initialization failed. Try again from Settings.';
+      lastError =
+          'Notification initialization failed. Try again from Settings.';
       state = PushState.disabled;
     }
     return state;
@@ -187,8 +218,7 @@ class PushService {
   Future<void> unregister(SupabaseClient client) async {
     if (kIsWeb) return;
     try {
-      final token = await (_messaging ?? FirebaseMessaging.instance)
-          .getToken();
+      final token = await (_messaging ?? FirebaseMessaging.instance).getToken();
       if (token == null || token.isEmpty) return;
       await client.rpc('unregister_push_token', params: {'p_token': token});
     } catch (_) {}
@@ -197,5 +227,6 @@ class PushService {
   Future<void> dispose() async {
     await _refreshSubscription?.cancel();
     await _foregroundSubscription?.cancel();
+    _tokenValidationTimer?.cancel();
   }
 }

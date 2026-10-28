@@ -83,5 +83,10 @@
 		</array>
 		<key>UIStatusBarHidden</key>
 		<false/>
+		<key>UIBackgroundModes</key>
+		<array>
+			<string>voip</string>
+			<string>remote-notification</string>
+		</array>
 	</dict>
 </plist>

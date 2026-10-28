@@ -108,7 +108,7 @@ serve(async (req) => {
     return json({ error: "Invalid request." }, 400);
   }
   const kind = body.kind;
-  if (kind !== "message" && kind !== "call" && kind !== "status" && kind !== "group") {
+  if (kind !== "message" && kind !== "call" && kind !== "missed_call" && kind !== "status" && kind !== "group") {
     return json({ error: "Invalid kind." }, 400);
   }
 
@@ -169,7 +169,7 @@ serve(async (req) => {
       Date.parse(m.joined_at) <= Date.parse(eventRow.created_at) &&
       !(m.is_muted && (!m.muted_until || Date.parse(m.muted_until) > Date.now())))
       .map((m) => m.user_id);
-  } else if (kind === "message" || kind === "call") {
+  } else if (kind === "message" || kind === "call" || kind === "missed_call") {
     const peer = typeof body.peer === "string" ? body.peer : "";
     if (!/^[0-9a-f-]{36}$/.test(peer) || peer === me) {
       return json({ error: "Invalid peer." }, 400);
@@ -181,6 +181,18 @@ serve(async (req) => {
         .eq('id', body.invite).eq('caller_id', me).eq('callee_id', peer).eq('status', 'ringing')
         .gt('created_at', new Date(Date.now() - 60000).toISOString())
         .gt('expires_at', new Date().toISOString()).maybeSingle();
+      if (!invite) return json({ delivered: 0 });
+      eventId = invite.id;
+      video = invite.call_type === 'video';
+    } else if (kind === 'missed_call') {
+      // The caller's own invite to this peer, no longer ringing, started
+      // recently: a real unanswered call, never a fabricated one.
+      if (typeof body.invite !== 'string' || !/^[0-9a-f-]{36}$/.test(body.invite)) return json({ error: 'Invalid invite.' }, 400);
+      const { data: invite } = await admin.from('call_invites').select('id,call_type,created_at')
+        .eq('id', body.invite).eq('caller_id', me).eq('callee_id', peer)
+        .neq('status', 'ringing')
+        .gt('created_at', new Date(Date.now() - 300000).toISOString())
+        .maybeSingle();
       if (!invite) return json({ delivered: 0 });
       eventId = invite.id;
       video = invite.call_type === 'video';
@@ -225,10 +237,18 @@ serve(async (req) => {
 
   const data: Record<string, string> =
     kind === 'group'
-      ? { kind, peer: me, group: groupId, name: groupName }
+      ? { kind, peer: groupId, name: groupName, sender: myName }
       : kind === "message"
       ? { kind, peer: me, name: myName }
       : kind === "call"
+        ? {
+            kind,
+            peer: me,
+            invite: typeof body.invite === "string" ? body.invite : "",
+            video: video ? "true" : "false",
+            name: myName,
+          }
+        : kind === "missed_call"
         ? {
             kind,
             peer: me,

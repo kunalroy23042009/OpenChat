@@ -11,10 +11,19 @@ import 'voice_note_player.dart';
 /// Holds raw recordings only until send/discard. Permissions are requested
 /// on interaction, never when a chat is opened.
 class VoiceNoteRecorder extends StatefulWidget {
-  const VoiceNoteRecorder({super.key, required this.onRecorded,
+  const VoiceNoteRecorder({
+    super.key,
+    required this.onRecorded,
     this.maxDuration = const Duration(minutes: 2),
-    this.onRecordingStateChanged});
-  final Future<void> Function(File file, Duration duration, List<double> waveform) onRecorded;
+    this.onRecordingStateChanged,
+  });
+  final Future<void> Function(
+    File file,
+    Duration duration,
+    List<double> waveform,
+    String transcript,
+  )
+  onRecorded;
   final Duration maxDuration;
 
   /// Fires true when capture starts, false when it stops/previews/discards,
@@ -24,10 +33,12 @@ class VoiceNoteRecorder extends StatefulWidget {
   State<VoiceNoteRecorder> createState() => _VoiceNoteRecorderState();
 }
 
-class _VoiceNoteRecorderState extends State<VoiceNoteRecorder> with WidgetsBindingObserver {
+class _VoiceNoteRecorderState extends State<VoiceNoteRecorder>
+    with WidgetsBindingObserver {
   final _recorder = AudioRecorder();
   final _clock = Stopwatch();
   final _samples = <double>[];
+  final _transcript = TextEditingController();
   StreamSubscription<Amplitude>? _amplitudes;
   Timer? _timer;
   Future<void>? _starting;
@@ -37,7 +48,10 @@ class _VoiceNoteRecorderState extends State<VoiceNoteRecorder> with WidgetsBindi
   String? _error;
 
   @override
-  void initState() { super.initState(); WidgetsBinding.instance.addObserver(this); }
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
@@ -54,34 +68,67 @@ class _VoiceNoteRecorderState extends State<VoiceNoteRecorder> with WidgetsBindi
   }
 
   Future<void> _begin() async {
-    setState(() { _busy = true; _error = null; });
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
     try {
-      if (!await _recorder.hasPermission()) throw StateError('Allow microphone access to record a voice note.');
+      if (!await _recorder.hasPermission()) {
+        throw StateError('Allow microphone access to record a voice note.');
+      }
       if (!mounted || _cancelled || _released) return;
       final dir = await getTemporaryDirectory();
-      _file = File('${dir.path}/oc-voice-${DateTime.now().microsecondsSinceEpoch}.m4a');
-      await _recorder.start(const RecordConfig(encoder: AudioEncoder.aacLc,
-        bitRate: 64000, sampleRate: 44100, numChannels: 1), path: _file!.path);
-      if (!mounted || _cancelled) { await _recorder.cancel(); return; }
-      _clock..reset()..start();
+      _file = File(
+        '${dir.path}/oc-voice-${DateTime.now().microsecondsSinceEpoch}.m4a',
+      );
+      await _recorder.start(
+        const RecordConfig(
+          encoder: AudioEncoder.aacLc,
+          bitRate: 64000,
+          sampleRate: 44100,
+          numChannels: 1,
+        ),
+        path: _file!.path,
+      );
+      if (!mounted || _cancelled) {
+        await _recorder.cancel();
+        return;
+      }
+      _clock
+        ..reset()
+        ..start();
       _samples.clear();
       _recording = true;
       widget.onRecordingStateChanged?.call(true);
-      _amplitudes = _recorder.onAmplitudeChanged(const Duration(milliseconds: 100)).listen((amplitude) {
-        if (!mounted || !_recording || _paused) return;
-        _samples.add(pow(10, amplitude.current.clamp(-60, 0) / 20).toDouble());
-        setState(() {});
-      });
+      _amplitudes = _recorder
+          .onAmplitudeChanged(const Duration(milliseconds: 100))
+          .listen((amplitude) {
+            if (!mounted || !_recording || _paused) return;
+            _samples.add(
+              pow(10, amplitude.current.clamp(-60, 0) / 20).toDouble(),
+            );
+            setState(() {});
+          });
       _timer = Timer.periodic(const Duration(milliseconds: 200), (_) {
         if (mounted) setState(() {});
-        if (_clock.elapsed >= widget.maxDuration) unawaited(_finish());
+        if (_clock.elapsed >= widget.maxDuration) {
+          unawaited(_finish());
+        }
       });
     } catch (e) {
-      if (mounted) setState(() => _error = e is StateError ? e.message.toString() : 'Could not start recording.');
+      if (mounted) {
+        setState(
+          () => _error = e is StateError
+              ? e.message.toString()
+              : 'Could not start recording.',
+        );
+      }
     } finally {
       _busy = false;
       if (mounted) setState(() {});
-      if (_released && _recording && !_locked) await _finish();
+      if (_released && _recording && !_locked) {
+        await _finish();
+      }
     }
   }
 
@@ -99,7 +146,9 @@ class _VoiceNoteRecorderState extends State<VoiceNoteRecorder> with WidgetsBindi
         _file = null;
         _error = 'Hold a little longer to record a voice note.';
       }
-    } catch (_) { _error = 'Could not finish the recording.'; }
+    } catch (_) {
+      _error = 'Could not finish the recording.';
+    }
     _recording = false;
     _paused = false;
     _locked = false;
@@ -112,10 +161,17 @@ class _VoiceNoteRecorderState extends State<VoiceNoteRecorder> with WidgetsBindi
     if (_busy || !_recording) return;
     setState(() => _busy = true);
     try {
-      if (_paused) { await _recorder.resume(); _clock.start(); }
-      else { await _recorder.pause(); _clock.stop(); }
+      if (_paused) {
+        await _recorder.resume();
+        _clock.start();
+      } else {
+        await _recorder.pause();
+        _clock.stop();
+      }
       _paused = !_paused;
-    } catch (_) { _error = 'Could not change recording state.'; }
+    } catch (_) {
+      _error = 'Could not change recording state.';
+    }
     _busy = false;
     if (mounted) setState(() {});
   }
@@ -136,12 +192,27 @@ class _VoiceNoteRecorderState extends State<VoiceNoteRecorder> with WidgetsBindi
   Future<void> _send() async {
     final file = _file;
     if (file == null || _recording || _sending) return;
-    setState(() { _sending = true; _error = null; });
+    setState(() {
+      _sending = true;
+      _error = null;
+    });
     try {
-      await widget.onRecorded(file, _clock.elapsed, compactWaveform(_samples));
-      if (mounted) Navigator.pop(context);
+      await widget.onRecorded(
+        file,
+        _clock.elapsed,
+        compactWaveform(_samples),
+        _transcript.text.trim(),
+      );
+      if (mounted) {
+        Navigator.pop(context);
+      }
     } catch (_) {
-      if (mounted) setState(() { _sending = false; _error = 'Not sent. Your recording is ready to retry.'; });
+      if (mounted) {
+        setState(() {
+          _sending = false;
+          _error = 'Not sent. Your recording is ready to retry.';
+        });
+      }
     }
   }
 
@@ -151,7 +222,9 @@ class _VoiceNoteRecorderState extends State<VoiceNoteRecorder> with WidgetsBindi
       await _amplitudes?.cancel();
       await _recorder.cancel();
       await _recorder.dispose();
-      if (_file != null && await _file!.exists()) await _file!.delete();
+      if (_file != null && await _file!.exists()) {
+        await _file!.delete();
+      }
     } catch (_) {}
   }
 
@@ -160,6 +233,7 @@ class _VoiceNoteRecorderState extends State<VoiceNoteRecorder> with WidgetsBindi
     _cancelled = true;
     WidgetsBinding.instance.removeObserver(this);
     _timer?.cancel();
+    _transcript.dispose();
     unawaited(_cleanup());
     super.dispose();
   }
@@ -167,38 +241,135 @@ class _VoiceNoteRecorderState extends State<VoiceNoteRecorder> with WidgetsBindi
   @override
   Widget build(BuildContext context) => PopScope(
     canPop: !_sending,
-    child: SafeArea(child: Padding(padding: const EdgeInsets.all(20), child: Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Text(_recording ? (_locked ? 'Hands-free recording' : 'Release to preview • swipe up to lock') : 'Voice note', style: Theme.of(context).textTheme.titleMedium),
-        const SizedBox(height: 12),
-        if (_error != null) Text(_error!, style: TextStyle(color: Theme.of(context).colorScheme.error)),
-        if (_file != null && !_recording && !_busy)
-          VoiceNotePlayer(audioFile: _file!, duration: _clock.elapsed, mine: true, waveform: compactWaveform(_samples)),
-        if (_recording) ...[
-          SizedBox(height: 48, width: double.infinity, child: CustomPaint(painter: VoiceWavePainter(compactWaveform(_samples), Theme.of(context).colorScheme.primary, 1))),
-          Text(voiceTime(_clock.elapsed)),
-          Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-            IconButton(tooltip: _paused ? 'Resume recording' : 'Pause recording', onPressed: _busy ? null : _pause, icon: Icon(_paused ? Icons.play_arrow : Icons.pause)),
-            IconButton(tooltip: 'Stop and preview', onPressed: _busy ? null : _finish, icon: const Icon(Icons.stop)),
-          ]),
-        ],
-        // Keep the gesture recognizer mounted throughout the hold.
-        GestureDetector(
-          onLongPressStart: (_) => _start(),
-          onLongPressMoveUpdate: (d) { if (_recording && d.offsetFromOrigin.dy < -50) setState(() => _locked = true); },
-          onLongPressEnd: (_) { _released = true; if (!_locked) unawaited(_finish()); },
-          onLongPressCancel: () { _released = true; if (_recording && !_locked) unawaited(_discard()); },
-          child: Semantics(label: 'Hold to record voice note', button: true, child: Padding(
-            padding: const EdgeInsets.all(12), child: Icon(_locked ? Icons.lock : Icons.mic, size: 40, color: _recording ? Colors.red : Theme.of(context).colorScheme.primary))),
+    child: SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              _recording
+                  ? (_locked
+                        ? 'Hands-free recording'
+                        : 'Release to preview • swipe up to lock')
+                  : 'Voice note',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            const SizedBox(height: 12),
+            if (_error != null)
+              Text(
+                _error!,
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
+            if (_file != null && !_recording && !_busy) ...[
+              VoiceNotePlayer(
+                audioFile: _file!,
+                duration: _clock.elapsed,
+                mine: true,
+                waveform: compactWaveform(_samples),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: _transcript,
+                enabled: !_sending,
+                maxLength: 4000,
+                minLines: 1,
+                maxLines: 4,
+                textCapitalization: TextCapitalization.sentences,
+                decoration: const InputDecoration(
+                  labelText: 'Transcript (optional)',
+                  hintText: 'Add text for accessibility and search',
+                  helperText:
+                      'This text is sent inside the encrypted voice note.',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+            ],
+            if (_recording) ...[
+              SizedBox(
+                height: 48,
+                width: double.infinity,
+                child: CustomPaint(
+                  painter: VoiceWavePainter(
+                    compactWaveform(_samples),
+                    Theme.of(context).colorScheme.primary,
+                    1,
+                  ),
+                ),
+              ),
+              Text(voiceTime(_clock.elapsed)),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  IconButton(
+                    tooltip: _paused ? 'Resume recording' : 'Pause recording',
+                    onPressed: _busy ? null : _pause,
+                    icon: Icon(_paused ? Icons.play_arrow : Icons.pause),
+                  ),
+                  IconButton(
+                    tooltip: 'Stop and preview',
+                    onPressed: _busy ? null : _finish,
+                    icon: const Icon(Icons.stop),
+                  ),
+                ],
+              ),
+            ],
+            // Keep the gesture recognizer mounted throughout the hold.
+            GestureDetector(
+              onLongPressStart: (_) => _start(),
+              onLongPressMoveUpdate: (d) {
+                if (_recording && d.offsetFromOrigin.dy < -50) {
+                  setState(() => _locked = true);
+                }
+              },
+              onLongPressEnd: (_) {
+                _released = true;
+                if (!_locked) {
+                  unawaited(_finish());
+                }
+              },
+              onLongPressCancel: () {
+                _released = true;
+                if (_recording && !_locked) {
+                  unawaited(_discard());
+                }
+              },
+              child: Semantics(
+                label: 'Hold to record voice note',
+                button: true,
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Icon(
+                    _locked ? Icons.lock : Icons.mic,
+                    size: 40,
+                    color: _recording
+                        ? Colors.red
+                        : Theme.of(context).colorScheme.primary,
+                  ),
+                ),
+              ),
+            ),
+            if (_file == null && !_busy)
+              const Text('Hold the microphone to record (up to 2 minutes).'),
+            if (_busy || _sending) const LinearProgressIndicator(),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                TextButton(
+                  onPressed: _sending ? null : _discard,
+                  child: const Text('Discard'),
+                ),
+                FilledButton(
+                  onPressed: _file != null && !_recording && !_busy && !_sending
+                      ? _send
+                      : null,
+                  child: const Text('Send'),
+                ),
+              ],
+            ),
+          ],
         ),
-        if (_file == null && !_busy) const Text('Hold the microphone to record (up to 2 minutes).'),
-        if (_busy || _sending) const LinearProgressIndicator(),
-        Row(mainAxisAlignment: MainAxisAlignment.end, children: [
-          TextButton(onPressed: _sending ? null : _discard, child: const Text('Discard')),
-          FilledButton(onPressed: _file != null && !_recording && !_busy && !_sending ? _send : null, child: const Text('Send')),
-        ]),
-      ],
-    ))),
+      ),
+    ),
   );
 }

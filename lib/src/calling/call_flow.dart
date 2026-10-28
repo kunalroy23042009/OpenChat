@@ -157,6 +157,19 @@ Future<void> startOutgoingCall(
     } catch (_) {}
     await service.hangUp();
     await logOnce(outcome);
+    // Never answered: push the missed-call notification to the callee
+    // straight from here. notify-send re-verifies the invite server-side.
+    if (outcome == 'failed') {
+      unawaited(
+        NotifyService.poke(
+          client,
+          kind: 'missed_call',
+          peer: peerId,
+          invite: inviteId,
+          video: type == CallType.video,
+        ),
+      );
+    }
     service.dispose();
     if (pop) {
       try {

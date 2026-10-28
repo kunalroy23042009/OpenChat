@@ -43,7 +43,7 @@ void main() {
     await tester.enterText(find.widgetWithText(TextField, 'Your name'), 'Sam');
     await tester.tap(find.text('Start chatting'));
     await tester.pumpAndSettle();
-    expect(find.bySemanticsLabel('OpenChat logo'), findsOneWidget);
+    expect(find.bySemanticsLabel('Your profile photo'), findsOneWidget);
     final preferences = await SharedPreferences.getInstance();
     expect(preferences.getBool('openchat.onboarding.v1'), isTrue);
     expect(tester.takeException(), isNull);
@@ -58,7 +58,7 @@ void main() {
     await tester.tap(find.text('Start chatting'));
     await tester.pumpAndSettle();
     expect(find.text('Enter your name to continue.'), findsOneWidget);
-    expect(find.bySemanticsLabel('OpenChat logo'), findsNothing);
+    expect(find.bySemanticsLabel('Your profile photo'), findsNothing);
   });
 
   testWidgets('returning users skip onboarding', (tester) async {
@@ -76,7 +76,7 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
-    expect(find.bySemanticsLabel('OpenChat logo'), findsOneWidget);
+    expect(find.bySemanticsLabel('Your profile photo'), findsOneWidget);
     expect(find.textContaining('Welcome to'), findsNothing);
   });
 }

@@ -63,6 +63,10 @@ void main() {
     expect(profile.avatarPath, isNotNull);
     expect(profile.avatarPath, startsWith(p.join(temp.path, 'avatars')));
     expect(File(profile.avatarPath!).existsSync(), isTrue);
+    expect(
+      profile.preferences.getString('openchat.avatar.sync_state'),
+      'pending_upload',
+    );
 
     final first = profile.avatarPath!;
     await profile.setAvatar(source.path);
@@ -71,6 +75,10 @@ void main() {
     await profile.removeAvatar();
     expect(profile.avatarPath, isNull);
     expect(profile.avatarFile, isNull);
+    expect(
+      profile.preferences.getString('openchat.avatar.sync_state'),
+      'pending_remove',
+    );
   });
 
   test('missing avatar file resets to no photo', () async {

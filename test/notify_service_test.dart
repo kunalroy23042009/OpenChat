@@ -9,12 +9,14 @@ class ShownNotification {
     this.body,
     this.channelId,
     this.payload,
+    this.actions,
   });
   final int id;
   final String? title;
   final String? body;
   final String? channelId;
   final String? payload;
+  final List<AndroidNotificationAction>? actions;
 }
 
 /// Fake Android implementation: records renders without touching any
@@ -46,6 +48,7 @@ class FakeNotifications extends AndroidFlutterLocalNotificationsPlugin {
         body: body,
         channelId: notificationDetails?.channelId,
         payload: payload,
+        actions: notificationDetails?.actions,
       ),
     );
   }
@@ -93,6 +96,14 @@ void main() {
     expect(NotifyTap.decode('not json'), isNull);
     expect(NotifyTap.decode('{"kind":"nuke","peer":"x"}'), isNull);
     expect(NotifyTap.decode('{"kind":"msg"}'), isNull);
+    final group = NotifyTap.decode(
+      const NotifyTap(
+        kind: 'group',
+        peer: 'group-1',
+        name: 'Study group',
+      ).encode(),
+    )!;
+    expect((group.kind, group.peer), ('group', 'group-1'));
   });
 
   test('routing decision suppresses open chats and self echoes', () {
@@ -136,8 +147,10 @@ void main() {
       fake.channels,
       containsAll([
         NotifyService.messagesChannel,
+        NotifyService.silentMessagesChannel,
         NotifyService.callsChannel,
         NotifyService.statusChannel,
+        NotifyService.groupsChannel,
       ]),
     );
     await NotifyService.instance.showMessage(peerId: 'peer-1', name: 'Alice');
@@ -151,9 +164,21 @@ void main() {
       name: 'Cara',
       snippet: 'Hello world',
     );
-    expect(fake.shown, hasLength(3));
+    await NotifyService.instance.showMessage(
+      peerId: 'peer-silent',
+      name: 'Dora',
+      silent: true,
+    );
+    await NotifyService.instance.showGroup(
+      groupId: 'group-1',
+      groupName: 'Study group',
+      senderName: 'Eli',
+    );
+    expect(fake.shown, hasLength(5));
 
     final message = fake.shown[0];
+    expect(message.actions!.single.id, 'reply');
+    expect(message.actions!.single.showsUserInterface, isTrue);
     expect(message.channelId, NotifyService.messagesChannel);
     expect(message.title, 'Alice');
     final messageTap = NotifyTap.decode(message.payload)!;
@@ -167,6 +192,12 @@ void main() {
     expect(status.channelId, NotifyService.statusChannel);
     expect(status.title, contains('Cara'));
     expect(status.body, 'Hello world');
+
+    final silent = fake.shown[3];
+    expect(silent.channelId, NotifyService.silentMessagesChannel);
+    final group = fake.shown[4];
+    expect(group.channelId, NotifyService.groupsChannel);
+    expect(NotifyTap.decode(group.payload)?.peer, 'group-1');
   });
 
   test('open chats suppress their own notifications', () async {
@@ -178,4 +209,59 @@ void main() {
     await NotifyService.instance.showMessage(peerId: 'peer-1', name: 'Alice');
     expect(fake.shown, hasLength(1));
   });
+
+  test(
+    'reply uses the platform action id rather than payload instructions',
+    () {
+      const payload =
+          '{"kind":"msg","peer":"alice","name":"Alice","action":"reply"}';
+      expect(NotifyTap.decode(payload)!.action, isNull);
+      final reply = NotifyTap.fromResponse(
+        const NotificationResponse(
+          notificationResponseType:
+              NotificationResponseType.selectedNotificationAction,
+          payload: payload,
+          actionId: 'reply',
+        ),
+      );
+      expect(reply!.action, 'reply');
+      expect(reply.peer, 'alice');
+      expect(
+        NotifyTap.decode(
+          const NotifyTap(
+            kind: 'missed_call',
+            peer: 'call',
+            name: 'Alice',
+          ).encode(),
+        )!.kind,
+        'missed_call',
+      );
+    },
+  );
+
+  test(
+    'visible groups suppress alerts without consuming event deduplication',
+    () async {
+      final service = NotifyService.instance;
+      await service.init();
+      service.openGroups.add('visible');
+      await service.showGroup(
+        groupId: 'visible',
+        groupName: 'Group',
+        senderName: 'Alice',
+        event: 'event-1',
+      );
+      expect(fake.shown, isEmpty);
+      service.openGroups.remove('visible');
+      await service.showGroup(
+        groupId: 'visible',
+        groupName: 'Group',
+        senderName: 'Alice',
+        event: 'event-1',
+      );
+      expect(fake.shown, hasLength(1));
+      await service.cancelGroup('visible');
+      expect(fake.shown, isEmpty);
+    },
+  );
 }

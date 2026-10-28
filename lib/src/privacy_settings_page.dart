@@ -4,6 +4,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'chat_lock.dart';
+import 'contacts_repository.dart';
+import 'privacy_audience_dialog.dart';
+import 'two_factor_screen.dart';
 
 class PrivacySettingsPage extends StatefulWidget {
   const PrivacySettingsPage({
@@ -25,8 +28,9 @@ class _PrivacySettingsPageState extends State<PrivacySettingsPage> {
   bool appLock = false;
   String lastSeen = 'contacts';
   String photoPrivacy = 'contacts';
+  String aboutPrivacy = 'contacts';
   String statusPrivacy = 'contacts';
-  int disappearingSeconds = 604800;
+  int disappearingSeconds = 0;
   String focusMessage = 'I am focusing right now and will reply later.';
   List<Map<String, dynamic>> sessions = const [];
   bool loadingSessions = false;
@@ -42,13 +46,16 @@ class _PrivacySettingsPageState extends State<PrivacySettingsPage> {
     lastSeen = widget.preferences.getString('${_prefix}lastSeen') ?? 'contacts';
     photoPrivacy =
         widget.preferences.getString('${_prefix}photoPrivacy') ?? 'contacts';
+    aboutPrivacy =
+        widget.preferences.getString('${_prefix}aboutPrivacy') ?? 'contacts';
     statusPrivacy =
         widget.preferences.getString('${_prefix}statusPrivacy') ?? 'contacts';
     disappearingSeconds =
-        widget.preferences.getInt('${_prefix}disappearing') ?? 604800;
+        widget.preferences.getInt('${_prefix}disappearing') ?? 0;
     focusMessage =
         widget.preferences.getString('${_prefix}focusMessage') ?? focusMessage;
     _loadSessions();
+    _loadCloudPrivacy();
   }
 
   Future<void> _save() async {
@@ -58,6 +65,7 @@ class _PrivacySettingsPageState extends State<PrivacySettingsPage> {
       widget.preferences.setBool('${_prefix}appLock', appLock),
       widget.preferences.setString('${_prefix}lastSeen', lastSeen),
       widget.preferences.setString('${_prefix}photoPrivacy', photoPrivacy),
+      widget.preferences.setString('${_prefix}aboutPrivacy', aboutPrivacy),
       widget.preferences.setString('${_prefix}statusPrivacy', statusPrivacy),
       widget.preferences.setInt('${_prefix}disappearing', disappearingSeconds),
       widget.preferences.setString('${_prefix}focusMessage', focusMessage),
@@ -72,6 +80,7 @@ class _PrivacySettingsPageState extends State<PrivacySettingsPage> {
               'read_receipts': readReceipts,
               'last_seen_privacy': lastSeen,
               'profile_photo_privacy': photoPrivacy,
+              'about_privacy': aboutPrivacy,
               'status_privacy': statusPrivacy,
               'default_disappearing_seconds': disappearingSeconds,
               'focus_mode': focusMode,
@@ -82,6 +91,30 @@ class _PrivacySettingsPageState extends State<PrivacySettingsPage> {
       } catch (_) {
         // Local privacy choices remain effective if the backend is offline.
       }
+    }
+  }
+
+  Future<void> _loadCloudPrivacy() async {
+    final client = widget.client;
+    final userId = client?.auth.currentUser?.id;
+    if (client == null || userId == null) return;
+    try {
+      final row = await client
+          .from('user_preferences')
+          .select(
+            'last_seen_privacy, profile_photo_privacy, about_privacy, status_privacy',
+          )
+          .eq('user_id', userId)
+          .maybeSingle();
+      if (!mounted || row == null) return;
+      setState(() {
+        lastSeen = row['last_seen_privacy'] as String? ?? lastSeen;
+        photoPrivacy = row['profile_photo_privacy'] as String? ?? photoPrivacy;
+        aboutPrivacy = row['about_privacy'] as String? ?? aboutPrivacy;
+        statusPrivacy = row['status_privacy'] as String? ?? statusPrivacy;
+      });
+    } catch (_) {
+      // The local settings remain usable offline and on older backends.
     }
   }
 
@@ -161,11 +194,19 @@ class _PrivacySettingsPageState extends State<PrivacySettingsPage> {
           'Last seen and online',
           lastSeen,
           (value) => lastSeen = value,
+          field: 'last_seen',
         ),
         _privacyChoice(
           'Profile photo',
           photoPrivacy,
           (value) => photoPrivacy = value,
+          field: 'profile_photo',
+        ),
+        _privacyChoice(
+          'About',
+          aboutPrivacy,
+          (value) => aboutPrivacy = value,
+          field: 'about',
         ),
         _privacyChoice(
           'Status audience',
@@ -177,6 +218,7 @@ class _PrivacySettingsPageState extends State<PrivacySettingsPage> {
           leading: const Icon(Icons.timer_outlined),
           title: const Text('Default disappearing timer'),
           subtitle: Text(switch (disappearingSeconds) {
+            0 => 'Off (messages are kept forever)',
             86400 => '24 hours',
             7776000 => '90 days',
             _ => '7 days',
@@ -212,6 +254,21 @@ class _PrivacySettingsPageState extends State<PrivacySettingsPage> {
           trailing: const Icon(Icons.chevron_right),
           onTap: _editSecretCode,
         ),
+        if (widget.client?.auth.currentUser != null)
+          ListTile(
+            leading: const Icon(Icons.security_outlined),
+            title: const Text('Two-factor authentication'),
+            subtitle: const Text(
+              'Add a 6-digit authenticator app code for account recovery.',
+            ),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => Navigator.push(
+              context,
+              MaterialPageRoute<void>(
+                builder: (_) => TwoFactorScreen(client: widget.client!),
+              ),
+            ),
+          ),
         const Divider(height: 32),
         Row(
           children: [
@@ -262,14 +319,15 @@ class _PrivacySettingsPageState extends State<PrivacySettingsPage> {
     String value,
     ValueChanged<String> assign, {
     bool status = false,
+    String? field,
   }) => ListTile(
     title: Text(title),
-    subtitle: Text(value),
+    subtitle: Text(_privacyLabel(value)),
     trailing: const Icon(Icons.chevron_right),
     onTap: () async {
       final options = status
           ? const ['contacts', 'except', 'only']
-          : const ['everyone', 'contacts', 'nobody'];
+          : const ['everyone', 'contacts', 'except', 'only', 'nobody'];
       final selected = await showDialog<String>(
         context: context,
         builder: (context) => SimpleDialog(
@@ -282,7 +340,7 @@ class _PrivacySettingsPageState extends State<PrivacySettingsPage> {
                         ? Icons.radio_button_checked
                         : Icons.radio_button_off,
                   ),
-                  title: Text(option),
+                  title: Text(_privacyLabel(option)),
                   onTap: () => Navigator.pop(context, option),
                 ),
               )
@@ -290,11 +348,72 @@ class _PrivacySettingsPageState extends State<PrivacySettingsPage> {
         ),
       );
       if (selected != null) {
+        if (field != null && (selected == 'except' || selected == 'only')) {
+          final configured = await _chooseAudience(field, title, selected);
+          if (!configured) return;
+        }
         setState(() => assign(selected));
         _save();
       }
     },
   );
+
+  String _privacyLabel(String value) => switch (value) {
+    'everyone' => 'Everyone',
+    'contacts' => 'My contacts',
+    'except' => 'My contacts except...',
+    'only' => 'Only share with...',
+    'nobody' => 'Nobody',
+    _ => value,
+  };
+
+  Future<bool> _chooseAudience(String field, String title, String mode) async {
+    final client = widget.client;
+    if (client?.auth.currentUser == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Sign in to choose specific contacts.')),
+        );
+      }
+      return false;
+    }
+    try {
+      final contacts = (await SupabaseContactsRepository(
+        client!,
+      ).contacts()).where((contact) => contact.status == 'accepted').toList();
+      final saved = await client.rpc(
+        'list_profile_visibility_exceptions',
+        params: {'p_field': field},
+      ) as List;
+      final selected = saved.map((id) => id.toString()).toSet();
+      if (!mounted) return false;
+      final result = await showDialog<Set<String>>(
+        context: context,
+        builder: (context) => AudienceDialog(
+          title: mode == 'except'
+              ? '$title: contacts except'
+              : '$title: only share with',
+          contacts: contacts,
+          selected: selected,
+        ),
+      );
+      if (result == null) return false;
+      await client.rpc(
+        'replace_profile_visibility_exceptions',
+        params: {'p_field': field, 'p_subject_ids': result.toList()},
+      );
+      return true;
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Could not update the selected contacts.'),
+          ),
+        );
+      }
+      return false;
+    }
+  }
 
   Future<void> _editSecretCode() async {
     final current = await ChatLock.secretCode();
@@ -349,7 +468,12 @@ class _PrivacySettingsPageState extends State<PrivacySettingsPage> {
       builder: (context) => SimpleDialog(
         title: const Text('Disappearing messages'),
         children:
-            const {86400: '24 hours', 604800: '7 days', 7776000: '90 days'}
+            const {
+              0: 'Off (default)',
+              86400: '24 hours',
+              604800: '7 days',
+              7776000: '90 days',
+            }
                 .entries
                 .map(
                   (entry) => ListTile(

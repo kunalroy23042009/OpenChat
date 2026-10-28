@@ -26,4 +26,17 @@ void main() {
     });
     expect(contact.avatarUrl, isNull);
   });
+
+  test('contact retains a private avatar path before it is signed', () {
+    final contact = CloudContact.fromJson({
+      'user_id': 'u1',
+      'display_name': 'Ava',
+      'username': 'ava',
+      'avatar_path': 'u1/avatar_1.jpg',
+      'status': 'accepted',
+      'incoming': false,
+    });
+    expect(contact.avatarPath, 'u1/avatar_1.jpg');
+    expect(contact.avatarUrl, isNull);
+  });
 }

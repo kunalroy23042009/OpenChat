@@ -212,6 +212,39 @@ void main() {
     },
   );
 
+  test('expired secure messages are hidden and permanently purged', () async {
+    final store = await secureStore();
+    await store.addSecureMessage(
+      'me',
+      'peer',
+      'keep',
+      mine: true,
+      clientId: 'active',
+    );
+    // Simulate a history row that crossed its expiry while the app was closed.
+    final key = 'openchat.secure.v1.me-peer';
+    final payload =
+        jsonDecode(store.preferences.getString(key)!) as Map<String, dynamic>;
+    (payload['messages'] as List).add(
+      SecureMessage(
+        text: encodeExpiringBody('gone', DateTime.utc(2000)),
+        mine: true,
+        at: DateTime.utc(1999),
+        clientId: 'expired',
+      ).toJson(),
+    );
+    await store.preferences.setString(key, jsonEncode(payload));
+
+    expect(store.getSecureConversation('me', 'peer').map((m) => m.text), [
+      'keep',
+    ]);
+    expect(await store.purgeExpiredSecureMessages('me', 'peer'), 1);
+    final restarted = ChatStore(store.preferences);
+    expect(restarted.getSecureConversation('me', 'peer').map((m) => m.text), [
+      'keep',
+    ]);
+  });
+
   test('deletes outside 60 hours or before the original are ignored', () async {
     final store = await secureStore();
     await store.addSecureMessage(

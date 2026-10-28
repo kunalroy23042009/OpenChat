@@ -4,7 +4,7 @@ begin;
 create table if not exists public.device_notification_dispatches (
   actor_id uuid not null references public.profiles(id) on delete cascade,
   recipient_id uuid not null references public.profiles(id) on delete cascade,
-  kind text not null check (kind in ('message','group','call','status')),
+  kind text not null check (kind in ('message','group','call','status','missed_call')),
   event_id text not null check (length(event_id) between 1 and 100),
   device_hash text not null,
   attempted_at timestamptz not null default now(),

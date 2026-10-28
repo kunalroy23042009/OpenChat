@@ -3,11 +3,16 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:video_player/video_player.dart';
 
-/// Inline playback for a local video status file. Loops silently until the
-/// viewer closes the status.
+/// Inline playback for a status video — a local draft file [path] or a
+/// cloud signed URL [url]. Loops silently until the viewer closes it.
 class VideoStatusView extends StatefulWidget {
-  const VideoStatusView({super.key, required this.path});
-  final String path;
+  const VideoStatusView({super.key, this.path, this.url})
+    : assert(
+        (path == null) != (url == null),
+        'Provide exactly one of path or url',
+      );
+  final String? path;
+  final String? url;
   @override
   State<VideoStatusView> createState() => _VideoStatusViewState();
 }
@@ -18,7 +23,9 @@ class _VideoStatusViewState extends State<VideoStatusView> {
   @override
   void initState() {
     super.initState();
-    final controller = VideoPlayerController.file(File(widget.path));
+    final controller = widget.path != null
+        ? VideoPlayerController.file(File(widget.path!))
+        : VideoPlayerController.networkUrl(Uri.parse(widget.url!));
     controller.setLooping(true);
     controller.initialize().then((_) async {
       if (!mounted) {
@@ -27,6 +34,8 @@ class _VideoStatusViewState extends State<VideoStatusView> {
       }
       setState(() => _controller = controller);
       await controller.play();
+    }).catchError((_) {
+      if (mounted) setState(() => _controller = controller);
     });
   }
 

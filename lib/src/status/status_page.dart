@@ -10,6 +10,8 @@ import 'status_repository.dart';
 import 'video_status_view.dart';
 import '../contacts_repository.dart'
     show CloudContact, SupabaseContactsRepository;
+import '../local_profile.dart';
+import '../ops/error_report.dart';
 import '../push/notify_service.dart';
 import '../security/app_lock.dart';
 
@@ -35,6 +37,7 @@ class StatusItem {
     this.mediaType = 'text',
     this.authorId,
     this.avatarUrl,
+    this.cloudMediaUrl,
   });
 
   final String id;
@@ -47,18 +50,26 @@ class StatusItem {
   final String? authorId;
   final String? avatarUrl;
 
-  /// Local gallery photo attached to this status (this-device demo for now).
+  /// Gallery photo/video attached to this status. Local file for this-device
+  /// drafts, null for cloud statuses (render [cloudMediaUrl] instead).
   final String? imagePath;
 
-  /// 'text', 'image', or 'video'. Cloud text posts sync; media stays local
-  /// until the media pipeline lands for status.
+  /// Signed cloud URL for image/video statuses published to the
+  /// `status-media` bucket (refreshed on each load; signing lasts 1h).
+  final String? cloudMediaUrl;
+
+  /// 'text', 'image', or 'video'. Text and cloud media sync; local drafts
+  /// are uploaded before the status is shared.
   final String mediaType;
 }
 
 class StatusPage extends StatefulWidget {
-  const StatusPage({super.key, this.client});
+  const StatusPage({super.key, this.client, this.profile});
 
   final SupabaseClient? client;
+
+  /// Signed-in profile powering the "My Status" avatar/photo.
+  final LocalProfile? profile;
 
   @override
   State<StatusPage> createState() => _StatusPageState();
@@ -137,7 +148,8 @@ class _StatusPageState extends State<StatusPage> {
     if (client?.auth.currentUser == null) return;
     try {
       final status = CloudStatus.fromJson(record);
-      final contacts = await SupabaseContactsRepository(client!).contacts();
+      final repo = StatusRepository(client!);
+      final contacts = await SupabaseContactsRepository(client).contacts();
       final byId = {for (final c in contacts) c.userId: c};
       final me = client.auth.currentUser!.id;
       final isMe = status.authorId == me;
@@ -147,6 +159,7 @@ class _StatusPageState extends State<StatusPage> {
           : (contact != null && contact.name.isNotEmpty
               ? contact.name
               : 'Contact');
+      final media = await _resolveMedia(repo, status);
       if (!mounted) return;
       setState(() {
         _statuses.removeWhere((s) => s.id == status.id);
@@ -162,10 +175,24 @@ class _StatusPageState extends State<StatusPage> {
             backgroundColor: Color(status.backgroundColor ?? 0xFF245CDB),
             authorId: status.authorId,
             avatarUrl: contact?.avatarUrl,
+            cloudMediaUrl: media.$1,
+            mediaType: media.$2,
           ),
         );
       });
     } catch (_) {}
+  }
+
+  /// Signed URL + rendered media type for a cloud status ('' => non-media).
+  static const (String?, String) _noMedia = (null, 'text');
+
+  Future<(String?, String)> _resolveMedia(
+    StatusRepository repo,
+    CloudStatus status,
+  ) async {
+    final url = await repo.signedMediaUrl(status.mediaUrl);
+    if (url == null) return _noMedia;
+    return (url, status.type == 'video' ? 'video' : 'image');
   }
 
   @override
@@ -178,7 +205,8 @@ class _StatusPageState extends State<StatusPage> {
     final client = widget.client;
     if (client?.auth.currentUser == null) return;
     try {
-      final cloud = await StatusRepository(client!).activeStatuses();
+      final repo = StatusRepository(client!);
+      final cloud = await repo.activeStatuses();
       // Resolve real names/photos through contacts (profiles are
       // self-read-only, so this is the accessible source of truth).
       Map<String, CloudContact> byId = {};
@@ -186,6 +214,13 @@ class _StatusPageState extends State<StatusPage> {
         final contacts = await SupabaseContactsRepository(client).contacts();
         byId = {for (final c in contacts) c.userId: c};
       } catch (_) {}
+      final resolved = <(String, (String?, String))>[];
+      for (final status in cloud) {
+        // Signing is sequential-but-cheap; batch through the awaited list to
+        // keep rows stable.
+        resolved.add((status.id, await _resolveMedia(repo, status)));
+      }
+      final mediaById = {for (final r in resolved) r.$1: r.$2};
       if (!mounted) return;
       final me = client.auth.currentUser!.id;
       setState(() {
@@ -200,6 +235,7 @@ class _StatusPageState extends State<StatusPage> {
                   : (contact != null && contact.name.isNotEmpty
                         ? contact.name
                         : 'Contact');
+              final media = mediaById[status.id] ?? _noMedia;
               return StatusItem(
                 id: status.id,
                 authorName: name,
@@ -210,6 +246,8 @@ class _StatusPageState extends State<StatusPage> {
                 backgroundColor: Color(status.backgroundColor ?? 0xFF245CDB),
                 authorId: status.authorId,
                 avatarUrl: contact?.avatarUrl,
+                cloudMediaUrl: media.$1,
+                mediaType: media.$2,
               );
             }),
           );
@@ -346,7 +384,7 @@ class _StatusPageState extends State<StatusPage> {
             ListTile(
               leading: const Icon(Icons.videocam_outlined),
               title: const Text('Video status'),
-              subtitle: const Text('Up to 3 minutes, stays on this device'),
+              subtitle: const Text('Up to 3 minutes, shared to your audience'),
               onTap: () => Navigator.pop(ctx, 'video'),
             ),
           ],
@@ -449,64 +487,112 @@ class _StatusPageState extends State<StatusPage> {
   }
 
   Future<void> _addPhotoStatus() async {
-    XFile? picked;
-    AppLock.suppressRelockOnce = true;
-    try {
-      picked = await ImagePicker().pickImage(
-        source: ImageSource.gallery,
-        maxWidth: 1600,
-        imageQuality: 85,
-      );
-    } on Exception catch (_) {
-      return;
-    }
-    if (picked == null || !mounted) return;
-    setState(() {
-      _statuses.insert(
-        0,
-        StatusItem(
-          id: DateTime.now().toIso8601String(),
-          authorName: 'My Status',
-          content: 'Photo',
-          timestamp: DateTime.now(),
-          isMe: true,
-          isViewed: true,
-          backgroundColor: const Color(0xFF0F172A),
-          imagePath: picked!.path,
-          mediaType: 'image',
-        ),
-      );
-    });
+    await _pickAndPublishMedia(false);
   }
 
   Future<void> _addVideoStatus() async {
+    await _pickAndPublishMedia(true);
+  }
+
+  /// Picks gallery media, previews it locally at once, then uploads to the
+  /// private `status-media` bucket and publishes the cloud row. A failure
+  /// keeps the local preview and shows why nothing reached contacts.
+  Future<void> _pickAndPublishMedia(bool isVideo) async {
     XFile? picked;
     AppLock.suppressRelockOnce = true;
     try {
-      picked = await ImagePicker().pickVideo(
-        source: ImageSource.gallery,
-        maxDuration: const Duration(minutes: 3),
-      );
+      picked = isVideo
+          ? await ImagePicker().pickVideo(
+              source: ImageSource.gallery,
+              maxDuration: const Duration(minutes: 3),
+            )
+          : await ImagePicker().pickImage(
+              source: ImageSource.gallery,
+              maxWidth: 1600,
+              imageQuality: 85,
+            );
     } on Exception catch (_) {
       return;
     }
     if (picked == null || !mounted) return;
+    final file = File(picked.path);
+    final localId = 'local_${DateTime.now().microsecondsSinceEpoch}';
     setState(() {
       _statuses.insert(
         0,
         StatusItem(
-          id: DateTime.now().toIso8601String(),
+          id: localId,
           authorName: 'My Status',
-          content: 'Video',
+          content: isVideo ? 'Video' : 'Photo',
           timestamp: DateTime.now(),
           isMe: true,
           isViewed: true,
           backgroundColor: const Color(0xFF0F172A),
           imagePath: picked!.path,
-          mediaType: 'video',
+          mediaType: isVideo ? 'video' : 'image',
         ),
       );
     });
+    await _publishMediaToCloud(isVideo: isVideo, file: file, localId: localId);
+  }
+
+  /// Upload + publish attempt for a locally previewed media status. On
+  /// success the local placeholder is replaced by the cloud row; on failure
+  /// it stays and a reason is surfaced.
+  Future<void> _publishMediaToCloud({
+    required bool isVideo,
+    required File file,
+    required String localId,
+  }) async {
+    final client = widget.client;
+    if (client?.auth.currentUser == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Sign in to share this status with your contacts.'),
+          ),
+        );
+      }
+      return;
+    }
+    var audience = 'contacts';
+    List<String> audienceIds = const [];
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      audience = prefs.getString('openchat.privacy.statusPrivacy') ?? 'contacts';
+    } catch (_) {}
+    if (audience == 'only' || audience == 'except') {
+      if (!mounted) return;
+      final picked = await _pickAudience(audience);
+      if (picked == null) return; // cancelled: keep local preview only
+      audienceIds = picked;
+    }
+    try {
+      await StatusRepository(client!).publishMedia(
+        file,
+        isVideo: isVideo,
+        backgroundColor: 0xFF0F172A,
+        audience: audience,
+        audienceUserIds: audienceIds,
+      );
+      if (mounted) {
+        setState(() => _statuses.removeWhere((s) => s.id == localId));
+        await _loadCloudStatuses();
+      }
+      unawaited(NotifyService.poke(client, kind: 'status'));
+    } catch (e) {
+      ErrorReport.reportError('status-media', e, code: 'publish');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Saved on this device, but could not reach the server to share it. '
+              'Check your connection and try again.',
+            ),
+          ),
+        );
+      }
+    }
   }
 
   Future<void> _deleteStatus(BuildContext ctx, StatusItem status) async {
@@ -532,8 +618,22 @@ class _StatusPageState extends State<StatusPage> {
     // items just drop from this device.
     final client = widget.client;
     if (client?.auth.currentUser != null && status.imagePath == null) {
+      final repo = StatusRepository(client!);
       try {
-        await StatusRepository(client!).deleteStatus(status.id);
+        await repo.deleteStatus(status.id);
+      } catch (_) {}
+      // Best-effort cleanup of the bucket object the row pointed at.
+      try {
+        final url = status.cloudMediaUrl ?? '';
+        if (url.contains('status-media/')) {
+          final objectPath = Uri.parse(url).pathSegments
+              .skipWhile((s) => s != 'object')
+              .skip(2) // object + signed prefix
+              .join('/');
+          if (objectPath.isNotEmpty) {
+            await client.storage.from('status-media').remove([objectPath]);
+          }
+        }
       } catch (_) {}
     }
     if (!mounted) return;
@@ -614,52 +714,7 @@ class _StatusPageState extends State<StatusPage> {
                 ),
               ),
               Center(
-                child: status.imagePath != null
-                    ? Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          Flexible(
-                            child: Padding(
-                              padding: const EdgeInsets.all(16),
-                              child: status.mediaType == 'video'
-                                  ? VideoStatusView(path: status.imagePath!)
-                                  : ClipRRect(
-                                      borderRadius: BorderRadius.circular(16),
-                                      child: Image.file(
-                                        File(status.imagePath!),
-                                        fit: BoxFit.contain,
-                                      ),
-                                    ),
-                            ),
-                          ),
-                          if (status.content != 'Photo' &&
-                              status.content != 'Video')
-                            Padding(
-                              padding: const EdgeInsets.all(16),
-                              child: Text(
-                                status.content,
-                                textAlign: TextAlign.center,
-                                style: const TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 20,
-                                  fontWeight: FontWeight.w700,
-                                ),
-                              ),
-                            ),
-                        ],
-                      )
-                    : Padding(
-                        padding: const EdgeInsets.all(32),
-                        child: Text(
-                          status.content,
-                          textAlign: TextAlign.center,
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 28,
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
-                      ),
+                child: _statusMediaBody(status),
               ),
             ],
           ),
@@ -667,6 +722,74 @@ class _StatusPageState extends State<StatusPage> {
       ),
     );
   }
+
+  /// Full-bleed status body: local draft media, cloud media (signed URL),
+  /// or the text-only fallback. Media keeps an optional caption.
+  Widget _statusMediaBody(StatusItem status) {
+    Widget? media;
+    if (status.imagePath != null) {
+      media = status.mediaType == 'video'
+          ? VideoStatusView(path: status.imagePath!)
+          : ClipRRect(
+              borderRadius: BorderRadius.circular(16),
+              child: Image.file(File(status.imagePath!), fit: BoxFit.contain),
+            );
+    } else if (status.cloudMediaUrl != null) {
+      media = status.mediaType == 'video'
+          ? VideoStatusView(url: status.cloudMediaUrl)
+          : ClipRRect(
+              borderRadius: BorderRadius.circular(16),
+              child: Image.network(
+                status.cloudMediaUrl!,
+                fit: BoxFit.contain,
+                errorBuilder: (_, __, ___) => _statusTextBody(status),
+              ),
+            );
+    }
+    if (media == null) return _statusTextBody(status);
+    final placeholderLabel =
+        status.content == 'Photo' || status.content == 'Video';
+    return Container(
+      alignment: Alignment.center,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Flexible(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: media,
+            ),
+          ),
+          if (!placeholderLabel && status.content.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Text(
+                status.content,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 20,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _statusTextBody(StatusItem status) => Padding(
+    padding: const EdgeInsets.all(32),
+    child: Text(
+      status.content,
+      textAlign: TextAlign.center,
+      style: const TextStyle(
+        color: Colors.white,
+        fontSize: 28,
+        fontWeight: FontWeight.w700,
+      ),
+    ),
+  );
 
   Widget _statusAvatar(StatusItem status, double radius) {
     final url = status.avatarUrl;
@@ -696,6 +819,30 @@ class _StatusPageState extends State<StatusPage> {
     );
   }
 
+  /// Own profile photo in the "My Status" row; falls back to a person glyph.
+  Widget _myStatusAvatar(ThemeData theme) {
+    final profile = widget.profile;
+    if (profile == null) {
+      return CircleAvatar(
+        radius: 26,
+        backgroundColor: theme.colorScheme.primary.withValues(alpha: 0.2),
+        child: Icon(Icons.person, color: theme.colorScheme.primary),
+      );
+    }
+    return ListenableBuilder(
+      listenable: profile,
+      builder: (context, _) {
+        final file = profile.avatarFile;
+        return CircleAvatar(
+          radius: 26,
+          backgroundColor: theme.colorScheme.primary.withValues(alpha: 0.2),
+          foregroundImage: file != null ? FileImage(file) : null,
+          child: Icon(Icons.person, color: theme.colorScheme.primary),
+        );
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -720,13 +867,7 @@ class _StatusPageState extends State<StatusPage> {
           ListTile(
             leading: Stack(
               children: [
-                CircleAvatar(
-                  radius: 26,
-                  backgroundColor: theme.colorScheme.primary.withValues(
-                    alpha: 0.2,
-                  ),
-                  child: Icon(Icons.person, color: theme.colorScheme.primary),
-                ),
+                _myStatusAvatar(theme),
                 Positioned(
                   bottom: 0,
                   right: 0,

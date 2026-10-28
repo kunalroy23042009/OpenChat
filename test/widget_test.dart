@@ -44,7 +44,9 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('small phone creates a chat and sends a message', (tester) async {
+  testWidgets('small phone new-chat opens real contacts, not a demo dialog', (
+    tester,
+  ) async {
     tester.view.physicalSize = const Size(320, 700);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.resetPhysicalSize);
@@ -63,19 +65,10 @@ void main() {
     );
     await tester.tap(find.byTooltip('New conversation'));
     await tester.pumpAndSettle();
-    await tester.enterText(
-      find.widgetWithText(TextField, 'Contact name'),
-      'Sam',
-    );
-    await tester.tap(find.text('Create'));
-    await tester.pumpAndSettle();
-    await tester.enterText(
-      find.widgetWithText(TextField, 'Write a message…'),
-      'Hello Sam',
-    );
-    await tester.tap(find.byTooltip('Send message'));
-    await tester.pumpAndSettle();
-    expect(find.text('Hello Sam'), findsOneWidget);
+    // Without a signed-in account the button points at sign-in instead of
+    // fabricating a fictional conversation. Real chats come from contacts.
+    expect(find.text('Sign in to start chatting.'), findsOneWidget);
+    expect(find.text('New demo conversation'), findsNothing);
     expect(tester.takeException(), isNull);
   });
 
@@ -128,7 +121,7 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
-    expect(find.bySemanticsLabel('OpenChat logo'), findsOneWidget);
+    expect(find.bySemanticsLabel('Your profile photo'), findsOneWidget);
     expect(find.textContaining('Good conversations'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });

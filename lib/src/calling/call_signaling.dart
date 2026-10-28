@@ -38,6 +38,15 @@ class CallSignaling {
     required String inviteId,
   }) => client.rpc('end_call', params: {'p_invite_id': inviteId});
 
+  /// Callee side: mark the call invite as delivered (receipt).
+  static Future<void> markDelivered(
+    SupabaseClient client, {
+    required String inviteId,
+  }) => client.rpc(
+    'mark_call_invite_delivered',
+    params: {'p_invite_id': inviteId},
+  );
+
   /// Exchanges the Supabase session for a short-lived LiveKit token.
   /// Throws a human-readable message when calling is not configured.
   static Future<({String url, String token})> token(

@@ -1,4 +1,5 @@
 import 'dart:async';
+
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 /// Manages typing indicators and presence state via Supabase Realtime Presence.
@@ -27,6 +28,8 @@ class TypingPresence {
   RealtimeChannel? _channel;
   Timer? _typingExpiry;
   Timer? _debounce;
+  bool _active = true;
+  bool _subscribed = false;
   bool _isTyping = false;
   bool _isRecording = false;
 
@@ -35,6 +38,7 @@ class TypingPresence {
 
   /// Joins the presence channel for this conversation.
   void join() {
+    if (_channel != null) return;
     final channelName = 'presence:$conversationId';
     _channel = client.channel(channelName);
 
@@ -48,15 +52,10 @@ class TypingPresence {
       ..onPresenceLeave((payload) {
         _syncPresence();
       })
-      ..subscribe((status, [error]) async {
+      ..subscribe((status, [error]) {
+        _subscribed = status == RealtimeSubscribeStatus.subscribed;
         if (status == RealtimeSubscribeStatus.subscribed) {
-          await _channel!.track({
-            'user_id': userId,
-            'display_name': displayName,
-            'status': 'online',
-            'typing': false,
-            'recording': false,
-          });
+          _broadcastState();
         }
       });
   }
@@ -89,6 +88,7 @@ class TypingPresence {
   /// Call on every keystroke in the text input. Automatically debounces and
   /// expires typing status after 3 seconds of inactivity.
   void onKeystroke() {
+    if (!_active) return;
     _debounce?.cancel();
 
     if (!_isTyping) {
@@ -125,14 +125,32 @@ class TypingPresence {
     _broadcastState();
   }
 
-  void _broadcastState() {
-    _channel?.track({
-      'user_id': userId,
-      'display_name': displayName,
-      'status': 'online',
-      'typing': _isTyping,
-      'recording': _isRecording,
-    });
+  void setActive(bool active) {
+    _active = active;
+    if (!active) {
+      _isTyping = false;
+      _isRecording = false;
+      _typingExpiry?.cancel();
+    }
+    _broadcastState();
+  }
+
+  Future<void> _broadcastState() async {
+    final channel = _channel;
+    if (channel == null || !_subscribed) return;
+    try {
+      if (!_active) {
+        await channel.untrack();
+      } else {
+        await channel.track({
+          'user_id': userId,
+          'display_name': displayName,
+          'status': 'online',
+          'typing': _isTyping,
+          'recording': _isRecording,
+        });
+      }
+    } catch (_) {}
   }
 
   /// Builds a human-readable status line from current presence states.
@@ -175,8 +193,10 @@ class TypingPresence {
   void dispose() {
     _typingExpiry?.cancel();
     _debounce?.cancel();
-    _channel?.untrack();
-    _channel?.unsubscribe();
+    final channel = _channel;
+    _channel = null;
+    _subscribed = false;
+    if (channel != null) unawaited(client.removeChannel(channel));
   }
 }
 

@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -12,6 +13,11 @@ import '../chat_preferences.dart';
 import '../security/app_lock.dart';
 import 'media_seal.dart';
 import 'media_message.dart';
+import 'resumable_transfer.dart';
+
+/// Internal defaults from build-time env (set by `flutter build --dart-define`).
+const _defaultSupabaseUrl = String.fromEnvironment('SUPABASE_URL');
+const _defaultSupabaseKey = String.fromEnvironment('SUPABASE_ANON_KEY');
 
 /// Reference to a sealed upload: object path plus base64 key material that
 /// travels inside the Signal-encrypted message.
@@ -49,9 +55,23 @@ class SealedVideo {
 /// AES-256-GCM sealed on-device with a fresh key per file; the server only
 /// ever sees ciphertext, and only the two chat parties can even read that.
 class ChatMedia {
-  ChatMedia(this.client, {this.preferences});
+  ChatMedia(
+    this.client, {
+    this.preferences,
+    String? supabaseUrl,
+    String? supabaseKey,
+  }) {
+    _checkpoints = preferences != null
+        ? TransferCheckpointManager(preferences!)
+        : null;
+    _supabaseUrl = supabaseUrl ?? _defaultSupabaseUrl;
+    _supabaseKey = supabaseKey ?? _defaultSupabaseKey;
+  }
   final SupabaseClient client;
   final SharedPreferences? preferences;
+  late final TransferCheckpointManager? _checkpoints;
+  late final String _supabaseUrl;
+  late final String _supabaseKey;
   static const bucket = 'chat-media';
   static const maxBytes = 10 * 1024 * 1024;
 
@@ -61,6 +81,7 @@ class ChatMedia {
     Uint8List plain,
     String peerId, {
     bool video = false,
+    void Function(double progress)? onProgress,
   }) async {
     final me = client.auth.currentUser?.id;
     if (me == null) throw const AuthException('Sign in to share media.');
@@ -73,7 +94,24 @@ class ChatMedia {
       List<int>.generate(18, (_) => random.nextInt(256)),
     );
     final path = '$me/$peerId/$name.enc';
-    await client.storage.from(bucket).uploadBinary(path, sealed.cipher);
+
+    // Use resumable uploader if checkpoints available
+    if (_checkpoints != null) {
+      final uploader = ResumableUploader(
+        client: client,
+        bucket: bucket,
+        checkpoints: _checkpoints,
+      );
+      await uploader.upload(
+        path,
+        sealed.cipher,
+        onProgress: (p) => onProgress?.call(0.1 + 0.9 * p),
+      );
+    } else {
+      onProgress?.call(0.1);
+      await client.storage.from(bucket).uploadBinary(path, sealed.cipher);
+      onProgress?.call(1.0);
+    }
     return SealedUpload(
       path: path,
       key: base64Encode(sealed.key),
@@ -108,6 +146,7 @@ class ChatMedia {
           key: upload.key,
           nonce: upload.nonce,
           waveform: body.waveform,
+          transcript: body.transcript,
           fwd: true,
         );
       }
@@ -128,6 +167,7 @@ class ChatMedia {
         key: upload.key,
         nonce: upload.nonce,
         durationSec: body.durationSec,
+        videoNote: body.isVideoNote,
         fwd: true,
       );
     }
@@ -149,7 +189,11 @@ class ChatMedia {
 
   /// Seals [file] with a fresh AES-256-GCM key, uploads the ciphertext,
   /// and returns the path plus base64 key material for the message body.
-  Future<SealedUpload> uploadSealed(File file, String peerId) async {
+  Future<SealedUpload> uploadSealed(
+    File file,
+    String peerId, {
+    void Function(double progress)? onProgress,
+  }) async {
     final me = client.auth.currentUser?.id;
     if (me == null) throw const AuthException('Sign in to send images.');
     final bytes = await file.length();
@@ -158,6 +202,7 @@ class ChatMedia {
     }
     final plain = await file.readAsBytes();
     final sealed = await MediaSeal.seal(plain);
+    onProgress?.call(0.1);
     final name =
         '${DateTime.now().microsecondsSinceEpoch}-${file.uri.pathSegments.last}.enc';
     final path = '$me/$peerId/$name';
@@ -168,6 +213,7 @@ class ChatMedia {
           sealed.cipher,
           fileOptions: const FileOptions(upsert: true),
         );
+    onProgress?.call(1.0);
     return SealedUpload(
       path: path,
       key: base64Encode(sealed.key),
@@ -179,39 +225,164 @@ class ChatMedia {
   Future<Uint8List> downloadSealed(
     String path,
     String keyB64,
-    String nonceB64,
-  ) async {
+    String nonceB64, {
+    void Function(double progress)? onProgress,
+  }) async {
+    onProgress?.call(0.1);
     Uint8List cipher;
     try {
-      cipher = await client.storage.from(bucket).download(path);
+      if (_checkpoints != null) {
+        final size = await _getObjectSize(path);
+        if (size > 0) {
+          final downloader = ResumableDownloader(
+            client: client,
+            bucket: bucket,
+            checkpoints: _checkpoints,
+            supabaseUrl: _supabaseUrl,
+            supabaseKey: _supabaseKey,
+          );
+          cipher = await downloader.download(
+            path,
+            size,
+            onProgress: (p) => onProgress?.call(0.1 + 0.7 * p),
+          );
+        } else {
+          cipher = await client.storage.from(bucket).download(path);
+          onProgress?.call(0.8);
+        }
+      } else {
+        cipher = await client.storage.from(bucket).download(path);
+        onProgress?.call(0.8);
+      }
     } catch (_) {
       final restored = await ChatBackup.restoreMediaBytes(client, path);
       if (restored == null) rethrow;
       cipher = restored;
+      onProgress?.call(0.8);
     }
-    return MediaSeal.open(
+    final plain = MediaSeal.open(
       cipher: cipher,
       key: base64Decode(keyB64),
       nonce: base64Decode(nonceB64),
     );
+    onProgress?.call(1.0);
+    return plain;
   }
 
   /// Raw download for legacy unsealed uploads (no key material).
-  Future<Uint8List> downloadRaw(String path) async {
+  Future<Uint8List> downloadRaw(
+    String path, {
+    void Function(double progress)? onProgress,
+  }) async {
+    onProgress?.call(0.1);
     try {
-      return await client.storage.from(bucket).download(path);
+      if (_checkpoints != null) {
+        final size = await _getObjectSize(path);
+        if (size > 0) {
+          final downloader = ResumableDownloader(
+            client: client,
+            bucket: bucket,
+            checkpoints: _checkpoints,
+            supabaseUrl: _supabaseUrl,
+            supabaseKey: _supabaseKey,
+          );
+          final bytes = await downloader.download(
+            path,
+            size,
+            onProgress: (p) => onProgress?.call(0.1 + 0.9 * p),
+          );
+          return bytes;
+        }
+      }
+      final bytes = await client.storage.from(bucket).download(path);
+      onProgress?.call(1.0);
+      return bytes;
     } catch (_) {
       final restored = await ChatBackup.restoreMediaBytes(client, path);
       if (restored == null) rethrow;
+      onProgress?.call(1.0);
       return restored;
     }
   }
 
+  /// Get object size via HEAD request
+  Future<int> _getObjectSize(String path) async {
+    try {
+      final url = '$_supabaseUrl/storage/v1/object/$bucket/$path';
+      final token = client.auth.currentSession?.accessToken ?? '';
+      final response = await http.head(
+        Uri.parse(url),
+        headers: {'Authorization': 'Bearer $token', 'apikey': _supabaseKey},
+      );
+      if (response.statusCode == 200) {
+        final contentLength = response.headers['content-length'];
+        if (contentLength != null) {
+          return int.parse(contentLength);
+        }
+      }
+    } catch (_) {
+      // Ignore and fall back to simple download
+    }
+    return 0;
+  }
+
   static const maxVideoBytes = 64 * 1024 * 1024;
+
+  /// Downloads and unseals a video. Plaintext only ever lives in memory.
+  Future<Uint8List> downloadSealedVideo(
+    String path,
+    String keyB64,
+    String nonceB64, {
+    void Function(double progress)? onProgress,
+  }) async {
+    onProgress?.call(0.1);
+    Uint8List cipher;
+    try {
+      if (_checkpoints != null) {
+        final size = await _getObjectSize(path);
+        if (size > 0) {
+          final downloader = ResumableDownloader(
+            client: client,
+            bucket: bucket,
+            checkpoints: _checkpoints,
+            supabaseUrl: _supabaseUrl,
+            supabaseKey: _supabaseKey,
+          );
+          cipher = await downloader.download(
+            path,
+            size,
+            onProgress: (p) => onProgress?.call(0.1 + 0.7 * p),
+          );
+        } else {
+          cipher = await client.storage.from(bucket).download(path);
+          onProgress?.call(0.8);
+        }
+      } else {
+        cipher = await client.storage.from(bucket).download(path);
+        onProgress?.call(0.8);
+      }
+    } catch (_) {
+      final restored = await ChatBackup.restoreMediaBytes(client, path);
+      if (restored == null) rethrow;
+      cipher = restored;
+      onProgress?.call(0.8);
+    }
+    final plain = MediaSeal.open(
+      cipher: cipher,
+      key: base64Decode(keyB64),
+      nonce: base64Decode(nonceB64),
+    );
+    onProgress?.call(1.0);
+    return plain;
+  }
 
   /// Seals a video plus a small thumbnail (own key pair each) and uploads
   /// both ciphertexts. WhatsApp-style pilot cap: 64 MB per video.
-  Future<SealedVideo> uploadSealedVideo(File file, String peerId) async {
+  Future<SealedVideo> uploadSealedVideo(
+    File file,
+    String peerId, {
+    void Function(double progress)? onProgress,
+  }) async {
     final me = client.auth.currentUser?.id;
     if (me == null) throw const AuthException('Sign in to send videos.');
     final size = await file.length();
@@ -220,9 +391,14 @@ class ChatMedia {
     }
     final stamp = DateTime.now().microsecondsSinceEpoch;
     final base = file.uri.pathSegments.last;
-    Future<SealedUpload> putBytes(Uint8List bytes, String name) async {
+    Future<SealedUpload> putBytes(
+      Uint8List bytes,
+      String name,
+      double weight,
+    ) async {
       final sealed = await MediaSeal.seal(bytes);
       final path = '$me/$peerId/$stamp-$name.enc';
+      onProgress?.call(0.1); // Sealing done
       await client.storage
           .from(bucket)
           .uploadBinary(
@@ -230,6 +406,7 @@ class ChatMedia {
             sealed.cipher,
             fileOptions: const FileOptions(upsert: true),
           );
+      onProgress?.call(weight); // Upload done (weight = progress fraction)
       return SealedUpload(
         path: path,
         key: base64Encode(sealed.key),
@@ -237,10 +414,13 @@ class ChatMedia {
       );
     }
 
-    final video = await putBytes(await file.readAsBytes(), base);
-    // No thumbnail: the video_thumbnail plugin is unmaintained and breaks
-    // the Android build (jcenter/AGP9). The bubble renders a duration tile
+    final videoBytes = await file.readAsBytes();
+    final video = await putBytes(videoBytes, base, 0.7);
+
+    // Thumbnail extraction removed: video_thumbnail plugin is unmaintained and
+    // breaks Android build (jcenter/AGP9). The bubble renders a duration tile
     // until a maintained thumbnail solution lands.
+    onProgress?.call(1.0);
     return SealedVideo(
       path: video.path,
       key: video.key,
@@ -259,11 +439,13 @@ class ChatMedia {
     );
   }
 
-  Future<XFile?> pickCameraVideo() {
+  Future<XFile?> pickCameraVideo({
+    Duration maxDuration = const Duration(minutes: 3),
+  }) {
     AppLock.suppressRelockOnce = true;
     return ImagePicker().pickVideo(
       source: ImageSource.camera,
-      maxDuration: const Duration(minutes: 3),
+      maxDuration: maxDuration,
     );
   }
 

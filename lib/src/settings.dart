@@ -6,6 +6,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'chat_lock.dart';
 import 'chat_preferences.dart';
 import 'chat_store.dart';
+import 'media/encrypted_media_browser.dart';
 import 'auth/password_auth.dart';
 import 'auth/password_field.dart';
 import 'auth/password_page.dart';
@@ -352,6 +353,24 @@ class _SettingsPageState extends State<SettingsPage> {
                   ),
                 ),
               ),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.photo_library_outlined),
+              title: const Text('Media browser'),
+              subtitle: const Text(
+                'Browse and search encrypted media from your chats.',
+              ),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () => Navigator.push(
+                context,
+                MaterialPageRoute<void>(
+                  builder: (_) => EncryptedMediaBrowser(
+                    store: widget.store,
+                    client: widget.client!,
+                  ),
+                ),
+              ),
+            ),
             ListTile(
               contentPadding: EdgeInsets.zero,
               leading: const Icon(Icons.privacy_tip_outlined),

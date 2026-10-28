@@ -1,5 +1,3 @@
-import 'dart:io';
-
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
@@ -7,7 +5,9 @@ import 'package:qr_flutter/qr_flutter.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'contacts_repository.dart';
+import 'avatar_sync.dart';
 import 'local_profile.dart';
+import 'privacy_settings_page.dart';
 import 'security/app_lock.dart';
 
 /// WhatsApp-style profile: photo, name, and about line.
@@ -26,6 +26,7 @@ class _ProfilePageState extends State<ProfilePage> {
   String? feedback;
   String? cloudUsername;
   String? cloudPhone;
+  String? cloudAvatarUrl;
 
   bool get signedIn => widget.client?.auth.currentUser != null;
 
@@ -46,6 +47,7 @@ class _ProfilePageState extends State<ProfilePage> {
       setState(() {
         cloudUsername = cloud.username;
         cloudPhone = cloud.phone;
+        cloudAvatarUrl = cloud.avatarUrl;
       });
     } catch (_) {
       if (mounted) {
@@ -138,7 +140,8 @@ class _ProfilePageState extends State<ProfilePage> {
     try {
       if (choice == 'remove') {
         await widget.profile.removeAvatar();
-        await _syncAvatarUrl(null);
+        if (mounted) setState(() => cloudAvatarUrl = null);
+        await _syncAvatar();
       } else {
         AppLock.suppressRelockOnce = true;
         final picked = await ImagePicker().pickImage(
@@ -148,7 +151,7 @@ class _ProfilePageState extends State<ProfilePage> {
         );
         if (picked != null && mounted) {
           await widget.profile.setAvatar(picked.path);
-          await _syncAvatarUrl(widget.profile.avatarPath);
+          await _syncAvatar();
         }
       }
     } on PlatformException {
@@ -164,30 +167,26 @@ class _ProfilePageState extends State<ProfilePage> {
     }
   }
 
-  /// Uploads the device photo to the public avatars bucket and points the
-  /// cloud profile at it. Best-effort: the local photo stays regardless.
-  Future<void> _syncAvatarUrl(String? localPath) async {
+  /// Uploads to the private profile-photo bucket. Local changes are queued by
+  /// LocalProfile when offline and retried as soon as an account is available.
+  Future<void> _syncAvatar() async {
     final client = widget.client;
-    if (client == null || client.auth.currentUser == null || !mounted) return;
-    try {
-      final repository = SupabaseContactsRepository(client);
-      if (localPath == null) {
-        await repository.setAvatarUrl(null);
-        return;
-      }
-      final uid = client.auth.currentUser!.id;
-      final name = '$uid/avatar_${DateTime.now().microsecondsSinceEpoch}.jpg';
-      await client.storage.from('avatars').upload(
-        name,
-        File(localPath),
-        fileOptions: const FileOptions(contentType: 'image/jpeg', upsert: true),
+    if (client == null || client.auth.currentUser == null) return;
+    final sync = AvatarSyncService(
+      client: client,
+      preferences: widget.profile.preferences,
+    );
+    final synced = widget.profile.avatarPath == null
+        ? await sync.removeAvatar()
+        : await sync.syncCurrentAvatar(widget.profile);
+    if (!mounted) return;
+    if (!synced) {
+      setState(
+        () => feedback = 'Photo saved on this device. Cloud sync will retry when you are online.',
       );
-      await repository.setAvatarUrl(client.storage.from('avatars').getPublicUrl(name));
-    } catch (_) {
-      if (mounted) {
-        setState(() => feedback = 'Photo saved on this device. Cloud sync failed — check your connection.');
-      }
+      return;
     }
+    await _loadCloud();
   }
 
   Future<void> editField({required bool isName}) async {
@@ -360,8 +359,12 @@ class _ProfilePageState extends State<ProfilePage> {
                       backgroundColor: const Color(0xFFDDE5FF),
                       backgroundImage: widget.profile.avatarFile != null
                           ? FileImage(widget.profile.avatarFile!)
-                          : null,
-                      child: widget.profile.avatarFile == null
+                          : (cloudAvatarUrl != null
+                                ? NetworkImage(cloudAvatarUrl!)
+                                : null),
+                      child:
+                          widget.profile.avatarFile == null &&
+                              cloudAvatarUrl == null
                           ? Text(
                               widget.profile.name.isEmpty
                                   ? '?'
@@ -450,6 +453,20 @@ class _ProfilePageState extends State<ProfilePage> {
               ),
               const SizedBox(height: 16),
               _ProfileRow(
+                icon: Icons.visibility_outlined,
+                label: 'Profile visibility',
+                value: 'Choose who can see your photo, about, and last seen',
+                onEdit: () => Navigator.of(context).push(
+                  MaterialPageRoute<void>(
+                    builder: (_) => PrivacySettingsPage(
+                      preferences: widget.profile.preferences,
+                      client: widget.client,
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+              _ProfileRow(
                 icon: Icons.alternate_email,
                 label: 'Account',
                 value: signedIn
@@ -461,7 +478,7 @@ class _ProfilePageState extends State<ProfilePage> {
               const Padding(
                 padding: EdgeInsets.symmetric(horizontal: 4),
                 child: Text(
-                  'Your profile photo is stored on this device and shared with your contacts when signed in.',
+                  'Your profile photo is stored privately and shared only with the audience you choose.',
                   style: TextStyle(fontSize: 12, color: Color(0xFF66748A)),
                 ),
               ),

@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:open_chat/src/chat_store.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -56,18 +58,35 @@ void main() {
     expect(back.locked, isTrue);
   });
 
-  test('production purge removes only fictional seeds', () async {
+  test('production purge removes seeds and legacy dialog chats', () async {
     SharedPreferences.setMockInitialValues({});
     final preferences = await SharedPreferences.getInstance();
+    // Saved state: a legacy name-only dialog chat (numeric id) next to a
+    // real encrypted chat. Both kinds of fictional chat must go; the real
+    // one stays.
+    final legacy = Conversation(
+      id: '1729030000000000',
+      name: 'Old dialog chat',
+      color: 0xFFDBE6FF,
+      messages: [],
+    );
+    final real = Conversation(
+      id: '_secure_me-6b2f4c9e',
+      name: 'Real chat',
+      color: 0xFFDDE5FF,
+      messages: [],
+    );
+    await preferences.setString(
+      ChatStore.storageKey,
+      jsonEncode([legacy.toJson(), real.toJson()]),
+    );
     final store = ChatStore(preferences, purgeDemoSeeds: true);
     final ids = store.conversations.map((c) => c.id).toSet();
     expect(ids, isNot(contains('maya')));
     expect(ids, isNot(contains('leo')));
     expect(ids, isNot(contains('aisha')));
     expect(ids, isNot(contains('noah')));
-
-    final kept = await store.create('Mine');
-    final reloaded = ChatStore(preferences, purgeDemoSeeds: true);
-    expect(reloaded.conversations.any((c) => c.id == kept.id), isTrue);
+    expect(ids, isNot(contains(legacy.id)));
+    expect(ids, contains(real.id));
   });
 }

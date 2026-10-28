@@ -18,7 +18,9 @@ void main() {
   });
 
   test('reply retains the quote but forwarding strips unrelated context', () {
-    final body = parseMessageBody(encodeReplyBody('ref', 'answer', 'Alice', 'private quote'));
+    final body = parseMessageBody(
+      encodeReplyBody('ref', 'answer', 'Alice', 'private quote'),
+    );
     expect(body.isReply, isTrue);
     expect(body.quoteText, 'private quote');
     final forwarded = parseMessageBody(body.forwardedBody);
@@ -29,7 +31,10 @@ void main() {
   });
 
   test('control bodies cannot be forwarded', () {
-    expect(() => const MediaBody.delete(target: 'x').forwardedBody, throwsStateError);
+    expect(
+      () => const MediaBody.delete(target: 'x').forwardedBody,
+      throwsStateError,
+    );
     expect(() => const MediaBody.tomb().forwardedBody, throwsStateError);
     expect(parseMessageBody('{"t":"del","target":12}').kind, 'text');
   });
@@ -41,11 +46,16 @@ void main() {
     expect(set.target, 'ref-1');
     expect(set.text, '❤️');
     expect(set.removed, isFalse);
-    final clear = parseMessageBody(encodeReactBody('ref-1', '❤️', remove: true));
+    final clear = parseMessageBody(
+      encodeReactBody('ref-1', '❤️', remove: true),
+    );
     expect(clear.removed, isTrue);
     expect(() => set.forwardedBody, throwsStateError);
     // Oversized emoji payloads stay literal text, never controls.
-    expect(parseMessageBody('{"t":"react","target":"x","e":"toolongemoji!!"}').kind, 'text');
+    expect(
+      parseMessageBody('{"t":"react","target":"x","e":"toolongemoji!!"}').kind,
+      'text',
+    );
     expect(parseMessageBody('{"t":"react","target":"","e":"❤️"}').kind, 'text');
   });
 
@@ -57,13 +67,18 @@ void main() {
     expect(edit.text, 'corrected');
     expect(() => edit.forwardedBody, throwsStateError);
     expect(parseMessageBody('{"t":"edit","target":"x","b":""}').kind, 'text');
-    expect(parseMessageBody('{"t":"edit","target":"x","b":"${'y' * 4001}"}').kind, 'text');
+    expect(
+      parseMessageBody('{"t":"edit","target":"x","b":"${'y' * 4001}"}').kind,
+      'text',
+    );
   });
 
   test('editedBody preserves quotes and flags, rejects empties', () {
     expect(const MediaBody.text('old').editedBody('new'), 'new');
     expect(
-      parseMessageBody(const MediaBody.text('old', forwarded: true).editedBody('new')).forwarded,
+      parseMessageBody(
+        const MediaBody.text('old', forwarded: true).editedBody('new'),
+      ).forwarded,
       isTrue,
     );
     final reply = parseMessageBody(encodeReplyBody('r', 'old', 'Al', 'quote'));
@@ -71,8 +86,18 @@ void main() {
     expect(changed.isReply, isTrue);
     expect(changed.text, 'new answer');
     expect(changed.quoteText, 'quote');
-    expect(() => const MediaBody.text('old').editedBody('  '), throwsStateError);
-    expect(() => const MediaBody.poll(pollId: 'p', question: 'q', options: ['a', 'b']).editedBody('x'), throwsStateError);
+    expect(
+      () => const MediaBody.text('old').editedBody('  '),
+      throwsStateError,
+    );
+    expect(
+      () => const MediaBody.poll(
+        pollId: 'p',
+        question: 'q',
+        options: ['a', 'b'],
+      ).editedBody('x'),
+      throwsStateError,
+    );
   });
 
   test('plain text passes through untouched', () {
@@ -80,6 +105,24 @@ void main() {
     expect(body.kind, 'text');
     expect(body.text, 'Hello with emoji 🎉');
     expect(body.path, isNull);
+  });
+
+  test('expiry metadata is private plaintext and survives an edit', () {
+    final expiry = DateTime.utc(2030, 1, 2, 3, 4, 5);
+    final expiring = encodeExpiringBody(
+      encodeReplyBody('ref', 'old', 'A', 'quote'),
+      expiry,
+    );
+    expect(messageExpiry(expiring), expiry);
+    expect(messageHasExpired(expiring, DateTime.utc(2030)), isFalse);
+    expect(messageHasExpired(expiring, DateTime.utc(2031)), isTrue);
+
+    final edited = preserveMessageExpiry(
+      expiring,
+      parseMessageBody(expiring).editedBody('new'),
+    );
+    expect(messageExpiry(edited), expiry);
+    expect(parseMessageBody(edited).text, 'new');
   });
 
   test('legacy JSON-looking text stays text', () {
@@ -171,12 +214,57 @@ void main() {
     expect(body.durationSec, 7);
   });
 
-  test('poll round-trips question, options, and mode', () {
-    final raw = encodePollBody(
-      'poll-1',
-      'Saturday at 10?',
-      ['Yes', 'No', 'Maybe'],
+  test('video notes round-trip without changing ordinary video behavior', () {
+    final body = parseMessageBody(
+      encodeVideoBody(
+        's/r/note.enc',
+        '',
+        key: 'a2V5',
+        nonce: 'bm9uY2U',
+        durationSec: 42,
+        videoNote: true,
+      ),
     );
+    expect(body.isVideo, isTrue);
+    expect(body.isVideoNote, isTrue);
+    expect(body.durationSec, 42);
+    expect(parseMessageBody(body.forwardedBody).isVideoNote, isTrue);
+    expect(
+      parseMessageBody('{"t":"vid","path":"s/r/note.enc","dur":61,"note":true}')
+          .kind,
+      'text',
+    );
+  });
+
+  test('voice transcripts remain encrypted body metadata through forwarding', () {
+    final body = parseMessageBody(
+      encodeVoiceBody(
+        's/r/voice.enc',
+        12,
+        key: 'a2V5',
+        nonce: 'bm9uY2U',
+        transcript: 'Meet me by the station.',
+      ),
+    );
+    expect(body.transcript, 'Meet me by the station.');
+    expect(
+      parseMessageBody(body.forwardedBody).transcript,
+      'Meet me by the station.',
+    );
+    expect(
+      parseMessageBody(
+        '{"t":"voice","path":"s/r/voice.enc","dur":1,"wave":[],"tr":"${'x' * 4001}"}',
+      ).kind,
+      'text',
+    );
+  });
+
+  test('poll round-trips question, options, and mode', () {
+    final raw = encodePollBody('poll-1', 'Saturday at 10?', [
+      'Yes',
+      'No',
+      'Maybe',
+    ]);
     final body = parseMessageBody(raw);
     expect(body.kind, 'poll');
     expect(body.pollId, 'poll-1');
@@ -192,10 +280,7 @@ void main() {
       parseMessageBody('{"t":"poll","id":"x","q":"y","opts":["one"]}').kind,
       'text',
     );
-    expect(
-      parseMessageBody('{"t":"vote","id":"x","choices":[]}').kind,
-      'text',
-    );
+    expect(parseMessageBody('{"t":"vote","id":"x","choices":[]}').kind, 'text');
   });
 
   test('tally counts latest ballot per side', () {
@@ -233,8 +318,15 @@ void main() {
   });
 
   test('malformed contact cards stay text', () {
-    expect(parseMessageBody('{"t":"contact","name":"","phones":["+14155552671"]}').kind, 'text');
-    expect(parseMessageBody('{"t":"contact","name":"Ava","phones":[]}').kind, 'text');
+    expect(
+      parseMessageBody('{"t":"contact","name":"","phones":["+14155552671"]}')
+          .kind,
+      'text',
+    );
+    expect(
+      parseMessageBody('{"t":"contact","name":"Ava","phones":[]}').kind,
+      'text',
+    );
     expect(parseMessageBody('{"t":"contact","name":"Ava"}').kind, 'text');
   });
 

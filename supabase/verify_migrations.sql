@@ -23,7 +23,8 @@ DECLARE
     'user_preferences',
     'status_updates',
     'status_views',
-    'call_logs'
+    'call_logs',
+    'profile_visibility_exceptions'
   ];
   v_functions text[] := ARRAY[
     'delete_account',
@@ -39,6 +40,10 @@ DECLARE
     'unblock_contact',
     'lookup_contacts_by_phones',
     'set_avatar_url',
+    'set_profile_avatar',
+    'can_view_profile_field',
+    'replace_profile_visibility_exceptions',
+    'list_profile_visibility_exceptions',
     'register_push_token',
     'unregister_push_token',
     'enqueue_message',
@@ -110,7 +115,7 @@ BEGIN
   END LOOP;
 
   -- Check storage buckets for media, avatars, and backups
-  FOREACH v_table IN ARRAY ARRAY['chat-media', 'avatars', 'chat-backups']
+  FOREACH v_table IN ARRAY ARRAY['chat-media', 'avatars', 'profile-avatars', 'chat-backups']
   LOOP
     IF EXISTS (
       SELECT 1 FROM storage.buckets WHERE id = v_table

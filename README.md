@@ -31,7 +31,7 @@ Flutter + Signal Protocol + Supabase + LiveKit. 1:1 chats and newly created grou
 
 ```powershell
 flutter pub get
-flutter run --dart-define-from-file=config.json   # config.json: SUPABASE_URL + SUPABASE_ANON_KEY
+flutter run --dart-define-from-file=config.json   # SUPABASE_URL + SUPABASE_ANON_KEY; optional GIPHY_API_KEY for GIF search
 ```
 
 Apply `supabase/migrations/` **in order**, then run `supabase/verify_migrations.sql` (plus `supabase/tests/durability_security.sql` for the retention/E2EE assertions).

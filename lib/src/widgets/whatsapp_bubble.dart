@@ -49,9 +49,9 @@ class _AppearOnceState extends State<AppearOnce>
 
   @override
   Widget build(BuildContext context) => FadeTransition(
-    opacity: _opacity,
-    child: SlideTransition(position: _offset, child: widget.child),
-  );
+        opacity: _opacity,
+        child: SlideTransition(position: _offset, child: widget.child),
+      );
 }
 
 class WhatsAppBubble extends StatelessWidget {
@@ -140,136 +140,166 @@ class WhatsAppBubble extends StatelessWidget {
     );
   }
 
+  Widget _buildBubble(BuildContext context, bool isDark) => Align(
+        alignment: isMine ? Alignment.centerRight : Alignment.centerLeft,
+        child: GestureDetector(
+          onLongPress: () => _showReactionMenu(context),
+          child: Container(
+            constraints: BoxConstraints(
+              maxWidth: MediaQuery.sizeOf(context).width * 0.78,
+            ),
+            margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 6),
+            decoration: BoxDecoration(
+              color: isMine
+                  ? (isDark ? const Color(0xFF005C4B) : const Color(0xFFE7FFDB))
+                  : (isDark ? const Color(0xFF202C33) : Colors.white),
+              borderRadius: BorderRadius.only(
+                topLeft: const Radius.circular(12),
+                topRight: const Radius.circular(12),
+                bottomLeft: Radius.circular(isMine ? 12 : 2),
+                bottomRight: Radius.circular(isMine ? 2 : 12),
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: 0.05),
+                  blurRadius: 2,
+                  offset: const Offset(0, 1),
+                ),
+              ],
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // Replied message quote banner
+                if (replyToText != null) ...[
+                  Container(
+                    margin: const EdgeInsets.only(bottom: 6),
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: (isDark ? Colors.black26 : Colors.black.withValues(alpha: 0.04)),
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border(
+                        left: BorderSide(
+                          color: isMine ? const Color(0xFF25D366) : const Color(0xFF34B7F1),
+                          width: 4,
+                        ),
+                      ),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          replyToSender ?? (isMine ? 'You' : 'Contact'),
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.bold,
+                            color: isMine ? const Color(0xFF25D366) : const Color(0xFF34B7F1),
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          replyToText!,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(fontSize: 12, color: (isDark ? Colors.white : const Color(0xFF111B21)).withValues(alpha: 0.8)),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+
+                // Message text & metadata layout
+                Wrap(
+                  alignment: WrapAlignment.end,
+                  crossAxisAlignment: WrapCrossAlignment.end,
+                  children: [
+                    FormattedText(
+                      text: text,
+                      baseStyle: TextStyle(fontSize: 15, color: isDark ? Colors.white : const Color(0xFF111B21), height: 1.25),
+                    ),
+                    const SizedBox(width: 8),
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          _formatTime(timestamp),
+                          style: TextStyle(fontSize: 11, color: isDark ? Colors.white60 : const Color(0xFF667781)),
+                        ),
+                        if (isMine) ...[
+                          const SizedBox(width: 4),
+                          MessageStatusTicks(state: status, size: 15),
+                        ],
+                      ],
+                    ),
+                  ],
+                ),
+
+                // Attached reactions badge
+                if (reactions.isNotEmpty) ...[
+                  const SizedBox(height: 4),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: isDark ? const Color(0xFF111B21) : Colors.white,
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(
+                        color: isDark ? const Color(0xFF2A3942) : Colors.black12,
+                      ),
+                    ),
+                    child: Text(
+                      reactions.join(' '),
+                      style: const TextStyle(fontSize: 12),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      );
+
   @override
   Widget build(BuildContext context) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
-
-    // WhatsApp authentic bubble colors
-    final bubbleColor = isMine
-        ? (isDark ? const Color(0xFF005C4B) : const Color(0xFFE7FFDB))
-        : (isDark ? const Color(0xFF202C33) : Colors.white);
-
-    final textColor = isDark ? Colors.white : const Color(0xFF111B21);
-    final timeColor = isDark ? Colors.white60 : const Color(0xFF667781);
-
-    return Align(
-      alignment: isMine ? Alignment.centerRight : Alignment.centerLeft,
-      child: GestureDetector(
-        onLongPress: () => _showReactionMenu(context),
-        child: Container(
-          constraints: BoxConstraints(
-            maxWidth: MediaQuery.sizeOf(context).width * 0.78,
-          ),
-          margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
-          padding: const EdgeInsets.fromLTRB(12, 8, 12, 6),
-          decoration: BoxDecoration(
-            color: bubbleColor,
-            borderRadius: BorderRadius.only(
-              topLeft: const Radius.circular(12),
-              topRight: const Radius.circular(12),
-              bottomLeft: Radius.circular(isMine ? 12 : 2),
-              bottomRight: Radius.circular(isMine ? 2 : 12),
-            ),
-            boxShadow: [
-              BoxShadow(
-                color: Colors.black.withValues(alpha: 0.05),
-                blurRadius: 2,
-                offset: const Offset(0, 1),
-              ),
-            ],
-          ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              // Replied message quote banner
-              if (replyToText != null) ...[
-                Container(
-                  margin: const EdgeInsets.only(bottom: 6),
-                  padding: const EdgeInsets.all(8),
-                  decoration: BoxDecoration(
-                    color: (isDark ? Colors.black26 : Colors.black.withValues(alpha: 0.04)),
-                    borderRadius: BorderRadius.circular(6),
-                    border: Border(
-                      left: BorderSide(
-                        color: isMine ? const Color(0xFF25D366) : const Color(0xFF34B7F1),
-                        width: 4,
-                      ),
-                    ),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        replyToSender ?? (isMine ? 'You' : 'Contact'),
-                        style: TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.bold,
-                          color: isMine ? const Color(0xFF25D366) : const Color(0xFF34B7F1),
-                        ),
-                      ),
-                      const SizedBox(height: 2),
-                      Text(
-                        replyToText!,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(fontSize: 12, color: textColor.withValues(alpha: 0.8)),
-                      ),
-                    ],
-                  ),
-                ),
-              ],
-
-              // Message text & metadata layout
-              Wrap(
-                alignment: WrapAlignment.end,
-                crossAxisAlignment: WrapCrossAlignment.end,
-                children: [
-                  FormattedText(
-                    text: text,
-                    baseStyle: TextStyle(fontSize: 15, color: textColor, height: 1.25),
-                  ),
-                  const SizedBox(width: 8),
-                  Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(
-                        _formatTime(timestamp),
-                        style: TextStyle(fontSize: 11, color: timeColor),
-                      ),
-                      if (isMine) ...[
-                        const SizedBox(width: 4),
-                        MessageStatusTicks(state: status, size: 15),
-                      ],
-                    ],
-                  ),
-                ],
-              ),
-
-              // Attached reactions badge
-              if (reactions.isNotEmpty) ...[
-                const SizedBox(height: 4),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                  decoration: BoxDecoration(
-                    color: isDark ? const Color(0xFF111B21) : Colors.white,
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(
-                      color: isDark ? const Color(0xFF2A3942) : Colors.black12,
-                    ),
-                  ),
-                  child: Text(
-                    reactions.join(' '),
-                    style: const TextStyle(fontSize: 12),
-                  ),
-                ),
-              ],
-            ],
-          ),
-        ),
-      ),
+    final bubble = _buildBubble(context, isDark);
+    if (onReply == null) return bubble;
+    return Dismissible(
+      key: ValueKey(text),
+      direction: isMine ? DismissDirection.startToEnd : DismissDirection.endToStart,
+      background: _WhatsAppReplySwipeBackground(isMine: isMine),
+      onDismissed: (_) => onReply?.call(),
+      child: bubble,
     );
   }
 }
 
+class _WhatsAppReplySwipeBackground extends StatelessWidget {
+  const _WhatsAppReplySwipeBackground({required this.isMine});
+  final bool isMine;
 
+  @override
+  Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
+      padding: const EdgeInsets.symmetric(horizontal: 24),
+      decoration: BoxDecoration(
+        color: isDark ? const Color(0xFF004D3A) : const Color(0xFFDCF8C6),
+        borderRadius: BorderRadius.only(
+          topLeft: const Radius.circular(12),
+          topRight: const Radius.circular(12),
+          bottomLeft: Radius.circular(isMine ? 12 : 2),
+          bottomRight: Radius.circular(isMine ? 2 : 12),
+        ),
+      ),
+      alignment: isMine ? Alignment.centerLeft : Alignment.centerRight,
+      child: Icon(
+        Icons.reply,
+        color: isDark ? const Color(0xFF25D366) : const Color(0xFF008069),
+        size: 28,
+      ),
+    );
+  }
+}

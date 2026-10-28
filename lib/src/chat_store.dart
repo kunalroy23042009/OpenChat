@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
@@ -254,10 +255,16 @@ class ChatStore extends ChangeNotifier {
       conversations = _seed();
       storageWarning = 'Saved demo data could not be read. Sample conversations were restored.';
     }
-    if (purgeDemoSeeds &&
-        conversations.any((c) => demoSeedIds.contains(c.id))) {
-      conversations.removeWhere((c) => demoSeedIds.contains(c.id));
-      _save();
+    // Purge demo conversations: the fictional seeds and anything created
+    // by the legacy name-only dialog (numeric microsecond ids). Real
+    // conversations use '_secure_...', '_self_notes' or server UUID ids.
+    if (purgeDemoSeeds) {
+      bool isDemo(Conversation c) =>
+          demoSeedIds.contains(c.id) || RegExp(r'^[0-9]+$').hasMatch(c.id);
+      if (conversations.any(isDemo)) {
+        conversations.removeWhere(isDemo);
+        _save();
+      }
     }
     // AI chatbot removed: drop any legacy AI threads without deleting
     // real chats. Keeps home list clean after upgrade.
@@ -265,12 +272,91 @@ class ChatStore extends ChangeNotifier {
       conversations.removeWhere((c) => c.isAi);
       _save();
     }
+    // Restore secure (1:1) conversations from encrypted local history.
+    if (secureHistory != null) {
+      _restoreSecureConversations();
+    }
+  }
+
+  void _restoreSecureConversations() {
+    if (secureHistory == null) return;
+    final prefix = _securePrefix;
+    try {
+      final entries = secureHistory!.readEntries(prefix);
+      for (final key in entries.keys) {
+        final parsed = _parseSecureKey(key);
+        if (parsed == null) continue;
+        // Load this secure conversation (creates Conversation if missing).
+        // The chain outlives the constructor; failures must stay silent so
+        // the conversation list remains usable and tests can close the
+        // database while a restore is still pending.
+        unawaited(
+          _ensureSecureConversation(parsed.accountId, parsed.peerId)
+              .then(
+                (_) => loadSecureConversation(parsed.accountId, parsed.peerId),
+              )
+              .catchError((_) {}),
+        );
+      }
+    } catch (_) {
+      // Ignore restore failures; conversation list remains usable.
+    }
+  }
+
+  /// Key layout: `openchat.secure.v1.{accountId}-{peerId}`. Server account
+  /// ids are UUIDs (36 chars), so a leading UUID-shaped segment is preferred;
+  /// tests and legacy data use plain names, which split on the first dash.
+  static ({String accountId, String peerId})? _parseSecureKey(String key) {
+    if (!key.startsWith(_securePrefix)) return null;
+    return parseSecureConversationId(key.substring(_securePrefix.length));
+  }
+
+  /// Splits a secure conversation id (`_secure_{accountId}-{peerId}`) into
+  /// its account and peer parts so callers can resolve display names.
+  /// UUID-shaped segments are preferred; legacy data splits on the first
+  /// dash.
+  static ({String accountId, String peerId})? parseSecureConversationId(
+    String id,
+  ) {
+    if (!id.startsWith(_secureIdPrefix)) return null;
+    final rest = id.substring(_secureIdPrefix.length);
+    if (rest.length >= 38 && rest.codeUnitAt(36) == 0x2D /* - */) {
+      final head = rest.substring(0, 36);
+      if (_isUuidShape(head)) {
+        final peerId = rest.substring(37);
+        if (peerId.isNotEmpty) return (accountId: head, peerId: peerId);
+      }
+    }
+    final split = rest.indexOf('-');
+    if (split <= 0 || split == rest.length - 1) return null;
+    return (
+      accountId: rest.substring(0, split),
+      peerId: rest.substring(split + 1),
+    );
+  }
+
+  static bool _isUuidShape(String value) {
+    const hyphenPositions = {8, 13, 18, 23};
+    for (var i = 0; i < value.length; i++) {
+      if (hyphenPositions.contains(i)) {
+        if (value.codeUnitAt(i) != 0x2D) return false;
+        continue;
+      }
+      final code = value.codeUnitAt(i);
+      final isHex =
+          (code >= 0x30 && code <= 0x39) ||
+          (code >= 0x41 && code <= 0x46) ||
+          (code >= 0x61 && code <= 0x66);
+      if (!isHex) return false;
+    }
+    return true;
   }
   static const storageKey = 'openchat.demo.v1';
   final SharedPreferences preferences;
   final SecureHistoryDatabase? secureHistory;
   late List<Conversation> conversations;
   String? storageWarning;
+
   Future<void> _save() async {
     notifyListeners();
     try {
@@ -285,8 +371,14 @@ class ChatStore extends ChangeNotifier {
     }
   }
 
-  String? _securePayload(String key) =>
-      secureHistory?.read(key) ?? preferences.getString(key);
+  /// Reads the encrypted payload for [key]. A closed/uninitialized database
+  /// (app teardown races) must not throw here: callers treat null as
+  /// "nothing stored" and the read-only preferences fallback is safe.
+  String? _securePayload(String key) {
+    final db = secureHistory;
+    if (db != null && db.isInitialized) return db.read(key);
+    return preferences.getString(key);
+  }
 
   /// Removes a local/demo conversation (swipe-to-delete). Encrypted
   /// cloud chats are managed through contacts, not here.
@@ -315,6 +407,30 @@ class ChatStore extends ChangeNotifier {
 
   Future<void> setLocked(String id, bool value) =>
       _setFlag(id, (c) => c.locked = value);
+
+  /// Applies a resolved display name (contacts list or profiles table) to
+  /// a conversation row, e.g. one still showing the 'Loading...' placeholder.
+  /// No-op when the row is missing or the name is unchanged.
+  Future<void> renameConversation(String id, String name) async {
+    final clean = name.trim();
+    final idx = conversations.indexWhere((c) => c.id == id);
+    if (idx < 0 || clean.isEmpty || conversations[idx].name == clean) return;
+    final current = conversations[idx];
+    conversations[idx] = Conversation(
+      id: current.id,
+      name: clean,
+      color: current.color,
+      messages: current.messages,
+      unread: current.unread,
+      muted: current.muted,
+      mutedUntilMs: current.mutedUntilMs,
+      archived: current.archived,
+      pinned: current.pinned,
+      favourite: current.favourite,
+      locked: current.locked,
+    );
+    await _save();
+  }
 
   Future<void> send(Conversation chat, String text) async {
     final clean = text.trim();
@@ -397,6 +513,7 @@ class ChatStore extends ChangeNotifier {
 
   Future<void> loadSecureConversation(String accountId, String peerId) async {
     final key = _secureKey(accountId, peerId);
+    await purgeExpiredSecureMessages(accountId, peerId);
     final saved = _securePayload(key);
     if (saved == null) return;
     try {
@@ -427,14 +544,55 @@ class ChatStore extends ChangeNotifier {
           favourite: current.favourite,
           locked: current.locked,
         );
+      } else {
+        await _ensureSecureConversation(accountId, peerId);
+        // Reload to populate messages
+        final newIdx = conversations.indexWhere(
+          (c) => c.id == _secureId(accountId, peerId),
+        );
+        if (newIdx >= 0) {
+          conversations[newIdx] = Conversation(
+            id: conversations[newIdx].id,
+            name: conversations[newIdx].name,
+            color: conversations[newIdx].color,
+            messages: list
+                .map((m) => ChatMessage(text: m.text, mine: m.mine, at: m.at))
+                .toList(),
+            unread: conversations[newIdx].unread,
+            muted: conversations[newIdx].muted,
+            mutedUntilMs: conversations[newIdx].mutedUntilMs,
+            archived: conversations[newIdx].archived,
+            pinned: conversations[newIdx].pinned,
+            favourite: conversations[newIdx].favourite,
+            locked: conversations[newIdx].locked,
+          );
+        }
       }
     } catch (_) {
       // Corrupt or missing secure data; ignore.
     }
   }
 
+  Future<void> _ensureSecureConversation(String accountId, String peerId) async {
+    final secureId = _secureId(accountId, peerId);
+    final existing = conversations.indexWhere((c) => c.id == secureId);
+    if (existing >= 0) return;
+    // Create a minimal conversation entry for this peer.
+    // Name/color will be updated when the contact is resolved.
+    conversations.insert(0, Conversation(
+      id: secureId,
+      name: 'Loading...',
+      color: 0xFFDDE5FF,
+      messages: [],
+      unread: 0,
+    ));
+    await _save();
+  }
+
+  static const _secureIdPrefix = '_secure_';
+
   static String _secureId(String accountId, String peerId) =>
-      '_secure_$accountId-$peerId';
+      '$_secureIdPrefix$accountId-$peerId';
 
   /// True when the 1:1 secure chat with [peerId] is muted right now.
   /// Used to suppress notifications for muted chats, WhatsApp-style.
@@ -517,7 +675,7 @@ class ChatStore extends ChangeNotifier {
               // Media/poll bodies reject correction; the control is kept
               // for idempotency but changes nothing.
               messages[i] = m.withBody(
-                original.editedBody(body.text),
+                preserveMessageExpiry(m.text, original.editedBody(body.text)),
                 edited: true,
               );
             }
@@ -556,8 +714,11 @@ class ChatStore extends ChangeNotifier {
     List<SecureMessage> messages,
   ) async {
     final key = _secureKey(accountId, peerId);
+    final active = messages
+        .where((message) => !messageHasExpired(message.text))
+        .toList();
     final payload = jsonEncode({
-      'messages': messages.map((m) => m.toJson()).toList(),
+      'messages': active.map((m) => m.toJson()).toList(),
     });
     if (secureHistory != null) {
       await secureHistory!.write(key, payload);
@@ -568,7 +729,7 @@ class ChatStore extends ChangeNotifier {
     _syncSecureConversation(
       accountId,
       peerId,
-      messages.where((m) {
+      active.where((m) {
         if (m.hidden) return false;
         final kind = parseMessageBody(m.text);
         // Ballots stay for tallies; tombstones render. Delete, reaction
@@ -611,7 +772,7 @@ class ChatStore extends ChangeNotifier {
     if (saved == null) return [];
     try {
       return _readSecureMessages(key).where((m) {
-        if (m.hidden) return false;
+        if (m.hidden || messageHasExpired(m.text)) return false;
         final kind = parseMessageBody(m.text);
         return !kind.isDelete && !kind.isReact && !kind.isEdit;
       }).toList();
@@ -619,6 +780,41 @@ class ChatStore extends ChangeNotifier {
       storageWarning = 'Saved encrypted-chat history could not be read. The original data has been preserved.';
       return [];
     }
+  }
+
+  /// Permanently drops expired bodies from encrypted local history. Filtering
+  /// in [getSecureConversation] prevents stale rows from flashing before this
+  /// cooperative cleanup runs on chat open or at the expiry deadline.
+  Future<int> purgeExpiredSecureMessages(
+    String accountId,
+    String peerId,
+  ) async {
+    final key = _secureKey(accountId, peerId);
+    var removed = 0;
+    await _queueSecureWrite(key, () async {
+      if (_securePayload(key) == null) return;
+      final messages = _readSecureMessages(key);
+      final expired = messages
+          .where((message) => messageHasExpired(message.text))
+          .map((message) => message.ref)
+          .toSet();
+      if (expired.isEmpty) return;
+      messages.removeWhere((message) => expired.contains(message.ref));
+      await _writeSecureMessages(accountId, peerId, messages);
+      final stars =
+          preferences.getStringList(_starKey(accountId, peerId)) ?? [];
+      await preferences.setStringList(
+        _starKey(accountId, peerId),
+        stars.where((ref) => !expired.contains(ref)).toList(),
+      );
+      final pins = preferences.getStringList(_pinKey(accountId, peerId)) ?? [];
+      await preferences.setStringList(
+        _pinKey(accountId, peerId),
+        pins.where((ref) => !expired.contains(ref)).toList(),
+      );
+      removed = expired.length;
+    });
+    return removed;
   }
 
   bool hasSecureEnvelope(String accountId, String peerId, String envelopeId) {
@@ -720,7 +916,7 @@ class ChatStore extends ChangeNotifier {
       if (i < 0) return;
       final message = messages[i];
       if (!message.canEdit(DateTime.now())) return;
-      
+
       // Send edit control message via Signal
       try {
         final editBody = encodeEditBody(ref, newText);
@@ -729,18 +925,21 @@ class ChatStore extends ChangeNotifier {
           'peerId': peerId,
           'plain': base64Encode(utf8.encode(editBody)),
         }) as Map<dynamic, dynamic>;
-        
+
         await channel.invokeMethod('sendSignalMessage', {
           'accountId': accountId,
           'peerId': peerId,
           'type': result['type'],
           'body': result['body'],
         });
-        
+
         // Update local message to the edited text (peer gets the control).
         final original = parseMessageBody(message.text);
         messages[i] = SecureMessage(
-          text: original.editedBody(newText),
+          text: preserveMessageExpiry(
+            message.text,
+            original.editedBody(newText),
+          ),
           mine: true,
           at: message.at,
           clientId: message.clientId,
@@ -761,7 +960,7 @@ class ChatStore extends ChangeNotifier {
   }
 
   /// Deletes a 1:1 secure message (for me or for everyone).
-  /// For everyone: sends delete control message within 1 hour window.
+  /// For everyone: sends delete control message within the supported window.
   /// For me: marks locally as hidden.
   Future<bool> deleteSecureMessage(
     String accountId,
@@ -778,9 +977,11 @@ class ChatStore extends ChangeNotifier {
       final i = messages.indexWhere((m) => m.ref == ref && !m.hidden);
       if (i < 0) return;
       final message = messages[i];
-      
+
       if (forEveryone) {
-        if (!message.mine || !message.canDeleteForEveryone(DateTime.now()) || channel == null) {
+        if (!message.mine ||
+            !message.canDeleteForEveryone(DateTime.now()) ||
+            channel == null) {
           return;
         }
         // Send delete-for-everyone control message
@@ -791,16 +992,17 @@ class ChatStore extends ChangeNotifier {
             'peerId': peerId,
             'plain': base64Encode(utf8.encode(deleteBody)),
           }) as Map<dynamic, dynamic>;
-          
+
           await channel.invokeMethod('sendSignalMessage', {
             'accountId': accountId,
             'peerId': peerId,
             'type': result['type'],
             'body': result['body'],
           });
-          
-          // Mark locally as deleted
-          messages[i] = messages[i].withBody(encodeTombstoneBody(), hidden: true);
+
+          // Keep the tombstone visible locally, matching what the recipient
+          // receives instead of making the sender's message silently vanish.
+          messages[i] = messages[i].withBody(encodeTombstoneBody());
           await _writeSecureMessages(accountId, peerId, messages);
           success = true;
         } catch (_) {
@@ -852,7 +1054,7 @@ class ChatStore extends ChangeNotifier {
       final messages = _readSecureMessages(key);
       final i = messages.indexWhere((m) => m.ref == ref && !m.hidden);
       if (i < 0) return;
-      
+
       // Send reaction control message
       try {
         final reactBody = encodeReactBody(ref, emoji);
@@ -861,7 +1063,7 @@ class ChatStore extends ChangeNotifier {
           'peerId': peerId,
           'plain': base64Encode(utf8.encode(reactBody)),
         }) as Map<dynamic, dynamic>;
-        
+
         await channel.invokeMethod('sendSignalMessage', {
           'accountId': accountId,
           'peerId': peerId,
@@ -873,7 +1075,14 @@ class ChatStore extends ChangeNotifier {
       }
     });
     // Also apply locally for instant feedback
-    await applySecureReaction(accountId, peerId, ref, emoji, mine: true, remove: false);
+    await applySecureReaction(
+      accountId,
+      peerId,
+      ref,
+      emoji,
+      mine: true,
+      remove: false,
+    );
   }
 
   /// Atomically consumes a received view-once body before it is shown.
@@ -1136,6 +1345,7 @@ class ChatStore extends ChangeNotifier {
     for (final peerId in peers) {
       out[peerId] = {
         'messages': _readSecureMessages(_secureKey(accountId, peerId))
+            .where((message) => !messageHasExpired(message.text))
             .map((m) => m.toJson())
             .toList(),
         'stars': preferences.getStringList(_starKey(accountId, peerId)) ?? [],
@@ -1168,7 +1378,7 @@ class ChatStore extends ChangeNotifier {
             final m = SecureMessage.fromJson(
               Map<String, dynamic>.from(raw as Map),
             );
-            if (seen.add(m.ref)) merged.add(m);
+            if (!messageHasExpired(m.text) && seen.add(m.ref)) merged.add(m);
           } catch (_) {}
         }
         merged.sort((a, b) {

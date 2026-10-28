@@ -1,11 +1,19 @@
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 class AccountProfile {
-  const AccountProfile({required this.name, this.username, this.about, this.phone, this.avatarUrl});
+  const AccountProfile({
+    required this.name,
+    this.username,
+    this.about,
+    this.phone,
+    this.avatarUrl,
+    this.avatarPath,
+  });
   final String name;
   final String? username;
   final String? about;
   final String? avatarUrl;
+  final String? avatarPath;
 
   /// Self-asserted number until SMS verification is enabled.
   final String? phone;
@@ -19,6 +27,7 @@ class CloudContact {
     required this.username,
     this.about,
     this.avatarUrl,
+    this.avatarPath,
     required this.status,
     required this.incoming,
   });
@@ -28,6 +37,7 @@ class CloudContact {
   final String username;
   final String? about;
   final String? avatarUrl;
+  final String? avatarPath;
   final String status;
   final bool incoming;
   factory CloudContact.fromJson(Map<String, dynamic> json) => CloudContact(
@@ -37,6 +47,7 @@ class CloudContact {
     username: json['username'] as String? ?? '',
     about: json['about'] as String?,
     avatarUrl: json['avatar_url'] as String?,
+    avatarPath: json['avatar_path'] as String?,
     status: json['status'] as String,
     incoming: json['incoming'] as bool,
   );
@@ -67,7 +78,9 @@ class SupabaseContactsRepository implements ContactsRepository {
     if (id == null) throw const AuthException('Sign in to load your profile.');
     final row = await client
         .from('profiles')
-        .select('display_name, username, about, phone_number, avatar_url')
+        .select(
+          'display_name, username, about, phone_number, avatar_url, avatar_path',
+        )
         .eq('id', id)
         .single();
     return AccountProfile(
@@ -75,13 +88,43 @@ class SupabaseContactsRepository implements ContactsRepository {
       username: row['username'] as String?,
       about: row['about'] as String?,
       phone: row['phone_number'] as String?,
-      avatarUrl: row['avatar_url'] as String?,
+      avatarPath: row['avatar_path'] as String?,
+      avatarUrl: await _avatarUrl(
+        row['avatar_path'] as String?,
+        row['avatar_url'] as String?,
+      ),
     );
   }
 
   @override
   Future<void> setAvatarUrl(String? url) async {
     await client.rpc('set_avatar_url', params: {'p_url': url});
+  }
+
+  Future<String?> _avatarUrl(String? path, String? legacyUrl) async {
+    if (path == null || path.isEmpty) return legacyUrl;
+    try {
+      return await client.storage
+          .from('profile-avatars')
+          .createSignedUrl(path, 60 * 60);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<CloudContact> _contactFromRow(Map<String, dynamic> row) async {
+    final parsed = CloudContact.fromJson(row);
+    return CloudContact(
+      userId: parsed.userId,
+      requestId: parsed.requestId,
+      name: parsed.name,
+      username: parsed.username,
+      about: parsed.about,
+      avatarPath: parsed.avatarPath,
+      avatarUrl: await _avatarUrl(parsed.avatarPath, parsed.avatarUrl),
+      status: parsed.status,
+      incoming: parsed.incoming,
+    );
   }
 
   @override
@@ -99,11 +142,9 @@ class SupabaseContactsRepository implements ContactsRepository {
   @override
   Future<List<CloudContact>> contacts() async {
     final rows = await client.rpc('list_my_contacts') as List;
-    return rows
-        .map(
-          (row) => CloudContact.fromJson(Map<String, dynamic>.from(row as Map)),
-        )
-        .toList();
+    return Future.wait(
+      rows.map((row) => _contactFromRow(Map<String, dynamic>.from(row as Map))),
+    );
   }
 
   @override
@@ -113,22 +154,14 @@ class SupabaseContactsRepository implements ContactsRepository {
 
   @override
   Future<CloudContact?> findByPhone(String phone) async {
-    final row =
-        await client.rpc(
-              'find_contact_by_phone',
-              params: {'p_phone': phone.trim()},
-            )
-            as Map<String, dynamic>?;
+    final row = await client.rpc(
+      'find_contact_by_phone',
+      params: {'p_phone': phone.trim()},
+    ) as Map<String, dynamic>?;
     if (row == null) return null;
-    return CloudContact(
-      userId: row['user_id'] as String,
-      name: row['display_name'] as String? ?? 'OpenChat user',
-      username: row['username'] as String? ?? '',
-      avatarUrl: row['avatar_url'] as String?,
-      status: 'found',
-      incoming: false,
-    );
+    return _contactFromRow({...row, 'status': 'found', 'incoming': false});
   }
+
   @override
   Future<String> invite(String username) async => await client.rpc(
     'send_contact_invite',

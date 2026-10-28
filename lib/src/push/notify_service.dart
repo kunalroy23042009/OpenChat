@@ -10,10 +10,28 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 /// foreground handler, the background isolate, and FCM data messages all
 /// share one routing contract.
 class NotifyTap {
-  const NotifyTap({required this.kind, required this.peer, required this.name});
-  final String kind; // 'msg', 'call', or 'status'.
+  const NotifyTap({
+    required this.kind,
+    required this.peer,
+    required this.name,
+    this.action,
+  });
+  final String kind; // 'msg', 'group', 'call', or 'status'.
   final String peer;
   final String name;
+  final String? action;
+
+  /// Actions come from the platform response, never from a sender's payload.
+  static NotifyTap? fromResponse(NotificationResponse? response) {
+    final tap = decode(response?.payload);
+    if (tap == null) return null;
+    return NotifyTap(
+      kind: tap.kind,
+      peer: tap.peer,
+      name: tap.name,
+      action: response?.actionId == 'reply' ? 'reply' : null,
+    );
+  }
 
   String encode() => jsonEncode({'kind': kind, 'peer': peer, 'name': name});
 
@@ -24,7 +42,13 @@ class NotifyTap {
       final kind = map['kind'] as String?;
       final peer = map['peer'] as String?;
       if (kind == null || peer == null) return null;
-      if (kind != 'msg' && kind != 'call' && kind != 'status') return null;
+      if (kind != 'msg' &&
+          kind != 'group' &&
+          kind != 'call' &&
+          kind != 'missed_call' &&
+          kind != 'status') {
+        return null;
+      }
       return NotifyTap(
         kind: kind,
         peer: peer,
@@ -49,12 +73,14 @@ class NotifyService {
       FlutterLocalNotificationsPlugin();
 
   static const messagesChannel = 'openchat_messages';
+  static const silentMessagesChannel = 'openchat_messages_silent';
   static const callsChannel = 'openchat_calls';
   static const statusChannel = 'openchat_status';
   static const groupsChannel = 'openchat_groups';
 
   /// Peer ids with a visible chat screen. Messages for these never notify.
   final Set<String> openChats = {};
+  final Set<String> openGroups = {};
 
   /// Foreground tap handler, registered by the home screen (owns navigation).
   Future<void> Function(NotifyTap tap)? onTap;
@@ -77,7 +103,7 @@ class NotifyService {
     try {
       final launch = await _plugin.getNotificationAppLaunchDetails();
       return launch?.didNotificationLaunchApp == true
-          ? NotifyTap.decode(launch?.notificationResponse?.payload)
+          ? NotifyTap.fromResponse(launch?.notificationResponse)
           : null;
     } catch (_) {
       return null;
@@ -99,7 +125,7 @@ class NotifyService {
       final ok = await _plugin.initialize(
         settings: const InitializationSettings(android: android),
         onDidReceiveNotificationResponse: (response) {
-          final tap = NotifyTap.decode(response.payload);
+          final tap = NotifyTap.fromResponse(response);
           if (tap != null) onTap?.call(tap);
         },
       );
@@ -123,6 +149,16 @@ class NotifyService {
         ),
       );
       debugPrint('NotifyService: messages channel created');
+      await impl.createNotificationChannel(
+        const AndroidNotificationChannel(
+          silentMessagesChannel,
+          'Silent messages',
+          description: 'Muted and no-tone message alerts',
+          importance: Importance.low,
+          playSound: false,
+          enableVibration: false,
+        ),
+      );
       await impl.createNotificationChannel(
         const AndroidNotificationChannel(
           callsChannel,
@@ -204,7 +240,9 @@ class NotifyService {
           senderId: peerId,
           openPeers: openChats,
         )) {
-      debugPrint('NotifyService: showMessage - suppressed by shouldNotifyMessage');
+      debugPrint(
+        'NotifyService: showMessage - suppressed by shouldNotifyMessage',
+      );
       return;
     }
     if (!_newEvent('msg', event)) {
@@ -218,13 +256,20 @@ class NotifyService {
       body: 'New message',
       notificationDetails: NotificationDetails(
         android: AndroidNotificationDetails(
-          messagesChannel,
-          'Messages',
+          silent ? silentMessagesChannel : messagesChannel,
+          silent ? 'Silent messages' : 'Messages',
           importance: silent ? Importance.low : Importance.high,
           priority: silent ? Priority.low : Priority.high,
           category: AndroidNotificationCategory.message,
           playSound: !silent,
           enableVibration: !silent,
+          actions: const [
+            AndroidNotificationAction(
+              'reply',
+              'Reply in OpenChat',
+              showsUserInterface: true,
+            ),
+          ],
         ),
       ),
       payload: NotifyTap(kind: 'msg', peer: peerId, name: name).encode(),
@@ -265,6 +310,34 @@ class NotifyService {
     return _plugin.cancel(id: notificationId('call', inviteId));
   }
 
+  Future<void> showMissedCall({
+    required String inviteId,
+    required String name,
+    required bool video,
+  }) async {
+    if (!_ready) return;
+    await _plugin.show(
+      id: notificationId('missed_call', inviteId),
+      title: 'Missed ${video ? 'video' : 'voice'} call',
+      body: name,
+      notificationDetails: NotificationDetails(
+        android: AndroidNotificationDetails(
+          callsChannel,
+          'Calls',
+          importance: Importance.high,
+          priority: Priority.high,
+          category: AndroidNotificationCategory.call,
+          autoCancel: true,
+        ),
+      ),
+      payload: NotifyTap(
+        kind: 'missed_call',
+        peer: inviteId,
+        name: name,
+      ).encode(),
+    );
+  }
+
   Future<void> showStatus({
     required String authorId,
     required String name,
@@ -298,8 +371,10 @@ class NotifyService {
     required String groupName,
     required String senderName,
     String? event,
+    bool ignoreOpenGroups = false,
   }) async {
     if (!_ready) return;
+    if (!ignoreOpenGroups && openGroups.contains(groupId)) return;
     if (!_newEvent('group', event)) return;
     await _plugin.show(
       id: notificationId('group', groupId),
@@ -314,7 +389,11 @@ class NotifyService {
           category: AndroidNotificationCategory.message,
         ),
       ),
-      payload: NotifyTap(kind: 'group', peer: groupId, name: groupName).encode(),
+      payload: NotifyTap(
+        kind: 'group',
+        peer: groupId,
+        name: groupName,
+      ).encode(),
     );
   }
 

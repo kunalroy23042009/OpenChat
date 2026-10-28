@@ -21,6 +21,7 @@ class LocalProfile extends ChangeNotifier {
   static const nameKey = 'openchat.profile.name';
   static const aboutKey = 'openchat.profile.about';
   static const avatarKey = 'openchat.profile.avatar';
+  static const _avatarSyncStateKey = 'openchat.avatar.sync_state';
   static const defaultAbout = 'Hey there! I am using OpenChat.';
   static const maxAboutLength = 140;
 
@@ -65,6 +66,9 @@ class LocalProfile extends ChangeNotifier {
     final previous = avatarPath;
     avatarPath = target.path;
     await preferences.setString(avatarKey, target.path);
+    // The upload can only happen when an account is available. Queue it here
+    // so photos chosen before sign-in are not left device-only forever.
+    await preferences.setString(_avatarSyncStateKey, 'pending_upload');
     notifyListeners();
     if (previous != null && previous != target.path) {
       try {
@@ -79,6 +83,7 @@ class LocalProfile extends ChangeNotifier {
     final previous = avatarPath;
     avatarPath = null;
     await preferences.remove(avatarKey);
+    await preferences.setString(_avatarSyncStateKey, 'pending_remove');
     notifyListeners();
     if (previous != null) {
       try {

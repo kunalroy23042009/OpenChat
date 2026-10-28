@@ -9,34 +9,44 @@ import 'dart:async';
 import 'package:flutter_contacts/flutter_contacts.dart';
 
 import 'chat_store.dart';
+import 'chat/direct_unread.dart';
 import 'chat_lock.dart';
 import 'chat_preferences.dart';
 import 'contacts_repository.dart';
+import 'contacts_page.dart';
 import 'contacts_sync.dart';
 import 'local_profile.dart';
 import 'media/media_message.dart';
 import 'profile_page.dart';
+import 'push/badge_service.dart';
 import 'push/push_service.dart';
 import 'push/notify_service.dart';
 import 'secure_chat_screen.dart';
 import 'settings.dart';
 import 'theme/app_theme.dart';
 import 'status/status_page.dart';
+import 'app_version_gate.dart';
 import 'calling/call_history_page.dart';
 import 'calling/call_repository.dart';
 import 'calling/call_service.dart';
 import 'calling/call_signaling.dart';
 import 'calling/call_screen.dart';
+import 'calling/native_call_service.dart' hide CallType;
+import 'calling/group_voice_chat.dart';
 import 'backup/chat_backup.dart';
 import 'backup/google_drive_backup.dart';
 import 'chat/conversation_repository.dart';
 import 'chat/group_chat_screen.dart';
+import 'chat/profile_watcher.dart';
+import 'ops/error_report.dart';
 import 'security/secure_history_database.dart';
 import 'security/signal_crypto.dart';
 import 'widgets/whatsapp_bubble.dart';
 import 'widgets/status_ticks.dart';
 import 'widgets/whatsapp_wallpaper.dart';
 import 'features_page.dart';
+import 'broadcast/broadcast_lists.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 
 class ChatHome extends StatefulWidget {
   const ChatHome({
@@ -68,10 +78,32 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
   RealtimeChannel? _callWatch;
   String? _callWatchUid;
   bool _incomingOpen = false;
+
+  // Native (Telecom) ring supervision for the invite currently ringing.
+  RealtimeChannel? _ringWatch;
+  Timer? _ringTimer;
+  Future<void> Function()? _ringSettle;
+
   RealtimeChannel? _notifyWatch;
   String? _notifyUid;
   Map<String, String> _notifyNames = {};
+
+  /// Server-driven version gate: when the installed app is older than
+  /// `app_config.min_app_version`, the whole UI is replaced by an update
+  /// screen. Fails open — an unreachable gate never blocks anyone.
+  bool _updateRequired = false;
+  String? _minAppVersion;
+  String? _installedAppVersion;
+  String? _versionCheckedForUid;
   int activeTab = 0;
+  late final BroadcastListService _broadcastService = BroadcastListService(
+    widget.store.preferences,
+  );
+
+  // Shared instances for badge aggregation
+  DirectUnread? _directUnread;
+  ConversationRepository? _conversationRepo;
+
   void open(Conversation chat, bool wide) {
     widget.store.markRead(chat);
     if (wide) {
@@ -99,9 +131,39 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     NotifyService.instance.onTap = _onNotifyTap;
     _initializeNotifications();
+    // Real system ringing: wire the Telecom ConnectionService callbacks so
+    // answer/decline/end from the system UI drive the full call flow.
+    final callingClient = widget.client;
+    if (callingClient != null) {
+      unawaited(NativeCallService().initialize(callingClient));
+      NativeCallService().onIncomingAccepted = _onIncomingAccepted;
+      NativeCallService().onIncomingDeclined = _onIncomingDeclined;
+    }
     widget.store.ensureSelfChat();
     _watchNotify();
     unawaited(_publishSignalKeys());
+    
+    // Initialize shared unread trackers for badge aggregation
+    if (widget.client != null) {
+      _directUnread = DirectUnread(widget.client!)..addListener(_onUnreadChanged);
+      _directUnread!.start();
+      _conversationRepo = ConversationRepository(
+        widget.client!,
+        secureHistory: widget.store.secureHistory,
+      );
+      _conversationRepo!.addListener(_onUnreadChanged);
+      _conversationRepo!.subscribeToMembership();
+      
+      // Initialize badge service
+      BadgeService.initialize(
+        store: widget.store,
+        repo: _conversationRepo!,
+        directUnread: _directUnread!,
+      );
+    }
+    
+    // Load broadcast lists
+    _broadcastService.load();
     // Silent scheduled backup (needs one manual backup first). Never
     // blocks startup and never surfaces errors.
     WidgetsBinding.instance.addPostFrameCallback((_) => _maybeAutoBackup());
@@ -110,6 +172,10 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
     WidgetsBinding.instance.addPostFrameCallback(
       (_) => _maybeAutoSyncContacts(),
     );
+  }
+
+  void _onUnreadChanged() {
+    BadgeService.instance?.refresh();
   }
 
   Future<void> _publishSignalKeys() async {
@@ -131,6 +197,62 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       _maybeAutoBackup();
+      unawaited(_resolveChatNames());
+    }
+  }
+
+  /// Store-backed chat rows are created with a 'Loading...' placeholder
+  /// until the peer's profile is resolved. Accepted contacts come from the
+  /// contacts list; everyone else (e.g. someone who messaged first) is
+  /// resolved straight from the profiles table. Guarded like the other
+  /// build-side watchers: one network attempt per placeholder set.
+  String? _nameResolveKey;
+  DateTime _lastNameResolveAttempt = DateTime.fromMillisecondsSinceEpoch(0);
+
+  void _watchChatNames() {
+    final uid = widget.client?.auth.currentUser?.id;
+    if (uid == null) return;
+    unawaited(_resolveChatNames());
+  }
+
+  Future<void> _resolveChatNames() async {
+    final client = widget.client;
+    final me = client?.auth.currentUser?.id;
+    if (client == null || me == null) return;
+    final missing = <String, String>{}; // peerId -> conversation id
+    for (final c in widget.store.conversations) {
+      if (c.name != 'Loading...' && c.name.trim().isNotEmpty) continue;
+      final parsed = ChatStore.parseSecureConversationId(c.id);
+      if (parsed == null || parsed.accountId != me) continue;
+      if (parsed.peerId == me) continue; // self chat has its own title
+      missing[parsed.peerId] = c.id;
+    }
+    if (missing.isEmpty) return;
+    final key = missing.keys.toList()..sort();
+    final signature = key.join(',');
+    if (signature == _nameResolveKey &&
+        DateTime.now().difference(_lastNameResolveAttempt) <
+            const Duration(minutes: 1)) {
+      return;
+    }
+    _nameResolveKey = signature;
+    _lastNameResolveAttempt = DateTime.now();
+    try {
+      // The profiles table is RLS-restricted to its own row, so peer
+      // display names must come from the contacts RPC — it serves every
+      // invite status and joins the name server-side.
+      final contacts = await SupabaseContactsRepository(client).contacts();
+      for (final contact in contacts) {
+        final id = missing[contact.userId];
+        if (id == null) continue;
+        final name = contact.name.trim();
+        if (name.isNotEmpty) {
+          await widget.store.renameConversation(id, name);
+        }
+      }
+    } catch (_) {
+      // Leave placeholders in place; a later store update or app resume
+      // retries after the guard window.
     }
   }
 
@@ -177,7 +299,8 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
     if (uid == null) return;
     var backedUp = false;
     try {
-      backedUp = await ChatBackup.maybeAutoBackup(
+      backedUp =
+          await ChatBackup.maybeAutoBackup(
             client: client!,
             store: widget.store,
             uid: uid,
@@ -332,8 +455,8 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
     );
   }
 
-  /// Notification tap routing: messages open the encrypted chat, status
-  /// jumps to the Status tab. Calls are owned by the ringing dialog.
+  /// Notification tap routing: messages open the encrypted chat, groups open
+  /// their thread, status jumps to the Status tab, and calls use the ringer.
   Future<void> _onNotifyTap(NotifyTap tap) async {
     if (!mounted) return;
     final client = widget.client;
@@ -362,13 +485,43 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
                 peerName: match!.name,
                 peerUsername: match.username,
                 peerAvatarUrl: match.avatarUrl,
+                focusComposer: tap.action == 'reply',
               ),
             ),
           );
-        } catch (_) {}
+          return;
+        } catch (_) {
+          return;
+        }
       case 'status':
         Navigator.of(context).popUntil((route) => route.isFirst);
-        if (mounted) setState(() => activeTab = 1);
+        if (mounted) setState(() => activeTab = 2);
+        return;
+      case 'group':
+        try {
+          final group = await client
+              .from('conversations')
+              .select('id, title, avatar_url, e2ee_enabled')
+              .eq('id', tap.peer)
+              .inFilter('type', const ['group', 'channel'])
+              .maybeSingle();
+          if (!mounted || group == null) return;
+          setState(() => activeTab = 0);
+          await Navigator.of(context).push(
+            MaterialPageRoute<void>(
+              builder: (_) => GroupChatScreen(
+                conversationId: group['id'] as String,
+                conversationTitle: group['title'] as String? ?? tap.name,
+                avatarUrl: group['avatar_url'] as String?,
+                secureHistory: widget.store.secureHistory,
+                e2eeEnabled: group['e2ee_enabled'] == true,
+              ),
+            ),
+          );
+          return;
+        } catch (_) {
+          return;
+        }
       case 'call':
         final invite = await client
             .from('call_invites')
@@ -381,8 +534,13 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
           await _onIncomingInvite(invite);
         } else {
           await NotifyService.instance.cancelCall(tap.peer);
-          if (mounted) setState(() => activeTab = 2);
+          if (mounted) setState(() => activeTab = 3);
         }
+        return;
+      case 'missed_call':
+        Navigator.of(context).popUntil((route) => route.isFirst);
+        if (mounted) setState(() => activeTab = 3);
+        return;
     }
   }
 
@@ -390,9 +548,65 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     NotifyService.instance.onTap = null;
+    GroupVoiceChatService.instance.stop();
     _callWatch?.unsubscribe();
+    _ringTimer?.cancel();
+    unawaited(_ringWatch?.unsubscribe());
+    _ringWatch = null;
+    _ringSettle = null;
+    NativeCallService().onIncomingAccepted = null;
+    NativeCallService().onIncomingDeclined = null;
+    NativeCallService().onCallUiEnded = null;
     _notifyWatch?.unsubscribe();
+    _directUnread?.removeListener(_onUnreadChanged);
+    _directUnread?.dispose();
+    _conversationRepo?.removeListener(_onUnreadChanged);
+    _conversationRepo?.unsubscribeFromMembership();
+    _conversationRepo?.dispose();
+    if (BadgeService.isInitialized) BadgeService.instance!.dispose();
     super.dispose();
+  }
+
+  /// Group voice rooms watcher: one realtime subscription for the signed-in
+  /// user, driving the drop-in banners across all group chats.
+  void _watchGroupVoice() {
+    final client = widget.client;
+    if (client == null) return;
+    GroupVoiceChatService.instance.start(client);
+  }
+
+  /// Version gate: one fetch per signed-in uid, fail-open on any error.
+  void _checkAppVersion() {
+    final client = widget.client;
+    final uid = client?.auth.currentUser?.id;
+    if (client == null || uid == null) return;
+    if (_versionCheckedForUid == uid) return;
+    _versionCheckedForUid = uid;
+    unawaited(_loadMinAppVersion(client));
+  }
+
+  Future<void> _loadMinAppVersion(SupabaseClient client) async {
+    String? min;
+    try {
+      min = await fetchMinAppVersion(client);
+    } catch (_) {
+      return; // Unreachable gate: keep the app usable.
+    }
+    if (min == null) return;
+    try {
+      final info = await PackageInfo.fromPlatform();
+      if (!mounted) return;
+      setState(() {
+        _minAppVersion = min;
+        _installedAppVersion = info.version;
+        _updateRequired = compareVersions(info.version, min!) < 0;
+      });
+    } catch (_) {}
+  }
+
+  Future<void> _recheckAppVersion() async {
+    _versionCheckedForUid = null;
+    _checkAppVersion();
   }
 
   /// Foreground incoming-call ringer. While signed in, watch our invite
@@ -438,8 +652,6 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
     final callType = record['call_type'] as String? ?? 'voice';
     if (inviteId.isEmpty || callerId.isEmpty) return;
     final client = widget.client!;
-    final messenger = ScaffoldMessenger.of(context);
-    final navigator = Navigator.of(context);
     String peerName = 'Unknown caller';
     try {
       final contacts = await SupabaseContactsRepository(client).contacts();
@@ -452,7 +664,11 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
     } catch (_) {}
     if (!mounted || _incomingOpen) return;
     _incomingOpen = true;
-    // Ring on the lock screen too: the dialog only exists in-foreground.
+    // Send delivery receipt so the caller knows the invite arrived.
+    unawaited(CallSignaling.markDelivered(client, inviteId: inviteId));
+    // Lock-screen / full-screen notification: rings even when the app is
+    // swiped away or the device is locked (the Telecom ring below only
+    // runs while this process is alive).
     await NotifyService.instance.showCall(
       inviteId: inviteId,
       name: peerName,
@@ -462,6 +678,79 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
       _incomingOpen = false;
       return;
     }
+    // Decrypt the end-to-end media key BEFORE ringing: the system call UI
+    // needs it the moment the user answers, not after another round trip.
+    final encryptedKey = record['encrypted_call_key'] as String?;
+    String? mediaKey;
+    if (encryptedKey != null && encryptedKey != 'legacy-disabled') {
+      try {
+        final decrypted = await SignalCrypto(
+          client: client,
+          accountId: client.auth.currentUser!.id,
+          preferences: await SharedPreferences.getInstance(),
+        ).decryptText(callerId, encryptedKey);
+        if (base64Url.decode(base64Url.normalize(decrypted)).length == 32) {
+          mediaKey = decrypted;
+        }
+      } catch (_) {
+        // Ring anyway; a failed accept reports the error and declines.
+      }
+    }
+    if (!mounted) {
+      _incomingOpen = false;
+      return;
+    }
+    // Real system ring: Telecom drives the ringtone, lock screen and
+    // answer/decline buttons. Falls back to the in-app dialog when the
+    // platform refuses (telecom unavailable, concurrent call, web/iOS).
+    final native = NativeCallService();
+    final rangNatively = await native.ringIncoming(
+      inviteId: inviteId,
+      peerId: callerId,
+      peerName: peerName,
+      video: callType == 'video',
+      room: record['room'] as String?,
+      mediaKey: mediaKey,
+      client: client,
+    );
+    if (!mounted) {
+      if (rangNatively) await native.reportCallEnded(inviteId);
+      _incomingOpen = false;
+      return;
+    }
+    if (rangNatively) {
+      await _superviseNativeRing(
+        client: client,
+        inviteId: inviteId,
+        callerId: callerId,
+        peerName: peerName,
+        callType: callType,
+      );
+      return;
+    }
+    await _showIncomingCallDialog(
+      client: client,
+      inviteId: inviteId,
+      callerId: callerId,
+      peerName: peerName,
+      callType: callType,
+      room: record['room'] as String? ?? '',
+      encryptedCallKey: encryptedKey,
+      created: created,
+    );
+  }
+  /// Foreground fallback ring when Telecom is unavailable: the same accept
+  /// flow as the system-UI path, presented as an in-app dialog.
+  Future<void> _showIncomingCallDialog({
+    required SupabaseClient client,
+    required String inviteId,
+    required String callerId,
+    required String peerName,
+    required String callType,
+    required String room,
+    String? encryptedCallKey,
+    DateTime? created,
+  }) async {
     var expired = false;
     final dialogNavigator = Navigator.of(context, rootNavigator: true);
     final dialogRoute = DialogRoute<bool>(
@@ -520,7 +809,139 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
       } catch (_) {}
       return;
     }
-    // The ring may have died while the dialog sat open: re-check before
+    await _answerIncomingCall(
+      client: client,
+      inviteId: inviteId,
+      callerId: callerId,
+      peerName: peerName,
+      callType: callType,
+      room: room,
+      encryptedCallKey: encryptedCallKey,
+      service: CallService(),
+      ownsService: true,
+    );
+  }
+
+  /// Watches a natively ringing invite. When the caller gives up, tear the
+  /// system ring down and log the miss. A local timer mirrors the server's
+  /// 60-second timeout in case realtime is unreachable. The settle handle
+  /// is shared with the accept/decline hooks so exactly one path cleans up.
+  Future<void> _superviseNativeRing({
+    required SupabaseClient client,
+    required String inviteId,
+    required String callerId,
+    required String peerName,
+    required String callType,
+  }) async {
+    var settled = false;
+    Future<void> settle({required bool reportEnded, String? outcome}) async {
+      if (settled) return;
+      settled = true;
+      _ringSettle = null;
+      _ringTimer?.cancel();
+      _ringTimer = null;
+      try {
+        await _ringWatch?.unsubscribe();
+      } catch (_) {}
+      _ringWatch = null;
+      await NotifyService.instance.cancelCall(inviteId);
+      if (reportEnded) await NativeCallService().reportCallEnded(inviteId);
+      if (outcome == null || !mounted) return;
+      try {
+        await CallRepository(client).add(
+          peerLabel: peerName,
+          peerId: callerId,
+          callType: callType,
+          outcome: outcome,
+          startedAt: DateTime.now(),
+          durationSeconds: 0,
+          direction: 'incoming',
+        );
+      } catch (_) {}
+      if (mounted) setState(() {});
+    }
+
+    _ringSettle = () => settle(reportEnded: false);
+    _ringTimer = Timer(
+      const Duration(seconds: 60),
+      () => settle(reportEnded: true, outcome: 'missed'),
+    );
+    _ringWatch = client.channel('ring:$inviteId')
+      ..onPostgresChanges(
+        event: PostgresChangeEvent.update,
+        schema: 'public',
+        table: 'call_invites',
+        filter: PostgresChangeFilter(
+          type: PostgresChangeFilterType.eq,
+          column: 'id',
+          value: inviteId,
+        ),
+        callback: (payload) {
+          final status = payload.newRecord['status'] as String?;
+          if (status == 'ringing') return;
+          // 'accepted'/'declined' mean this device already acted (or is
+          // about to) — stop supervising without killing the connection.
+          // 'ended' is the caller giving up: stop the ring, log the miss.
+          settle(
+            reportEnded: status != 'accepted' && status != 'declined',
+            outcome: status == 'declined'
+                ? 'declined'
+                : (status == 'accepted' ? null : 'missed'),
+          );
+        },
+      )
+      ..subscribe();
+  }
+
+  /// System call UI accepted: stop supervising the ring and run the shared
+  /// accept flow against NativeCallService's media session.
+  Future<void> _onIncomingAccepted(CallInfo call) async {
+    await _ringSettle?.call();
+    final client = call.client ?? widget.client;
+    if (client == null || !mounted) {
+      await NativeCallService().reportCallEnded(call.uuid);
+      return;
+    }
+    await _answerIncomingCall(
+      client: client,
+      inviteId: call.inviteId ?? call.uuid,
+      callerId: call.handle,
+      peerName: call.name,
+      callType: call.video ? 'video' : 'voice',
+      room: call.room ?? '',
+      decryptedKey: call.mediaKey,
+      service: NativeCallService().media,
+      ownsService: false,
+    );
+  }
+
+  /// System call UI declined: the decline RPC already went out from
+  /// NativeCallService; just stop supervising. History logging comes from
+  /// the invite status watcher.
+  Future<void> _onIncomingDeclined(CallInfo call) async {
+    await _ringSettle?.call();
+  }
+
+  /// Shared incoming-accept flow used by both the system call UI and the
+  /// in-app dialog: verify the invite is still live, decrypt the media key
+  /// (unless already decrypted), get permissions, exchange the LiveKit
+  /// token, answer, join, present the call screen and log the outcome.
+  Future<void> _answerIncomingCall({
+    required SupabaseClient client,
+    required String inviteId,
+    required String callerId,
+    required String peerName,
+    required String callType,
+    required String room,
+    String? encryptedCallKey,
+    String? decryptedKey,
+    required CallService service,
+    required bool ownsService,
+  }) async {
+    if (!mounted) return;
+    final messenger = ScaffoldMessenger.of(context);
+    final navigator = Navigator.of(context);
+    // The ring may have died while the UI sat open: re-check before
     // answering so a stale Accept becomes "already ended", never raw SQL.
     try {
       final row = await client
@@ -532,52 +953,53 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
         messenger.showSnackBar(
           const SnackBar(content: Text('This call already ended.')),
         );
+        await NativeCallService().reportCallEnded(inviteId);
         return;
       }
     } catch (_) {}
     late final String mediaKey;
-    try {
-      final encryptedKey = record['encrypted_call_key'] as String?;
-      if (encryptedKey == null || encryptedKey == 'legacy-disabled') {
-        throw StateError('This call does not contain an end-to-end key.');
-      }
-      mediaKey = await SignalCrypto(
-        client: client,
-        accountId: client.auth.currentUser!.id,
-        preferences: await SharedPreferences.getInstance(),
-      ).decryptText(callerId, encryptedKey);
-      final keyBytes = base64Url.decode(base64Url.normalize(mediaKey));
-      if (keyBytes.length != 32) {
-        throw StateError('Invalid end-to-end call key.');
-      }
-    } catch (e) {
-      messenger.showSnackBar(
-        SnackBar(content: Text('Secure call setup failed: $e')),
-      );
+    if (decryptedKey != null) {
+      mediaKey = decryptedKey;
+    } else {
       try {
-        await CallSignaling.answer(client, inviteId: inviteId, accept: false);
-      } catch (_) {}
-      return;
+        if (encryptedCallKey == null || encryptedCallKey == 'legacy-disabled') {
+          throw StateError('This call does not contain an end-to-end key.');
+        }
+        mediaKey = await SignalCrypto(
+          client: client,
+          accountId: client.auth.currentUser!.id,
+          preferences: await SharedPreferences.getInstance(),
+        ).decryptText(callerId, encryptedCallKey);
+        final keyBytes = base64Url.decode(base64Url.normalize(mediaKey));
+        if (keyBytes.length != 32) {
+          throw StateError('Invalid end-to-end call key.');
+        }
+      } catch (e) {
+        messenger.showSnackBar(
+          SnackBar(content: Text('Secure call setup failed: $e')),
+        );
+        try {
+          await CallSignaling.answer(client, inviteId: inviteId, accept: false);
+        } catch (_) {}
+        await NativeCallService().reportCallEnded(inviteId);
+        return;
+      }
     }
-    final service = CallService();
     if (!await service.ensurePermissions(video: callType == 'video')) {
       messenger.showSnackBar(
         SnackBar(content: Text(service.error ?? 'Permission denied.')),
       );
-      service.dispose();
       try {
         await CallSignaling.answer(client, inviteId: inviteId, accept: false);
       } catch (_) {}
+      await NativeCallService().reportCallEnded(inviteId);
+      if (ownsService) service.dispose();
       return;
     }
     late final String url;
     late final String token;
     try {
-      final creds = await CallSignaling.token(
-        client,
-        room: record['room'] as String? ?? '',
-        name: peerName,
-      );
+      final creds = await CallSignaling.token(client, room: room, name: peerName);
       url = creds.url;
       token = creds.token;
       try {
@@ -587,12 +1009,14 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
         messenger.showSnackBar(
           const SnackBar(content: Text('This call already ended.')),
         );
-        service.dispose();
+        await NativeCallService().reportCallEnded(inviteId);
+        if (ownsService) service.dispose();
         return;
       }
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('$e')));
-      service.dispose();
+      await NativeCallService().reportCallEnded(inviteId);
+      if (ownsService) service.dispose();
       return;
     }
     if (!await service.join(
@@ -607,9 +1031,12 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
       try {
         await CallSignaling.finish(client, inviteId: inviteId);
       } catch (_) {}
-      service.dispose();
+      await NativeCallService().reportCallEnded(inviteId);
+      if (ownsService) service.dispose();
       return;
     }
+    // The system call UI should flip from ringing to active.
+    unawaited(NativeCallService().reportCallConnected(inviteId));
     final session = ActiveCallSession(
       callId: inviteId,
       peerUsername: peerName,
@@ -620,12 +1047,17 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
     final startedAt = DateTime.now();
     var incomingDone = false;
     RealtimeChannel? remoteWatch;
+    // Set below; ending the call from the system UI (notification, headset,
+    // telecom) must finish the app-side call too, not strand a dead screen.
+    void Function(String)? uiEndListener;
     Future<void> finishIncoming(String outcome, {bool pop = true}) async {
       if (incomingDone) return;
       incomingDone = true;
       try {
         await remoteWatch?.unsubscribe();
       } catch (_) {}
+      final native = NativeCallService();
+      if (native.onCallUiEnded == uiEndListener) native.onCallUiEnded = null;
       if (outcome != 'remote') {
         try {
           await CallSignaling.finish(client, inviteId: inviteId);
@@ -645,7 +1077,8 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
           direction: 'incoming',
         );
       } catch (_) {}
-      service.dispose();
+      await NativeCallService().reportCallEnded(inviteId);
+      if (ownsService) service.dispose();
       if (pop) {
         try {
           navigator.pop();
@@ -653,6 +1086,12 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
       }
     }
 
+    void endFromSystemUi(String uuid) {
+      if (uuid == inviteId) finishIncoming('remote');
+    }
+
+    uiEndListener = endFromSystemUi;
+    NativeCallService().onCallUiEnded = endFromSystemUi;
     remoteWatch = client.channel('invite:$inviteId')
       ..onPostgresChanges(
         event: PostgresChangeEvent.update,
@@ -690,14 +1129,42 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
     );
   }
 
+  /// WhatsApp-style: the new-chat button opens your real contacts, where
+  /// tapping a contact opens the encrypted chat. No fictional conversations.
   Future<void> newChat(bool wide) async {
-    final name = await showDialog<String>(
-      context: context,
-      builder: (_) => const _NewChatDialog(),
+    final client = widget.client;
+    if (client?.auth.currentUser == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Sign in to start chatting.')),
+      );
+      return;
+    }
+    if (!mounted) return;
+    await Navigator.push(
+      context,
+      MaterialPageRoute<void>(
+        builder: (_) => ContactsPage(
+          repository: SupabaseContactsRepository(client!),
+          client: client,
+          store: widget.store,
+          push: widget.push,
+          profile: widget.profile,
+        ),
+      ),
     );
-    if (name == null || !mounted) return;
-    final chat = await widget.store.create(name);
-    if (mounted) open(chat, wide);
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _createBroadcastList() async {
+    // Open the broadcast lists page to create a new list
+    // The page handles creation internally
+    if (!mounted) return;
+    // Navigate to broadcasts tab (already there) - FAB on broadcast page handles creation
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Tap + in the Broadcasts tab to create a new list'),
+      ),
+    );
   }
 
   /// Group creation: name plus accepted contacts as initial members.
@@ -851,14 +1318,11 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
           ),
         );
         if (!mounted || choice == null) break;
-        await store.setMute(
-          chat,
-          switch (choice) {
-            '8h' => const Duration(hours: 8),
-            '1w' => const Duration(days: 7),
-            _ => null,
-          },
-        );
+        await store.setMute(chat, switch (choice) {
+          '8h' => const Duration(hours: 8),
+          '1w' => const Duration(days: 7),
+          _ => null,
+        });
       case 'lock':
         if (chat.locked) {
           await store.setLocked(chat.id, false);
@@ -914,8 +1378,18 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
     listenable: widget.store,
     builder: (context, _) => LayoutBuilder(
       builder: (context, constraints) {
+        _checkAppVersion();
+        if (_updateRequired) {
+          return AppUpdateGate(
+            currentVersion: _installedAppVersion ?? '?',
+            minVersion: _minAppVersion ?? '?',
+            onRecheck: _recheckAppVersion,
+          );
+        }
         _watchIncomingCalls(context);
         _watchNotify();
+        _watchGroupVoice();
+        _watchChatNames();
         final wide = constraints.maxWidth >= 850;
         // Short screens (landscape phones, large text): shrink the fixed
         // header so the conversation list keeps room instead of overflowing.
@@ -931,13 +1405,21 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
           if (c.locked && !lockRevealed) return false;
           return true;
         }).toList();
-        // Pinned first, otherwise stable insertion order.
+        // Pinned chats stay first; every other conversation is ordered by its
+        // newest message so a newly received reply immediately rises to top.
         final indexed = base.asMap().entries.toList();
         indexed.sort((a, b) {
           if (a.value.pinned != b.value.pinned) {
             return a.value.pinned ? -1 : 1;
           }
-          return a.key.compareTo(b.key);
+          final aAt = a.value.messages.isEmpty
+              ? DateTime.fromMillisecondsSinceEpoch(0)
+              : a.value.messages.last.at;
+          final bAt = b.value.messages.isEmpty
+              ? DateTime.fromMillisecondsSinceEpoch(0)
+              : b.value.messages.last.at;
+          final recency = bAt.compareTo(aAt);
+          return recency == 0 ? a.key.compareTo(b.key) : recency;
         });
         final chats = [for (final e in indexed) e.value];
         final lockedCount = widget.store.conversations
@@ -977,15 +1459,27 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
                         ),
                       ),
                       child: Semantics(
-                        label: 'OpenChat logo',
+                        label: 'Your profile photo',
                         image: true,
-                        child: Image.asset(
-                          Theme.of(context).brightness == Brightness.dark
-                              ? 'assets/logos/openchat_dove_white.png'
-                              : 'assets/logos/openchat_dove.png',
-                          width: 30,
-                          height: 30,
-                          fit: BoxFit.contain,
+                        child: ListenableBuilder(
+                          listenable: widget.profile,
+                          builder: (context, _) {
+                            final file = widget.profile.avatarFile;
+                            if (file != null) {
+                              return CircleAvatar(
+                                radius: 18,
+                                foregroundImage: FileImage(file),
+                              );
+                            }
+                            return Image.asset(
+                              Theme.of(context).brightness == Brightness.dark
+                                  ? 'assets/logos/openchat_dove_white.png'
+                                  : 'assets/logos/openchat_dove.png',
+                              width: 30,
+                              height: 30,
+                              fit: BoxFit.contain,
+                            );
+                          },
                         ),
                       ),
                     ),
@@ -993,7 +1487,7 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
                     IconButton(
                       tooltip: 'Camera — new status',
                       icon: const Icon(Icons.photo_camera_outlined),
-                      onPressed: () => setState(() => activeTab = 1),
+                      onPressed: () => setState(() => activeTab = 2),
                     ),
                     IconButton(
                       tooltip: 'My profile',
@@ -1011,7 +1505,7 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
                     IconButton(
                       tooltip: 'Settings',
                       icon: const Icon(Icons.settings_outlined),
-                      onPressed: () => setState(() => activeTab = 3),
+                      onPressed: () => setState(() => activeTab = 4),
                     ),
                     PopupMenuButton<String>(
                       tooltip: 'More options',
@@ -1044,7 +1538,7 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
                               ),
                             );
                           case 'settings':
-                            setState(() => activeTab = 3);
+                            setState(() => activeTab = 4);
                         }
                       },
                       itemBuilder: (context) => const [
@@ -1169,13 +1663,16 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
                 ),
               ),
               SizedBox(height: compact ? 6 : 16),
-              if (widget.client?.auth.currentUser != null &&
-                  filter != 'groups')
+              if (widget.client?.auth.currentUser != null && filter != 'groups')
                 _SecureSection(
+                  key: ValueKey(widget.client!.auth.currentUser!.id),
                   client: widget.client!,
                   store: widget.store,
                   profile: widget.profile,
                   push: widget.push,
+                  query: query,
+                  unreadOnly: filter == 'unread',
+                  directUnread: _directUnread,
                 ),
               if (widget.client?.auth.currentUser != null)
                 _GroupSection(
@@ -1185,6 +1682,7 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
                   onCreateGroup: _createGroup,
                   query: query,
                   filter: filter,
+                  conversationRepo: _conversationRepo,
                 ),
               if (lockedCount > 0)
                 FutureBuilder<String?>(
@@ -1211,7 +1709,13 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
                               : 'Locked chats ($lockedCount)',
                           style: const TextStyle(fontWeight: FontWeight.w700),
                         ),
-                        subtitle: lockRevealed ? null : Text(secret.isEmpty ? 'Verify your PIN to reveal them.' : 'Type secret code in search or verify PIN.'),
+                        subtitle: lockRevealed
+                            ? null
+                            : Text(
+                                secret.isEmpty
+                                    ? 'Verify your PIN to reveal them.'
+                                    : 'Type secret code in search or verify PIN.',
+                              ),
                         trailing: const Icon(Icons.chevron_right),
                         onTap: () async {
                           if (lockRevealed) {
@@ -1271,7 +1775,10 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
                                       subtitle: Text(
                                         c.messages.isEmpty
                                             ? 'No messages'
-                                            : c.messages.last.text,
+                                            : securePreviewFor(
+                                                c.messages.last.text,
+                                                mine: c.messages.last.mine,
+                                              ),
                                         maxLines: 1,
                                         overflow: TextOverflow.ellipsis,
                                       ),
@@ -1405,7 +1912,10 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
                                     child: Text(
                                       chat.messages.isEmpty
                                           ? 'Say hello'
-                                          : chat.messages.last.text,
+                                          : securePreviewFor(
+                                              chat.messages.last.text,
+                                              mine: chat.messages.last.mine,
+                                            ),
                                       maxLines: 1,
                                       overflow: TextOverflow.ellipsis,
                                     ),
@@ -1469,9 +1979,16 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
           ),
         );
         final currentBody = switch (activeTab) {
-          1 => StatusPage(client: widget.client),
-          2 => CallHistoryPage(client: widget.client),
-          3 => SettingsPage(
+          1 => BroadcastListsPage(
+            service: _broadcastService,
+            client: widget.client,
+            store: widget.store,
+            profile: widget.profile,
+            push: widget.push,
+          ),
+          2 => StatusPage(client: widget.client, profile: widget.profile),
+          3 => CallHistoryPage(client: widget.client, onNewCall: () => newChat(false)),
+          4 => SettingsPage(
             store: widget.store,
             profile: widget.profile,
             push: widget.push,
@@ -1484,7 +2001,7 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
 
         return Scaffold(
           body: SafeArea(
-            child: wide
+            child: wide && activeTab == 0
                 ? Row(
                     children: [
                       SizedBox(width: 370, child: list),
@@ -1504,11 +2021,17 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
                   )
                 : currentBody,
           ),
-          floatingActionButton: activeTab == 0
+          floatingActionButton: (activeTab == 0 || activeTab == 1)
               ? FloatingActionButton(
-                  tooltip: 'New chat',
-                  onPressed: () => newChat(wide),
-                  child: const Icon(Icons.chat_outlined),
+                  tooltip: activeTab == 0 ? 'New chat' : 'New broadcast',
+                  onPressed: activeTab == 0
+                      ? () => newChat(wide)
+                      : () => _createBroadcastList(),
+                  child: Icon(
+                    activeTab == 0
+                        ? Icons.chat_outlined
+                        : Icons.campaign_outlined,
+                  ),
                 )
               : null,
           bottomNavigationBar: NavigationBar(
@@ -1521,6 +2044,11 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
                 icon: Icon(Icons.chat_outlined),
                 selectedIcon: Icon(Icons.chat),
                 label: 'Chats',
+              ),
+              NavigationDestination(
+                icon: Icon(Icons.campaign_outlined),
+                selectedIcon: Icon(Icons.campaign),
+                label: 'Broadcasts',
               ),
               NavigationDestination(
                 icon: Icon(Icons.donut_large_outlined),
@@ -1545,46 +2073,6 @@ class _ChatHomeState extends State<ChatHome> with WidgetsBindingObserver {
   );
 }
 
-class _NewChatDialog extends StatefulWidget {
-  const _NewChatDialog();
-  @override
-  State<_NewChatDialog> createState() => _NewChatDialogState();
-}
-
-class _NewChatDialogState extends State<_NewChatDialog> {
-  final controller = TextEditingController();
-  @override
-  void dispose() {
-    controller.dispose();
-    super.dispose();
-  }
-
-  void submit() {
-    if (controller.text.trim().isNotEmpty) {
-      Navigator.pop(context, controller.text.trim());
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) => AlertDialog(
-    title: const Text('New demo conversation'),
-    content: TextField(
-      controller: controller,
-      autofocus: true,
-      maxLength: 60,
-      decoration: const InputDecoration(labelText: 'Contact name'),
-      onSubmitted: (_) => submit(),
-    ),
-    actions: [
-      TextButton(
-        onPressed: () => Navigator.pop(context),
-        child: const Text('Cancel'),
-      ),
-      FilledButton(onPressed: submit, child: const Text('Create')),
-    ],
-  );
-}
-
 class ContactAvatar extends StatelessWidget {
   const ContactAvatar({super.key, required this.chat});
   final Conversation chat;
@@ -1606,19 +2094,52 @@ class ContactAvatar extends StatelessWidget {
 String timeLabel(DateTime at) =>
     '${at.hour.toString().padLeft(2, '0')}:${at.minute.toString().padLeft(2, '0')}';
 
+/// WhatsApp-style one-line preview for an encrypted message body: text
+/// snippet or media/poll glyph. Raw stored bodies are JSON envelopes, so
+/// chat-list tiles must never render them directly.
+String securePreviewFor(String raw, {bool mine = false}) {
+  final body = parseMessageBody(raw);
+  final String preview;
+  if (body.isImage) {
+    preview = '📷 ${body.text.isEmpty ? 'Photo' : body.text}';
+  } else if (body.isVideo) {
+    preview = '🎬 ${body.text.isEmpty ? 'Video' : body.text}';
+  } else if (body.isPoll) {
+    preview = '📊 ${body.question ?? 'Poll'}';
+  } else if (body.isVote) {
+    preview = '🗳️ Voted in a poll';
+  } else if (body.isTombstone) {
+    preview = 'This message was deleted';
+  } else if (body.isReply) {
+    preview = body.text;
+  } else if (body.text.length > 60) {
+    preview = '${body.text.substring(0, 60)}…';
+  } else {
+    preview = body.text;
+  }
+  return mine ? 'You: $preview' : preview;
+}
+
 /// Cloud-backed encrypted conversations for accepted contacts. Visible only
 /// when signed in; the local demo list below stays for everyone.
 class _SecureSection extends StatefulWidget {
   const _SecureSection({
+    super.key,
     required this.client,
     required this.store,
     required this.profile,
     required this.push,
+    this.query = '',
+    this.unreadOnly = false,
+    this.directUnread,
   });
   final SupabaseClient client;
   final ChatStore store;
   final LocalProfile profile;
   final PushService push;
+  final String query;
+  final bool unreadOnly;
+  final DirectUnread? directUnread;
   @override
   State<_SecureSection> createState() => _SecureSectionState();
 }
@@ -1630,21 +2151,65 @@ class _SecureRow {
     this.at,
     this.unread = false,
     this.hasDraft = false,
+    this.isSelf = false,
   });
   final CloudContact contact;
   final String preview;
   final DateTime? at;
   final bool unread;
   final bool hasDraft;
+
+  /// True for the pinned "Message yourself" row.
+  final bool isSelf;
 }
 
 class _SecureSectionState extends State<_SecureSection> {
   late Future<List<_SecureRow>> _future;
+  late final DirectUnread _unread;
+  /// Signed-in user's own cloud profile: powers the pinned
+  /// "Message yourself" row (WhatsApp-style self chat) in real time.
+  AccountProfile? _ownProfile;
 
   @override
   void initState() {
     super.initState();
+    _unread = widget.directUnread!;
+    _unread.addListener(_localChanged);
+    widget.store.addListener(_localChanged);
+    // Real-time profile changes (avatar/name/online) refresh this section.
+    ProfileWatcher.of(widget.client).start();
+    ProfileWatcher.of(widget.client).addListener(_profilesChanged);
+    unawaited(_loadOwnProfile());
     _future = _load();
+  }
+
+  Future<void> _loadOwnProfile() async {
+    try {
+      final own = await SupabaseContactsRepository(
+        widget.client,
+      ).profile();
+      if (mounted) setState(() => _ownProfile = own);
+    } catch (e) {
+      ErrorReport.reportError('selfchat-profile', e, code: 'load');
+    }
+  }
+
+  void _profilesChanged() {
+    if (!mounted) return;
+    setState(() => _future = _load());
+    unawaited(_loadOwnProfile());
+  }
+
+  void _localChanged() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    widget.store.removeListener(_localChanged);
+    _unread.removeListener(_localChanged);
+    ProfileWatcher.of(widget.client).removeListener(_profilesChanged);
+    super.dispose();
   }
 
   Future<List<_SecureRow>> _load() async {
@@ -1652,7 +2217,60 @@ class _SecureSectionState extends State<_SecureSection> {
     final contacts = (await SupabaseContactsRepository(
       widget.client,
     ).contacts()).where((c) => c.status == 'accepted').toList();
-    return [for (final c in contacts) _row(me, c)];
+    final rows = [for (final c in contacts) _row(me, c)];
+    rows.sort((a, b) {
+      final aAt = a.at ?? DateTime.fromMillisecondsSinceEpoch(0);
+      final bAt = b.at ?? DateTime.fromMillisecondsSinceEpoch(0);
+      return bAt.compareTo(aAt);
+    });
+    return rows;
+  }
+
+  /// The pinned "Message yourself" row: a real encrypted self chat backed
+  /// by the durable sealed-history store (peer id == own account id).
+  _SecureRow _selfRow(String? me, AccountProfile own) {
+    if (me == null) {
+      return _SecureRow(
+        contact: CloudContact(
+          userId: '',
+          name: 'Message yourself',
+          username: own.username ?? '',
+          about: null,
+          avatarUrl: own.avatarUrl,
+          avatarPath: own.avatarPath,
+          status: 'accepted',
+          incoming: false,
+        ),
+        preview: 'Sign in to sync your notes.',
+        isSelf: true,
+      );
+    }
+    final msgs = widget.store.getSecureConversation(me, me);
+    String preview = 'Your personal notes, synced to your backup.';
+    DateTime? at;
+    var unread = false;
+    if (msgs.isNotEmpty) {
+      final last = msgs.last;
+      preview = securePreviewFor(last.text, mine: last.mine);
+      at = last.at;
+      unread = widget.store.secureUnread(me, me);
+    }
+    return _SecureRow(
+      contact: CloudContact(
+        userId: me,
+        name: 'Message yourself',
+        username: own.username ?? '',
+        about: null,
+        avatarUrl: own.avatarUrl,
+        avatarPath: own.avatarPath,
+        status: 'accepted',
+        incoming: false,
+      ),
+      preview: preview,
+      at: at,
+      unread: unread,
+      isSelf: true,
+    );
   }
 
   /// Last-message preview so encrypted chats feel persistent: text
@@ -1663,50 +2281,38 @@ class _SecureSectionState extends State<_SecureSection> {
       return _SecureRow(contact: contact, preview: fallback);
     }
     final msgs = widget.store.getSecureConversation(me, contact.userId);
+    final unread =
+        widget.store.secureUnread(me, contact.userId) ||
+        (_unread.counts[contact.userId] ?? 0) > 0;
     if (msgs.isEmpty) {
-      return _SecureRow(contact: contact, preview: fallback);
+      return _SecureRow(
+        contact: contact,
+        preview: unread ? 'New encrypted message' : fallback,
+        unread: unread,
+      );
     }
     final last = msgs.last;
-    final body = parseMessageBody(last.text);
-    final String preview;
-    if (body.isImage) {
-      preview = '📷 ${body.text.isEmpty ? 'Photo' : body.text}';
-    } else if (body.isVideo) {
-      preview = '🎬 ${body.text.isEmpty ? 'Video' : body.text}';
-    } else if (body.isPoll) {
-      preview = '📊 ${body.question ?? 'Poll'}';
-    } else if (body.isVote) {
-      preview = '🗳️ Voted in a poll';
-    } else if (body.isTombstone) {
-      preview = 'This message was deleted';
-    } else if (body.isReply) {
-      preview = body.text;
-    } else if (body.text.length > 60) {
-      preview = '${body.text.substring(0, 60)}…';
-    } else {
-      preview = body.text;
-    }
+    final preview = securePreviewFor(last.text, mine: last.mine);
     final draft = widget.store.secureDraft(me, contact.userId);
     return _SecureRow(
       contact: contact,
-      preview: draft.isNotEmpty
-          ? '✏️ Draft: $draft'
-          : '${last.mine ? 'You: ' : ''}$preview',
+      preview: draft.isNotEmpty ? '✏️ Draft: $draft' : preview,
       at: last.at,
-      unread: widget.store.secureUnread(me, contact.userId),
+      unread: unread,
       hasDraft: draft.isNotEmpty,
     );
   }
 
   void _refresh() {
     if (!mounted) return;
+    unawaited(_unread.refresh());
     setState(() => _future = _load());
   }
 
   Future<void> _rowActions(_SecureRow row) async {
     final me = widget.client.auth.currentUser?.id;
     if (me == null) return;
-    final unread = widget.store.secureUnread(me, row.contact.userId);
+    final unread = row.unread;
     final action = await showModalBottomSheet<String>(
       context: context,
       showDragHandle: true,
@@ -1728,6 +2334,11 @@ class _SecureSectionState extends State<_SecureSection> {
       ),
     );
     if (action == 'read') {
+      if (unread && (_unread.counts[row.contact.userId] ?? 0) > 0) {
+        // Reading encrypted pending messages requires opening/unlocking them.
+        if (mounted) _open(row.contact);
+        return;
+      }
       await widget.store.setSecureUnread(me, row.contact.userId, !unread);
       _refresh();
     }
@@ -1803,13 +2414,45 @@ class _SecureSectionState extends State<_SecureSection> {
                 ),
               );
             }
-            final chats = snapshot.data ?? const <_SecureRow>[];
+            final loaded = snapshot.data ?? const <_SecureRow>[];
+            // Rebuild previews and ordering from durable local history on
+            // every store update so incoming messages move their chat to top
+            // without waiting for a manual refresh.
+            final search = widget.query.trim().toLowerCase();
+            final selfRow = _ownProfile == null
+                ? null
+                : _selfRow(widget.client.auth.currentUser?.id, _ownProfile!);
+            final chats =
+                [
+                      if (selfRow != null) selfRow,
+                      for (final row in loaded)
+                        _row(widget.client.auth.currentUser?.id, row.contact),
+                    ]
+                    .where(
+                      (row) =>
+                          (!widget.unreadOnly || row.unread) &&
+                          (search.isEmpty ||
+                              '${row.contact.name} ${row.contact.username} ${row.preview}'
+                                  .toLowerCase()
+                                  .contains(search)),
+                    )
+                    .toList()
+                  ..sort((a, b) {
+                    // The self chat stays pinned to the very top, like
+                    // WhatsApp's "Message yourself".
+                    if (a.isSelf != b.isSelf) return a.isSelf ? -1 : 1;
+                    final aAt = a.at ?? DateTime.fromMillisecondsSinceEpoch(0);
+                    final bAt = b.at ?? DateTime.fromMillisecondsSinceEpoch(0);
+                    return bAt.compareTo(aAt);
+                  });
             if (chats.isEmpty) {
-              return const Padding(
-                padding: EdgeInsets.symmetric(vertical: 4),
+              return Padding(
+                padding: const EdgeInsets.symmetric(vertical: 4),
                 child: Text(
-                  'No encrypted chats yet. Add someone in Settings → People & profile, then open their encrypted chat here.',
-                  style: TextStyle(fontSize: 12, color: Color(0xFF66748A)),
+                  loaded.isEmpty
+                      ? 'No encrypted chats yet. Add someone in Settings → People & profile, then open their encrypted chat here.'
+                      : 'No encrypted chats match this filter.',
+                  style: const TextStyle(fontSize: 12, color: Color(0xFF66748A)),
                 ),
               );
             }
@@ -1909,17 +2552,14 @@ class _GroupSection extends StatefulWidget {
     required this.onCreateGroup,
     this.query = '',
     this.filter = 'all',
+    this.conversationRepo,
   });
   final SupabaseClient client;
   final SecureHistoryDatabase? secureHistory;
   final VoidCallback onCreateGroup;
-
-  /// Title filter from the home search box (member-name search needs a
-  /// per-group member fetch and stays a follow-up).
   final String query;
-
-  /// Active home filter: all / unread / favourites / groups.
   final String filter;
+  final ConversationRepository? conversationRepo;
   @override
   State<_GroupSection> createState() => _GroupSectionState();
 }
@@ -1930,10 +2570,7 @@ class _GroupSectionState extends State<_GroupSection> {
   @override
   void initState() {
     super.initState();
-    _repo = ConversationRepository(
-      widget.client,
-      secureHistory: widget.secureHistory,
-    );
+    _repo = widget.conversationRepo!;
     _repo.addListener(_changed);
     refresh();
     _repo.subscribeToMembership();
@@ -1955,29 +2592,43 @@ class _GroupSectionState extends State<_GroupSection> {
           mainAxisSize: MainAxisSize.min,
           children: [
             ListTile(
-              leading: Icon(group.isPinned ? Icons.push_pin : Icons.push_pin_outlined),
+              leading: Icon(
+                group.isPinned ? Icons.push_pin : Icons.push_pin_outlined,
+              ),
               title: Text(group.isPinned ? 'Unpin chat' : 'Pin to top'),
               onTap: () => Navigator.pop(ctx, 'pin'),
             ),
             ListTile(
-              leading: Icon(group.isFavourite ? Icons.star : Icons.star_outline),
+              leading: Icon(
+                group.isFavourite ? Icons.star : Icons.star_outline,
+              ),
               title: Text(
-                group.isFavourite ? 'Remove from favourites' : 'Add to favourites',
+                group.isFavourite
+                    ? 'Remove from favourites'
+                    : 'Add to favourites',
               ),
               onTap: () => Navigator.pop(ctx, 'favourite'),
             ),
             ListTile(
-              leading: Icon(group.isMuted ? Icons.notifications_off : Icons.notifications),
-              title: Text(group.isMuted ? 'Unmute notifications' : 'Mute notifications'),
+              leading: Icon(
+                group.isMuted ? Icons.notifications_off : Icons.notifications,
+              ),
+              title: Text(
+                group.isMuted ? 'Unmute notifications' : 'Mute notifications',
+              ),
               onTap: () => Navigator.pop(ctx, 'mute'),
             ),
             ListTile(
-              leading: Icon(group.isArchived ? Icons.unarchive : Icons.archive_outlined),
+              leading: Icon(
+                group.isArchived ? Icons.unarchive : Icons.archive_outlined,
+              ),
               title: Text(group.isArchived ? 'Unarchive' : 'Archive'),
               onTap: () => Navigator.pop(ctx, 'archive'),
             ),
             ListTile(
-              leading: Icon(group.isLocked ? Icons.lock_open : Icons.lock_outline),
+              leading: Icon(
+                group.isLocked ? Icons.lock_open : Icons.lock_outline,
+              ),
               title: Text(group.isLocked ? 'Unlock chat' : 'Lock chat'),
               onTap: () => Navigator.pop(ctx, 'lock'),
             ),
@@ -2002,8 +2653,13 @@ class _GroupSectionState extends State<_GroupSection> {
     switch (action) {
       case 'pin':
         await _repo.setConversationFlags(group.id, pinned: !group.isPinned);
+        return;
       case 'favourite':
-        await _repo.setConversationFlags(group.id, favourite: !group.isFavourite);
+        await _repo.setConversationFlags(
+          group.id,
+          favourite: !group.isFavourite,
+        );
+        return;
       case 'mute':
         if (group.isMuted) {
           await _repo.setConversationFlags(group.id, muted: false);
@@ -2016,18 +2672,27 @@ class _GroupSectionState extends State<_GroupSection> {
             mutedUntil: choice.until,
           );
         }
+        return;
       case 'archive':
         await _repo.setConversationFlags(group.id, archived: !group.isArchived);
+        return;
       case 'lock':
         await _repo.setConversationFlags(group.id, locked: !group.isLocked);
+        return;
       case 'unread':
         final hasUnread = group.markedUnread || group.unreadCount > 0;
+        if (hasUnread) {
+          await _repo.markGroupRead(
+            group.id,
+            group.lastActivity ?? DateTime.now().toUtc(),
+          );
+        }
         await _repo.setConversationFlags(group.id, markedUnread: !hasUnread);
+        return;
     }
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Chat updated.')),
-    );
+    ScaffoldMessenger.of(context)
+        .showSnackBar(const SnackBar(content: Text('Chat updated.')));
   }
 
   /// Returns the mute expiry and whether the picker was cancelled.
@@ -2065,7 +2730,7 @@ class _GroupSectionState extends State<_GroupSection> {
   void dispose() {
     _repo.removeListener(_changed);
     _repo.unsubscribeFromMembership();
-    _repo.dispose();
+    // Don't dispose _repo - it's shared and managed by _ChatHomeState
     super.dispose();
   }
 
@@ -2102,9 +2767,7 @@ class _GroupSectionState extends State<_GroupSection> {
       return const SizedBox.shrink();
     }
     if (groups.isEmpty) return const SizedBox.shrink();
-    final sectionTitle = filter == 'favourites'
-        ? 'Favourite groups'
-        : 'Groups';
+    final sectionTitle = filter == 'favourites' ? 'Favourite groups' : 'Groups';
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -2146,9 +2809,9 @@ class _GroupSectionState extends State<_GroupSection> {
                     ? NetworkImage(group.avatarUrl!)
                     : null,
                 child: Text(
-                  (group.title ?? '?').isEmpty
+                  ((group.title ?? '').trim().isEmpty)
                       ? '?'
-                      : group.title![0].toUpperCase(),
+                      : group.title!.trim()[0].toUpperCase(),
                   style: const TextStyle(
                     color: Color(0xFF245CDB),
                     fontWeight: FontWeight.w800,
@@ -2159,7 +2822,9 @@ class _GroupSectionState extends State<_GroupSection> {
                 children: [
                   Expanded(
                     child: Text(
-                      group.title ?? 'Untitled group',
+                      (group.title?.trim().isNotEmpty ?? false)
+                          ? group.title!
+                          : 'Untitled group',
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: const TextStyle(fontWeight: FontWeight.w700),
@@ -2194,6 +2859,11 @@ class _GroupSectionState extends State<_GroupSection> {
                           color: Colors.white,
                         ),
                       ),
+                    )
+                  : group.markedUnread
+                  ? const CircleAvatar(
+                      radius: 5,
+                      backgroundColor: Color(0xFF245CDB),
                     )
                   : const Icon(Icons.chevron_right),
               onLongPress: () => _groupActions(group),
@@ -2456,14 +3126,11 @@ class _ChatPaneState extends State<ChatPane> {
       ),
     );
     if (choice == null || !mounted) return;
-    await widget.store.setMute(
-      widget.chat,
-      switch (choice) {
-        '8h' => const Duration(hours: 8),
-        '1w' => const Duration(days: 7),
-        _ => null,
-      },
-    );
+    await widget.store.setMute(widget.chat, switch (choice) {
+      '8h' => const Duration(hours: 8),
+      '1w' => const Duration(days: 7),
+      _ => null,
+    });
     setState(() {});
   }
 
@@ -2551,48 +3218,6 @@ class _ChatPaneState extends State<ChatPane> {
                   ),
                 ],
               ),
-            IconButton(
-              tooltip: 'Voice call',
-              onPressed: () {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute<void>(
-                    builder: (_) => CallScreen(
-                      session: ActiveCallSession(
-                        callId: DateTime.now().millisecondsSinceEpoch
-                            .toString(),
-                        peerUsername: widget.chat.id,
-                        peerDisplayName: widget.chat.name,
-                        type: CallType.voice,
-                      ),
-                      onEndCall: () => Navigator.pop(context),
-                    ),
-                  ),
-                );
-              },
-              icon: const Icon(Icons.call_outlined),
-            ),
-            IconButton(
-              tooltip: 'Video call',
-              onPressed: () {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute<void>(
-                    builder: (_) => CallScreen(
-                      session: ActiveCallSession(
-                        callId: DateTime.now().millisecondsSinceEpoch
-                            .toString(),
-                        peerUsername: widget.chat.id,
-                        peerDisplayName: widget.chat.name,
-                        type: CallType.video,
-                      ),
-                      onEndCall: () => Navigator.pop(context),
-                    ),
-                  ),
-                );
-              },
-              icon: const Icon(Icons.videocam_outlined),
-            ),
           ],
         ),
       ),
@@ -2603,7 +3228,7 @@ class _ChatPaneState extends State<ChatPane> {
             : const Color(0xFFEBF0FC),
         padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
         child: Text(
-          '💬 Demo conversation · stored only on this device',
+          '💬 Demo conversation · stored only on this device · calls are available in encrypted chats',
           textAlign: TextAlign.center,
           style: TextStyle(
             fontSize: 11,

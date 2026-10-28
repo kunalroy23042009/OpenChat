@@ -103,6 +103,7 @@ class ContactSyncService {
       ) as List;
       for (final row in rows) {
         final map = Map<String, dynamic>.from(row as Map);
+        final avatarPath = map['avatar_path'] as String?;
         matched.add(
           SyncedContact(
             contact: CloudContact(
@@ -110,7 +111,11 @@ class ContactSyncService {
               name: map['display_name'] as String? ?? 'OpenChat user',
               username: map['username'] as String? ?? '',
               about: map['about'] as String?,
-              avatarUrl: map['avatar_url'] as String?,
+              avatarPath: avatarPath,
+              avatarUrl: await _avatarUrl(
+                avatarPath,
+                map['avatar_url'] as String?,
+              ),
               status: 'found',
               incoming: false,
             ),
@@ -120,5 +125,16 @@ class ContactSyncService {
       }
     }
     return matched;
+  }
+
+  Future<String?> _avatarUrl(String? path, String? legacyUrl) async {
+    if (path == null || path.isEmpty) return legacyUrl;
+    try {
+      return await client.storage
+          .from('profile-avatars')
+          .createSignedUrl(path, 60 * 60);
+    } catch (_) {
+      return null;
+    }
   }
 }

@@ -13,7 +13,8 @@ class CallLogItem {
     required this.timestamp,
     required this.type,
     required this.isIncoming,
-    required this.isMissed,
+    required this.outcome,
+    required this.durationSeconds,
     this.peerId,
   });
 
@@ -23,25 +24,36 @@ class CallLogItem {
   final DateTime timestamp;
   final CallType type;
   final bool isIncoming;
-  final bool isMissed;
+
+  /// 'completed', 'declined', 'missed', 'failed' (or '' when unknown).
+  final String outcome;
+  final int durationSeconds;
 
   /// Supabase user id when known; without it calls start from chats.
   final String? peerId;
+
+  /// WhatsApp semantics: a call we never answered or that failed.
+  bool get isMissed => outcome == 'missed' || outcome == 'failed';
 }
 
 class CallHistoryPage extends StatefulWidget {
-  const CallHistoryPage({super.key, this.client});
+  const CallHistoryPage({super.key, this.client, this.onNewCall});
 
   final SupabaseClient? client;
+
+  /// Opens the contact picker (WhatsApp's new-call button). When unset the
+  /// buttons fall back to a hint.
+  final VoidCallback? onNewCall;
 
   @override
   State<CallHistoryPage> createState() => _CallHistoryPageState();
 }
 
 class _CallHistoryPageState extends State<CallHistoryPage> {
-  /// Real call entries only: cloud history when signed in, plus calls
-  /// placed on this device. No fictional sample entries.
-  final List<CallLogItem> _logs = [];
+  /// Real call entries only: cloud history when signed in. No fictional
+  /// sample entries.
+  List<CallLogItem> _logs = [];
+  bool _loading = true;
 
   @override
   void initState() {
@@ -51,15 +63,16 @@ class _CallHistoryPageState extends State<CallHistoryPage> {
 
   Future<void> _loadCloudLogs() async {
     final client = widget.client;
-    if (client?.auth.currentUser == null) return;
+    if (client?.auth.currentUser == null) {
+      if (mounted) setState(() => _loading = false);
+      return;
+    }
     try {
       final cloud = await CallRepository(client!).list();
       if (!mounted) return;
       setState(() {
-        _logs
-          ..clear()
-          ..addAll(
-            cloud.map(
+        _logs = cloud
+            .map(
               (log) => CallLogItem(
                 id: log.id,
                 contactName: log.peerLabel,
@@ -67,13 +80,17 @@ class _CallHistoryPageState extends State<CallHistoryPage> {
                 timestamp: log.startedAt,
                 type: log.callType == 'video' ? CallType.video : CallType.voice,
                 isIncoming: log.direction == 'incoming',
-                isMissed: log.outcome == 'missed',
+                outcome: log.outcome,
+                durationSeconds: log.durationSeconds,
                 peerId: log.peerId,
               ),
-            ));
+            )
+            .toList();
+        _loading = false;
       });
     } catch (_) {
-      // Keep demo logs available when offline or before migration deployment.
+      // Offline or migration pending: show what we have.
+      if (mounted) setState(() => _loading = false);
     }
   }
 
@@ -110,6 +127,8 @@ class _CallHistoryPageState extends State<CallHistoryPage> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final missedColor = theme.colorScheme.error;
+    final answeredColor = const Color(0xFF00A884);
 
     return Scaffold(
       appBar: AppBar(
@@ -117,103 +136,188 @@ class _CallHistoryPageState extends State<CallHistoryPage> {
         actions: [
           IconButton(
             icon: const Icon(Icons.add_call),
-            onPressed: () {
-              if (_logs.isNotEmpty) {
-                _startCall(_logs.first, CallType.voice);
-              }
-            },
+            tooltip: 'New call',
+            onPressed: widget.onNewCall,
           ),
         ],
       ),
-      body: ListView(
-        children: [
-          const Padding(
-            padding: EdgeInsets.fromLTRB(16, 16, 16, 8),
-            child: Text(
-              'Recent calls',
-              style: TextStyle(
-                fontWeight: FontWeight.bold,
-                color: Colors.grey,
-                fontSize: 13,
-              ),
-            ),
-          ),
-          ..._logs.map(
-            (log) => ListTile(
-              leading: CircleAvatar(
-                backgroundColor: theme.colorScheme.primary,
-                child: Text(
-                  log.contactName[0].toUpperCase(),
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-              ),
-              title: Text(
-                log.contactName,
-                style: TextStyle(
-                  fontWeight: FontWeight.w600,
-                  color: log.isMissed ? Colors.red : null,
-                ),
-              ),
-              subtitle: Row(
+      body: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : _logs.isEmpty
+          ? Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
                 children: [
                   Icon(
-                    log.isIncoming ? Icons.call_received : Icons.call_made,
-                    size: 14,
-                    color: log.isMissed
-                        ? Colors.red
-                        : (log.isIncoming ? Colors.green : Colors.blue),
+                    Icons.call_rounded,
+                    size: 56,
+                    color: theme.colorScheme.onSurfaceVariant,
                   ),
-                  const SizedBox(width: 4),
+                  const SizedBox(height: 12),
                   Text(
-                    'Today, ${_formatTime(log.timestamp)}',
-                    style: const TextStyle(fontSize: 12),
+                    'No recent calls',
+                    style: theme.textTheme.titleMedium,
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Missed calls will appear here.',
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
                   ),
                 ],
               ),
-              trailing: Row(
-                mainAxisSize: MainAxisSize.min,
+            )
+          : RefreshIndicator(
+              onRefresh: _loadCloudLogs,
+              child: ListView(
+                physics: const AlwaysScrollableScrollPhysics(),
                 children: [
-                  IconButton(
-                    icon: const Icon(Icons.call),
-                    color: theme.colorScheme.primary,
-                    onPressed: () => _startCall(log, CallType.voice),
+                  const Padding(
+                    padding: EdgeInsets.fromLTRB(16, 16, 16, 8),
+                    child: Text(
+                      'Recent calls',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        color: Colors.grey,
+                        fontSize: 13,
+                      ),
+                    ),
                   ),
-                  IconButton(
-                    icon: const Icon(Icons.videocam),
-                    color: theme.colorScheme.primary,
-                    onPressed: () => _startCall(log, CallType.video),
+                  ..._logs.map(
+                    (log) => ListTile(
+                      leading: CircleAvatar(
+                        backgroundColor: theme.colorScheme.primaryContainer,
+                        foregroundColor:
+                            theme.colorScheme.onPrimaryContainer,
+                        child: Text(
+                          log.contactName.isEmpty
+                              ? '?'
+                              : log.contactName[0].toUpperCase(),
+                          style: const TextStyle(
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                      title: Text(
+                        log.contactName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontWeight: FontWeight.w600,
+                          color: log.isMissed ? missedColor : null,
+                        ),
+                      ),
+                      subtitle: Row(
+                        children: [
+                          Icon(
+                            log.isMissed
+                                ? Icons.call_missed
+                                : log.isIncoming
+                                ? Icons.call_received
+                                : Icons.call_made,
+                            size: 15,
+                            color: log.isMissed
+                                ? missedColor
+                                : answeredColor,
+                          ),
+                          const SizedBox(width: 4),
+                          Expanded(
+                            child: Text(
+                              _describeCall(log),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: log.isMissed
+                                    ? missedColor
+                                    : theme.colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          IconButton(
+                            icon: const Icon(Icons.call),
+                            color: answeredColor,
+                            tooltip: 'Voice call',
+                            onPressed: () => _startCall(log, CallType.voice),
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.videocam),
+                            color: answeredColor,
+                            tooltip: 'Video call',
+                            onPressed: () => _startCall(log, CallType.video),
+                          ),
+                        ],
+                      ),
+                    ),
                   ),
                 ],
               ),
             ),
-          ),
-        ],
-      ),
       floatingActionButton: FloatingActionButton(
         heroTag: 'add_call_fab',
         backgroundColor: const Color(0xFF00A884),
         foregroundColor: Colors.white,
         tooltip: 'Start new call',
-        onPressed: () {
-          if (_logs.isNotEmpty) {
-            _startCall(_logs.first, CallType.voice);
-          } else {
-            ScaffoldMessenger.of(context).showSnackBar(
+        onPressed:
+            widget.onNewCall ??
+            () => ScaffoldMessenger.of(context).showSnackBar(
               const SnackBar(content: Text('Select a contact to call')),
-            );
-          }
-        },
+            ),
         child: const Icon(Icons.add_call),
       ),
     );
   }
 
-  String _formatTime(DateTime time) {
-    final hour = time.hour.toString().padLeft(2, '0');
-    final minute = time.minute.toString().padLeft(2, '0');
-    return '$hour:$minute';
+  /// WhatsApp-style subtitle: direction, relative day, time and, for
+  /// answered calls, the duration.
+  String _describeCall(CallLogItem log) {
+    final parts = <String>[];
+    parts.add(log.isIncoming ? 'Incoming' : 'Outgoing');
+    final now = DateTime.now();
+    final day = DateTime(now.year, now.month, now.day);
+    final callDay = DateTime(
+      log.timestamp.year,
+      log.timestamp.month,
+      log.timestamp.day,
+    );
+    final difference = day.difference(callDay).inDays;
+    final dayLabel = switch (difference) {
+      0 => 'Today',
+      1 => 'Yesterday',
+      _ when difference < 7 && difference > 1 =>
+        _weekday(log.timestamp.weekday),
+      _ =>
+        '${log.timestamp.day}/${log.timestamp.month}/${log.timestamp.year}',
+    };
+    final clock =
+        '${log.timestamp.hour.toString().padLeft(2, '0')}:'
+        '${log.timestamp.minute.toString().padLeft(2, '0')}';
+    parts.add('$dayLabel, $clock');
+    if (!log.isMissed && log.durationSeconds > 0) {
+      final minutes = log.durationSeconds ~/ 60;
+      final seconds = (log.durationSeconds % 60).toString().padLeft(2, '0');
+      parts.add('$minutes:$seconds');
+    } else if (log.isMissed) {
+      parts.add(
+        log.outcome == 'failed' ? 'Not answered' : 'Missed',
+      );
+    }
+    return parts.join(' · ');
   }
+
+  String _weekday(int weekday) => const {
+    1: 'Monday',
+    2: 'Tuesday',
+    3: 'Wednesday',
+    4: 'Thursday',
+    5: 'Friday',
+    6: 'Saturday',
+    7: 'Sunday',
+  }[weekday]!;
 }

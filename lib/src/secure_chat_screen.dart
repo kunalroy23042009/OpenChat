@@ -19,6 +19,7 @@ import 'chat_store.dart';
 import 'chat_lock.dart';
 import 'chat_preferences.dart';
 import 'chat/day_label.dart';
+import 'chat/profile_watcher.dart';
 import 'contacts_repository.dart';
 import 'calling/call_flow.dart';
 import 'calling/call_screen.dart';
@@ -26,6 +27,8 @@ import 'local_profile.dart';
 import 'media/chat_media.dart';
 import 'media/document_transfer.dart';
 import 'media/document_bubble.dart';
+import 'media/gif_picker.dart';
+import 'media/gif_search.dart';
 import 'media/share_bubbles.dart';
 import 'media/view_once_screen.dart';
 import 'media/media_message.dart';
@@ -40,7 +43,9 @@ import 'widgets/whatsapp_bubble.dart';
 import 'security/envelope_codec.dart';
 import 'security/safety_number.dart';
 import 'security/app_lock.dart';
+import 'ops/error_report.dart';
 import 'chat/typing_presence.dart';
+import 'chat/chat_routes.dart';
 import 'widgets/whatsapp_wallpaper.dart';
 
 class SecureChatScreen extends StatefulWidget {
@@ -55,6 +60,7 @@ class SecureChatScreen extends StatefulWidget {
     required this.peerUsername,
     this.peerAvatarUrl,
     this.testing = false,
+    this.focusComposer = false,
   });
   final LocalProfile profile;
   final ChatStore store;
@@ -65,17 +71,20 @@ class SecureChatScreen extends StatefulWidget {
   final String peerUsername;
   final String? peerAvatarUrl;
   final bool testing;
+  final bool focusComposer;
 
   @override
   State<SecureChatScreen> createState() => _SecureChatScreenState();
 }
 
 class _SecureChatScreenState extends State<SecureChatScreen>
-    with WidgetsBindingObserver {
+    with WidgetsBindingObserver, RouteAware {
   bool _accessGranted = false;
   bool _bootstrapped = false;
+  bool _networkReady = false;
   String get _lockKey => 'openchat.secureLock.v1.$accountId.${widget.peerId}';
   final composer = TextEditingController();
+  final _composerFocus = FocusNode();
   final scroll = ScrollController();
   final channel = const MethodChannel('dev.openchat/security');
   late final accountId = widget.client.auth.currentUser!.id;
@@ -88,6 +97,7 @@ class _SecureChatScreenState extends State<SecureChatScreen>
   int _tickOffset = 0;
   Timer? _pollTimer;
   Timer? _tickTimer;
+  Timer? _expiryTimer;
   bool _loading = true;
   String? _error;
   String? _ownFingerprint;
@@ -145,6 +155,16 @@ class _SecureChatScreenState extends State<SecureChatScreen>
   CloudContact? _peerContact;
   bool _contactBusy = false;
 
+  /// Cached last-seen timestamp for the peer (when offline).
+  DateTime? _peerLastSeen;
+
+  /// Real-time peer profile facts (name/avatar/online) refreshed on
+  /// `profiles` realtime events — WhatsApp-style live details.
+  String? _peerDisplayName;
+  String? _peerAvatarLive;
+  bool? _peerOnline;
+  bool _peerProfileSubscribed = false;
+
   @override
   void initState() {
     super.initState();
@@ -153,9 +173,7 @@ class _SecureChatScreenState extends State<SecureChatScreen>
     _accessGranted = widget.store.preferences.getBool(_lockKey) != true;
     // This chat is visible: suppress its notifications, clear its badge
     // and unread flag, and restore any unsent draft.
-    NotifyService.instance.openChats.add(widget.peerId);
-    NotifyService.instance.cancelChat(widget.peerId);
-    widget.store.setSecureUnread(accountId, widget.peerId, false);
+    if (_accessGranted) _showChat();
     composer.text = widget.store.secureDraft(accountId, widget.peerId);
     composer.addListener(_saveDraft);
     composer.addListener(() {
@@ -175,6 +193,16 @@ class _SecureChatScreenState extends State<SecureChatScreen>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) {
+      NotifyService.instance.openChats.remove(widget.peerId);
+      _typingPresence?.setActive(false);
+    } else if (_accessGranted) {
+      _showChat();
+      _typingPresence?.setActive(true);
+      unawaited(_pollInbox());
+      unawaited(_fetchPeerLastSeen());
+      unawaited(_flushOutbox());
+    }
     if (state != AppLifecycleState.resumed &&
         widget.store.preferences.getBool(_lockKey) == true) {
       _hideReactBar();
@@ -182,9 +210,43 @@ class _SecureChatScreenState extends State<SecureChatScreen>
     }
   }
 
+  void _showChat() {
+    NotifyService.instance.openChats.add(widget.peerId);
+    unawaited(NotifyService.instance.cancelChat(widget.peerId));
+    unawaited(widget.store.setSecureUnread(accountId, widget.peerId, false));
+    if (widget.focusComposer) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _accessGranted) _composerFocus.requestFocus();
+      });
+    }
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final route = ModalRoute.of(context);
+    if (route != null) chatRouteObserver.subscribe(this, route);
+  }
+
+  @override
+  void didPushNext() {
+    NotifyService.instance.openChats.remove(widget.peerId);
+    _typingPresence?.setActive(false);
+  }
+
+  @override
+  void didPopNext() {
+    if (!_accessGranted) return;
+    _showChat();
+    _typingPresence?.setActive(true);
+    unawaited(_pollInbox());
+  }
+
   Future<void> _unlockChat() async {
     if (await ChatLock.promptVerify(context) && mounted) {
       setState(() => _accessGranted = true);
+      _showChat();
+      _typingPresence?.setActive(true);
       if (!_bootstrapped) {
         _bootstrapped = true;
         await _bootstrap();
@@ -207,8 +269,8 @@ class _SecureChatScreenState extends State<SecureChatScreen>
   /// (delivery, calls, profile, status) needs an accepted request.
   Future<void> _refreshPeerContact() async {
     try {
-      final contacts =
-          await SupabaseContactsRepository(widget.client).contacts();
+      final contacts = await SupabaseContactsRepository(widget.client)
+          .contacts();
       if (!mounted) return;
       setState(() {
         _peerContact = null;
@@ -216,10 +278,122 @@ class _SecureChatScreenState extends State<SecureChatScreen>
           if (c.userId == widget.peerId) _peerContact = c;
         }
       });
+      // Fetch last_seen for offline display
+      await _fetchPeerLastSeen();
     } catch (_) {}
   }
 
-  bool get _peerConnected => _peerContact?.status == 'accepted';
+  Future<void> _fetchPeerLastSeen() async {
+    try {
+      // Fail closed on older servers rather than bypassing audience settings.
+      final allowed = await widget.client.rpc(
+        'can_view_profile_field',
+        params: {
+          'p_owner_id': widget.peerId,
+          'p_viewer_id': accountId,
+          'p_field': 'last_seen',
+        },
+      );
+      if (allowed != true) {
+        if (mounted) setState(() => _peerLastSeen = null);
+        return;
+      }
+      final row = await widget.client
+          .from('profiles')
+          .select('last_seen')
+          .eq('id', widget.peerId)
+          .maybeSingle();
+      if (mounted) {
+        setState(
+          () => _peerLastSeen = DateTime.tryParse(
+            row?['last_seen'] as String? ?? '',
+          )?.toLocal(),
+        );
+      }
+    } catch (_) {
+      if (mounted) setState(() => _peerLastSeen = null);
+    }
+  }
+
+  bool get _peerConnected =>
+      _isSelfChat || _peerContact?.status == 'accepted';
+
+  /// The "Message yourself" thread: peers own account id. Everything is
+  /// stored in the sealed local history (and included in encrypted
+  /// backups); no Signal session or server envelope is involved.
+  bool get _isSelfChat => widget.peerId == accountId;
+
+  /// Live avatar URL for the header: the freshest of the peer's signed
+  /// URL and the one passed by the caller.
+  String? get _headerAvatarUrl => _peerAvatarLive ?? widget.peerAvatarUrl;
+
+  String get _headerPeerName => _peerDisplayName ?? widget.peerName;
+
+  void _watchPeerProfile() {
+    if (_peerProfileSubscribed || widget.testing) return;
+    _peerProfileSubscribed = true;
+    ProfileWatcher.of(widget.client).addListener(_onProfilesTick);
+    ProfileWatcher.of(widget.client).start();
+  }
+
+  void _onProfilesTick() {
+    final facts = ProfileWatcher.of(widget.client).factsFor(widget.peerId);
+    if (facts == null) {
+      unawaited(_refreshPeerProfile());
+      return;
+    }
+    unawaited(_applyPeerProfileRow(facts));
+  }
+
+  /// Fetches the peer's profile row through the photo/last-seen audience
+  /// RLS policies added server-side.
+  Future<void> _refreshPeerProfile() async {
+    if (_isSelfChat) {
+      final me = widget.client.auth.currentUser?.id;
+      if (me == null) return;
+      try {
+        final row = await widget.client
+            .from('profiles')
+            .select('display_name, avatar_path, avatar_url, is_online')
+            .eq('id', me)
+            .maybeSingle();
+        if (row != null) {
+          await _applyPeerProfileRow(Map<String, dynamic>.from(row));
+        }
+      } catch (_) {}
+      return;
+    }
+    try {
+      final contacts = await SupabaseContactsRepository(widget.client).contacts();
+      for (final contact in contacts) {
+        if (contact.userId != widget.peerId) continue;
+        await _applyPeerProfileRow({
+          'display_name': contact.name,
+          'avatar_path': contact.avatarPath,
+          'avatar_url': contact.avatarUrl,
+        });
+      }
+      await _fetchPeerLastSeen();
+    } catch (_) {
+      await _fetchPeerLastSeen();
+    }
+  }
+
+  Future<void> _applyPeerProfileRow(Map<String, dynamic> row) async {
+    final path = row['avatar_path'] as String?;
+    final url = (path != null && path.isNotEmpty)
+        ? await ProfileWatcher.of(
+            widget.client,
+          ).avatarUrlFor(path, row['avatar_url'] as String?)
+        : row['avatar_url'] as String?;
+    final name = (row['display_name'] as String?)?.trim();
+    if (!mounted) return;
+    setState(() {
+      _peerAvatarLive = url;
+      _peerDisplayName = (name != null && name.isNotEmpty) ? name : null;
+      _peerOnline = row['is_online'] as bool?;
+    });
+  }
 
   Future<void> _invitePeer() async {
     if (_contactBusy || widget.peerUsername.isEmpty) return;
@@ -242,9 +416,8 @@ class _SecureChatScreenState extends State<SecureChatScreen>
       await _refreshPeerContact();
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Invite failed: $e')),
-        );
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Invite failed: $e')));
       }
     } finally {
       if (mounted) setState(() => _contactBusy = false);
@@ -259,14 +432,15 @@ class _SecureChatScreenState extends State<SecureChatScreen>
       await SupabaseContactsRepository(widget.client).respond(requestId, true);
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Connected. Messages and calls now work.')),
+        const SnackBar(
+          content: Text('Connected. Messages and calls now work.'),
+        ),
       );
       await _refreshPeerContact();
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Accept failed: $e')),
-        );
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Accept failed: $e')));
       }
     } finally {
       if (mounted) setState(() => _contactBusy = false);
@@ -282,10 +456,43 @@ class _SecureChatScreenState extends State<SecureChatScreen>
 
   Future<void> _bootstrap() async {
     try {
+      // Load cached history immediately so UI is responsive.
+      await widget.store.loadSecureConversation(accountId, widget.peerId);
+      if (!mounted) return;
+      if (mounted) setState(() => _loading = false);
+
+      // Run network-heavy initialization in background; UI stays responsive.
+      unawaited(_bootstrapNetwork());
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _error = e is StateError ? e.message.toString() : 'Could not open this chat. Check your connection and reopen it.';
+        });
+      }
+    }
+  }
+
+  Future<void> _bootstrapNetwork() async {
+    try {
+      _watchPeerProfile();
+      if (_isSelfChat) {
+        // Self chat has no remote peer: no Signal bootstrap, no typing
+        // presence. Realtime inbox and local sealed history serve it.
+        _peerOnline = true;
+        unawaited(_refreshPeerProfile());
+        _networkReady = true;
+        _scheduleExpiry();
+        _subscribeRealtime();
+        _startPolling();
+        if (mounted) setState(() {});
+        return;
+      }
       final init = await channel.invokeMapMethod<String, dynamic>(
         'initialize',
         {'accountId': accountId},
       );
+      if (!mounted) return;
       // A rotated identity (orphaned keystore entry, corrupt state) has no
       // valid server bundle: force republication and rebuild sessions, or
       // the peer keeps encrypting to a dead identity.
@@ -295,6 +502,7 @@ class _SecureChatScreenState extends State<SecureChatScreen>
       });
       _ownFingerprint = status?['fingerprint'] as String?;
       await _publishKeys(force: freshIdentity);
+      if (!mounted) return;
       try {
         await _ensureSession();
       } catch (e) {
@@ -302,7 +510,9 @@ class _SecureChatScreenState extends State<SecureChatScreen>
         // anyway; sending heals itself via _transmit's retry.
         if (mounted) setState(() => _error = _friendlySendError(e));
       }
-      await widget.store.loadSecureConversation(accountId, widget.peerId);
+      if (!mounted) return;
+      _networkReady = true;
+      _scheduleExpiry();
       unawaited(_refreshPeerContact());
       _subscribeRealtime();
       _startPolling();
@@ -321,18 +531,17 @@ class _SecureChatScreenState extends State<SecureChatScreen>
           },
         );
         _typingPresence!.join();
+        _typingPresence!.setActive(
+          _accessGranted &&
+              WidgetsBinding.instance.lifecycleState ==
+                  AppLifecycleState.resumed,
+        );
       }
       // Catch up immediately so an already-waiting envelope does not sit
       // until the first 30s tick.
       await _pollInbox();
-      if (mounted) setState(() => _loading = false);
     } catch (e) {
-      if (mounted) {
-        setState(() {
-          _loading = false;
-          _error = e is StateError ? e.message.toString() : 'Could not open this chat. Check your connection and reopen it.';
-        });
-      }
+      if (mounted) setState(() => _error = _friendlySendError(e));
     }
   }
 
@@ -569,10 +778,18 @@ class _SecureChatScreenState extends State<SecureChatScreen>
   }
 
   Future<void> _receiveEnvelope(Map<String, dynamic> record) async {
-    if (!mounted) return;
+    if (!mounted || !_networkReady) return;
     final id = record['id'] as String? ?? '';
     final sender = record['sender_id'] as String? ?? '';
     if (sender.isEmpty || id.isEmpty) return;
+    // Only this unlocked conversation owns its Signal receiver. Other peers
+    // stay queued on the server and keep their unread metadata intact.
+    if (sender != widget.peerId ||
+        !_accessGranted ||
+        ModalRoute.of(context)?.isCurrent != true ||
+        WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
+      return;
+    }
     // Redelivered rows already stored locally are only missing their ack.
     if (id.isNotEmpty &&
         widget.store.hasSecureEnvelope(accountId, sender, id)) {
@@ -636,6 +853,7 @@ class _SecureChatScreenState extends State<SecureChatScreen>
         setState(() {});
         _stickToBottom();
         _refreshPins();
+        _scheduleExpiry();
       }
       await _ack(id);
     } catch (_) {
@@ -698,19 +916,185 @@ class _SecureChatScreenState extends State<SecureChatScreen>
     );
   }
 
+  int get _disappearingSeconds =>
+      _chatPreferences.disappearingSecondsFor(widget.peerId);
+
+  void _scheduleExpiry() {
+    _expiryTimer?.cancel();
+    final next = widget.store
+        .getSecureConversation(accountId, widget.peerId)
+        .map((message) => messageExpiry(message.text))
+        .whereType<DateTime>()
+        .fold<DateTime?>(null, (earliest, value) {
+          return earliest == null || value.isBefore(earliest)
+              ? value
+              : earliest;
+        });
+    if (next == null) return;
+    final remaining = next.difference(DateTime.now().toUtc());
+    _expiryTimer = Timer(
+      remaining.isNegative ? Duration.zero : remaining,
+      () async {
+        await widget.store.purgeExpiredSecureMessages(accountId, widget.peerId);
+        if (mounted) setState(() {});
+        _scheduleExpiry();
+      },
+    );
+  }
+
+  Future<void> _chooseDisappearingTimer() async {
+    const labels = {
+      0: 'Off',
+      86400: '24 hours',
+      604800: '7 days',
+      7776000: '90 days',
+    };
+    final selected = await showDialog<int>(
+      context: context,
+      builder: (context) => SimpleDialog(
+        title: const Text('Disappearing messages'),
+        children: labels.entries
+            .map(
+              (entry) => ListTile(
+                leading: Icon(
+                  entry.key == _disappearingSeconds
+                      ? Icons.radio_button_checked
+                      : Icons.radio_button_off,
+                ),
+                title: Text(entry.value),
+                onTap: () => Navigator.pop(context, entry.key),
+              ),
+            )
+            .toList(),
+      ),
+    );
+    if (selected == null) return;
+    await _chatPreferences.setDisappearingSeconds(widget.peerId, selected);
+    if (mounted) {
+      setState(() {});
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            selected == 0
+                ? 'Disappearing messages turned off.'
+                : 'New messages disappear after ${labels[selected]}.',
+          ),
+        ),
+      );
+    }
+  }
+
   Future<void> _pollInbox() async {
+    if (!mounted || !_accessGranted || !_networkReady) return;
     try {
       // No clock cursor: fetch every unacked envelope and dedupe by id, so
       // an older undelivered message can never be skipped.
-      final result = await widget.client.rpc(
-        'fetch_inbox',
-        params: {'p_since': null, 'p_limit': 50},
-      ) as List<dynamic>;
+      final result = await widget.client
+          .from('message_envelopes')
+          .select()
+          .eq('recipient_id', accountId)
+          .eq('sender_id', widget.peerId)
+          .gt('expires_at', DateTime.now().toUtc().toIso8601String())
+          .order('created_at')
+          .limit(50);
       for (final record in result.cast<Map<String, dynamic>>()) {
         await _onEnvelope(record);
       }
       await _flushReadReceipts();
+      // The poll succeeding means the network is up: drain any messages
+      // that were queued while it was down.
+      unawaited(_flushOutbox());
     } catch (_) {}
+  }
+
+  // ---- Durable 1:1 outbox ------------------------------------------------
+
+  static const _outboxKey = 'openchat.outbox.v1';
+  static const _outboxMaxAttempts = 7;
+
+  Future<void> _queueOutbox({
+    required String peerId,
+    required String clientId,
+    required String ciphertext,
+  }) async {
+    final entries = _outboxEntries();
+    entries.add({
+      'peer_id': peerId,
+      'client_id': clientId,
+      'ciphertext': ciphertext,
+      'at': DateTime.now().toUtc().toIso8601String(),
+      'attempts': 0,
+    });
+    while (entries.length > 50) {
+      entries.removeAt(0);
+    }
+    await widget.store.preferences.setString(
+      '$_outboxKey.$accountId',
+      jsonEncode(entries),
+    );
+  }
+
+  List<Map<String, dynamic>> _outboxEntries() {
+    final raw = widget.store.preferences.getString('$_outboxKey.$accountId');
+    if (raw == null || raw.isEmpty) return [];
+    try {
+      return (jsonDecode(raw) as List)
+          .cast<Map<String, dynamic>>()
+          .map(Map<String, dynamic>.from)
+          .toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  /// Retries queued sends. The server dedupes by (sender, client id), so a
+  /// replay cannot double-deliver. Entries failing repeatedly are dropped
+  /// and reported.
+  Future<void> _flushOutbox() async {
+    final entries = _outboxEntries();
+    if (entries.isEmpty) return;
+    var remaining = false;
+    final keep = <Map<String, dynamic>>[];
+    for (final entry in entries) {
+      final peerId = entry['peer_id'] as String;
+      final clientId = entry['client_id'] as String;
+      final ciphertext = entry['ciphertext'] as String;
+      final attempts = (entry['attempts'] as num).toInt() + 1;
+      try {
+        final queued = await _enqueue(peerId, clientId, ciphertext);
+        final status = queued['status'] as String?;
+        if (status == 'sent' || status == 'duplicate') {
+          // Delivered now; ticks will arrive through the receipt pipeline.
+          continue;
+        }
+        remaining = true;
+        keep.add({...entry, 'attempts': attempts});
+      } catch (e) {
+        if (attempts >= _outboxMaxAttempts) {
+          ErrorReport.report(
+            area: 'secure-send',
+            code: 'outbox_dropped',
+            error: e,
+            details: {'attempts': '$attempts'},
+          );
+          if (mounted) {
+            setState(() {
+              _error =
+                  'A queued message could not be sent after several tries. Reopen this chat to resend it.';
+            });
+          }
+          continue;
+        }
+        remaining = true;
+        keep.add({...entry, 'attempts': attempts});
+      }
+    }
+    if (keep.length != entries.length || remaining) {
+      await widget.store.preferences.setString(
+        '$_outboxKey.$accountId',
+        jsonEncode(keep),
+      );
+    }
   }
 
   /// Refreshes sender-side ticks for our recent unacked messages.
@@ -784,7 +1168,8 @@ class _SecureChatScreenState extends State<SecureChatScreen>
         }
       });
       // Corrections are not new arrivals; only fresh text/replies poke.
-      if (sent && edit == null) {
+      // Self chat never pokes (your own notes are not notifications).
+      if (sent && edit == null && !_isSelfChat) {
         unawaited(
           NotifyService.poke(
             widget.client,
@@ -807,89 +1192,214 @@ class _SecureChatScreenState extends State<SecureChatScreen>
 
   /// User-safe send errors: raw platform/protocol exceptions never reach
   /// the UI. StateErrors are already friendly by construction.
-  static String _friendlySendError(Object e) {
+  String _friendlySendError(Object e) {
     if (e is StateError) return e.message.toString();
     if (_isUntrustedIdentity(e)) {
       return 'Peer security code changed. Reopening this chat refreshes encryption — then send again.';
     }
+    final text = e.toString();
+    // The peer's one-time prekey pool drained (every app publishes a fixed
+    // pool only at install). Their app tops it up on its next launch.
+    if (text.contains('refresh one-time keys')) {
+      return '${widget.peerName} needs to open the app once to refresh their encryption keys. Try again after they do.';
+    }
+    if (text.contains('Contact has no published keys yet')) {
+      return '${widget.peerName} has not finished registering. They can send you one message to complete setup.';
+    }
+    if (_looksNetwork(e)) {
+      return 'No connection. The message is queued and will send when you are back online.';
+    }
     return 'Message could not be sent. Check your connection and try again.';
+  }
+
+  /// True for exceptions that mean "the request never reached the server":
+  /// DNS, socket, HTTP retries. Auth refresh errors count too — the server
+  /// was not the one rejecting the message.
+  static bool _looksNetwork(Object e) {
+    final name = e.runtimeType.toString();
+    return name.contains('ClientException') ||
+        name.contains('SocketException') ||
+        name.contains('TimeoutException') ||
+        name.contains('ConnectionClosed') ||
+        name.contains('AuthRetryableFetchException');
   }
 
   /// Encrypts [plainText] (raw text or an encoded body), enqueues it for
   /// [toPeer] (this chat's peer by default), and stores the local copy.
   /// Shared by text, media, polls, votes, and forwarded content.
+  /// Network failures are queued in a durable outbox and retried on the
+  /// next successful inbox poll / app resume (server idempotency makes a
+  /// replay safe — the same client id returns `duplicate`).
   Future<bool> _transmit(
     String plainText, {
     String? toPeer,
     bool retriedSession = false,
   }) async {
     final peerId = toPeer ?? widget.peerId;
+    // Self chat: the sealed local store is the whole journey. No Signal
+    // session, no server envelope — history still lands in encrypted
+    // device backups.
+    if (peerId == accountId) {
+      final random = Random.secure();
+      final localId = base64UrlEncode(
+        List<int>.generate(24, (_) => random.nextInt(256)),
+      );
+      await widget.store.addSecureMessage(
+        accountId,
+        peerId,
+        plainText,
+        mine: true,
+        clientId: localId,
+      );
+      if (mounted) {
+        setState(() {});
+        if (toPeer == null) _stickToBottom();
+        _refreshPins();
+        if (toPeer == null) _scheduleExpiry();
+      }
+      return true;
+    }
+    var outgoing = plainText;
+    // Controls change existing state. Forwarded copies use the destination
+    // chat's setting, rather than silently inheriting this chat's timer.
+    if (!parseMessageBody(outgoing).isControl &&
+        messageExpiry(outgoing) == null) {
+      final seconds = _chatPreferences.disappearingSecondsFor(peerId);
+      if (seconds > 0) {
+        outgoing = encodeExpiringBody(
+          outgoing,
+          DateTime.now().toUtc().add(Duration(seconds: seconds)),
+        );
+      }
+    }
     try {
       final random = Random.secure();
       final localId = base64UrlEncode(
         List<int>.generate(24, (_) => random.nextInt(256)),
       );
+      String? encryptedCiphertext;
       await _ensureSessionFor(peerId);
       final result = await channel.invokeMethod('signalEncrypt', {
         'accountId': accountId,
         'peerId': peerId,
-        'plain': base64Encode(utf8.encode(plainText)),
+        'plain': base64Encode(utf8.encode(outgoing)),
       }) as Map<dynamic, dynamic>;
       // Prefix the Signal message type; the envelope has no type column.
-      final queued = await widget.client.rpc(
-        'enqueue_message',
-        params: {
-          'p_recipient_id': peerId,
-          'p_client_message_id': localId,
-          'p_ciphertext': EnvelopeCodec.encode(
-            result['type'] as int,
-            result['body'] as String,
-          ),
-        },
-      ) as Map<String, dynamic>;
-      switch (queued['status']) {
-        case 'sent':
-        case 'duplicate':
-          await widget.store.addSecureMessage(
-            accountId,
-            peerId,
-            plainText,
-            mine: true,
-            clientId: localId,
-            at:
-                DateTime.tryParse(queued['created_at'] as String? ?? '') ??
-                DateTime.tryParse(queued['expires_at'] as String? ?? '')
-                    ?.subtract(const Duration(days: 7)),
-          );
-          if (mounted) {
-            setState(() {});
-            if (toPeer == null) _stickToBottom();
-            _refreshPins();
-          }
-          return true;
-        case 'rate_limited':
-          throw StateError('Daily send limit reached. Try again tomorrow.');
-        case 'unavailable':
-          throw StateError(
-            'Contact unavailable. They may have blocked you or removed the connection.',
-          );
-        default:
-          throw StateError('Message rejected by the server.');
+      encryptedCiphertext = EnvelopeCodec.encode(
+        result['type'] as int,
+        result['body'] as String,
+      );
+      try {
+        final queued = await _enqueue(peerId, localId, encryptedCiphertext);
+        switch (queued['status']) {
+          case 'sent':
+          case 'duplicate':
+            return await _acceptStored(
+              peerId,
+              localId,
+              outgoing,
+              queued,
+              toPeer: toPeer,
+            );
+          case 'rate_limited':
+            throw StateError('Daily send limit reached. Try again tomorrow.');
+          case 'unavailable':
+            // This is a permission/contact rejection, not an offline recipient.
+            // The server already retains messages for offline accepted contacts.
+            throw StateError(
+              'Message not sent. Check that the contact request is accepted, then try again.',
+            );
+          default:
+            throw StateError('Message rejected by the server.');
+        }
+      } catch (enqueueError) {
+        if (enqueueError is StateError) rethrow;
+        if (!_looksNetwork(enqueueError)) rethrow;
+        // The request never reached the server: keep the encrypted copy in
+        // the durable outbox and show the message locally with a clock.
+        await _queueOutbox(
+          peerId: peerId,
+          clientId: localId,
+          ciphertext: encryptedCiphertext,
+        );
+        await widget.store.addSecureMessage(
+          accountId,
+          peerId,
+          outgoing,
+          mine: true,
+          clientId: localId,
+        );
+        ErrorReport.report(
+          area: 'secure-send',
+          code: 'queued_offline',
+          details: {'peer': 'accepted-contact', 'bytes': '${plainText.length}'},
+        );
+        if (mounted) {
+          setState(() => _error = _friendlySendError(enqueueError));
+          setState(() {});
+          if (toPeer == null) _stickToBottom();
+        }
+        return true;
       }
     } catch (e) {
+      ErrorReport.reportError('secure-send', e, details: {'stage': 'transmit'});
       if (!retriedSession && _isUntrustedIdentity(e)) {
         // Stale session (peer reinstalled): heal transparently and retry once.
         await _resetPeerSession(peerId);
         try {
           await _ensureSessionFor(peerId, revalidate: true);
         } catch (_) {}
-        return _transmit(plainText, toPeer: toPeer, retriedSession: true);
+        return _transmit(outgoing, toPeer: toPeer, retriedSession: true);
       }
       if (mounted) {
         setState(() => _error = _friendlySendError(e));
       }
       return false;
     }
+  }
+
+  /// Server enqueue helper kept separate so the network-failure path can
+  /// distinguish "never reached the server" from server rejections.
+  Future<Map<String, dynamic>> _enqueue(
+    String peerId,
+    String localId,
+    String ciphertext,
+  ) async {
+    return await widget.client.rpc(
+      'enqueue_message',
+      params: {
+        'p_recipient_id': peerId,
+        'p_client_message_id': localId,
+        'p_ciphertext': ciphertext,
+      },
+    ) as Map<String, dynamic>;
+  }
+
+  Future<bool> _acceptStored(
+    String peerId,
+    String localId,
+    String outgoing,
+    Map<String, dynamic> queued, {
+    String? toPeer,
+  }) async {
+    await widget.store.addSecureMessage(
+      accountId,
+      peerId,
+      outgoing,
+      mine: true,
+      clientId: localId,
+      at:
+          DateTime.tryParse(queued['created_at'] as String? ?? '') ??
+          DateTime.tryParse(queued['expires_at'] as String? ?? '')
+              ?.subtract(const Duration(days: 7)),
+    );
+    if (mounted) {
+      setState(() {});
+      if (toPeer == null) _stickToBottom();
+      _refreshPins();
+      if (toPeer == null) _scheduleExpiry();
+    }
+    return true;
   }
 
   Future<void> _pickAndSendImage() async {
@@ -948,6 +1458,12 @@ class _SecureChatScreenState extends State<SecureChatScreen>
                 onTap: () => Navigator.pop(ctx, 'voice_record'),
               ),
               _AttachTile(
+                icon: Icons.video_camera_front_outlined,
+                color: const Color(0xFF0288D1),
+                label: 'Video note',
+                onTap: () => Navigator.pop(ctx, 'video_note'),
+              ),
+              _AttachTile(
                 icon: Icons.description_outlined,
                 color: const Color(0xFF546E7A),
                 label: 'Document',
@@ -977,6 +1493,21 @@ class _SecureChatScreenState extends State<SecureChatScreen>
                 label: 'Once video',
                 onTap: () => Navigator.pop(ctx, 'once_video'),
               ),
+              _AttachTile(
+                icon: Icons.emoji_emotions_outlined,
+                color: const Color(0xFF6C63FF),
+                label: 'Stickers',
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _pickAndSendSticker();
+                },
+              ),
+              _AttachTile(
+                icon: Icons.gif_box_outlined,
+                color: const Color(0xFF7F66FF),
+                label: 'GIF',
+                onTap: () => Navigator.pop(ctx, 'gif'),
+              ),
             ],
           ),
         ),
@@ -1001,6 +1532,14 @@ class _SecureChatScreenState extends State<SecureChatScreen>
     }
     if (choice == 'voice_record') {
       await _recordAndSendVoice();
+      return;
+    }
+    if (choice == 'video_note') {
+      await _pickAndSendVideo(true, videoNote: true);
+      return;
+    }
+    if (choice == 'gif') {
+      await _pickAndSendGif();
       return;
     }
     if (choice.startsWith('video_')) {
@@ -1205,13 +1744,18 @@ class _SecureChatScreenState extends State<SecureChatScreen>
   Future<void> _pickAndSendVideo(
     bool fromCamera, {
     bool viewOnce = false,
+    bool videoNote = false,
   }) async {
     if (_sendingMedia) return;
     AppLock.suppressRelockOnce = true;
     XFile? picked;
     try {
       picked = fromCamera
-          ? await media.pickCameraVideo()
+          ? await media.pickCameraVideo(
+              maxDuration: videoNote
+                  ? const Duration(minutes: 1)
+                  : const Duration(minutes: 3),
+            )
           : await media.pickGalleryVideo();
     } on Exception {
       if (mounted) setState(() => _error = 'Could not open your videos.');
@@ -1220,21 +1764,37 @@ class _SecureChatScreenState extends State<SecureChatScreen>
     if (picked == null || !mounted) return;
     final file = File(picked.path);
     int durationSec = 0;
+    var durationKnown = false;
     VideoPlayerController? probe;
     try {
       probe = VideoPlayerController.file(file);
       await probe.initialize();
       durationSec = probe.value.duration.inSeconds;
+      durationKnown = true;
     } catch (_) {
     } finally {
       await probe?.dispose();
     }
     if (!mounted) return;
+    if (videoNote && !durationKnown) {
+      setState(() => _error = 'Could not confirm this video note\'s duration.');
+      return;
+    }
+    if (videoNote && durationSec > 60) {
+      setState(() => _error = 'Video notes must be one minute or shorter.');
+      return;
+    }
     final caption = TextEditingController();
     final send = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: Text(viewOnce ? 'Send view-once video' : 'Send video'),
+        title: Text(
+          videoNote
+              ? 'Send video note'
+              : viewOnce
+              ? 'Send view-once video'
+              : 'Send video',
+        ),
         content: SingleChildScrollView(
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -1276,7 +1836,10 @@ class _SecureChatScreenState extends State<SecureChatScreen>
         ],
       ),
     );
-    if (send != true || !mounted) return;
+    if (send != true || !mounted) {
+      caption.dispose();
+      return;
+    }
     setState(() {
       _sendingMedia = true;
       _error = null;
@@ -1294,6 +1857,7 @@ class _SecureChatScreenState extends State<SecureChatScreen>
           thumbNonce: sealed.thumbNonce.isEmpty ? null : sealed.thumbNonce,
           durationSec: durationSec,
           viewOnce: viewOnce,
+          videoNote: videoNote,
         ),
       );
       if (sent && mounted) {
@@ -1310,6 +1874,46 @@ class _SecureChatScreenState extends State<SecureChatScreen>
         setState(() => _error = _friendlyMediaError('Video upload', e));
       }
     } finally {
+      caption.dispose();
+      if (mounted) setState(() => _sendingMedia = false);
+    }
+  }
+
+  Future<void> _pickAndSendGif() async {
+    if (_sendingMedia) return;
+    final selected = await showModalBottomSheet<GifSearchResult>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (_) => const GifPickerSheet(),
+    );
+    if (selected == null || !mounted) return;
+
+    setState(() {
+      _sendingMedia = true;
+      _error = null;
+    });
+    final service = GifSearchService();
+    try {
+      final bytes = await service.download(selected);
+      final sealed = await media.uploadSealedBytes(bytes, widget.peerId);
+      final sent = await _transmit(
+        encodeImageBody(sealed.path, '', key: sealed.key, nonce: sealed.nonce),
+      );
+      if (!sent) throw StateError('GIF not sent');
+      if (mounted) {
+        unawaited(
+          NotifyService.poke(
+            widget.client,
+            kind: 'message',
+            peer: widget.peerId,
+          ),
+        );
+      }
+    } catch (error) {
+      if (mounted) setState(() => _error = _friendlyMediaError('GIF', error));
+    } finally {
+      service.dispose();
       if (mounted) setState(() => _sendingMedia = false);
     }
   }
@@ -1483,7 +2087,7 @@ class _SecureChatScreenState extends State<SecureChatScreen>
         ),
       ).timeout(const Duration(seconds: 20));
       if (!mounted) return;
-      
+
       // Show options: static location or live location
       final choice = await showModalBottomSheet<String>(
         context: context,
@@ -1501,7 +2105,10 @@ class _SecureChatScreenState extends State<SecureChatScreen>
                 onTap: () => Navigator.pop(ctx, 'static'),
               ),
               ListTile(
-                leading: const Icon(Icons.location_on, color: Color(0xFF00A884)),
+                leading: const Icon(
+                  Icons.location_on,
+                  color: Color(0xFF00A884),
+                ),
                 title: const Text('Share live location'),
                 subtitle: const Text('Share your real-time location'),
                 onTap: () => Navigator.pop(ctx, 'live'),
@@ -1510,7 +2117,8 @@ class _SecureChatScreenState extends State<SecureChatScreen>
           ),
         ),
       );
-      
+
+      if (!mounted) return;
       if (choice == 'static') {
         final labelController = TextEditingController();
         final label = await showDialog<String>(
@@ -1540,7 +2148,8 @@ class _SecureChatScreenState extends State<SecureChatScreen>
                 child: const Text('Cancel'),
               ),
               FilledButton(
-                onPressed: () => Navigator.pop(ctx, labelController.text.trim()),
+                onPressed: () =>
+                    Navigator.pop(ctx, labelController.text.trim()),
                 child: const Text('Send'),
               ),
             ],
@@ -1572,6 +2181,62 @@ class _SecureChatScreenState extends State<SecureChatScreen>
       if (mounted) setState(() => _error = e.message);
     } catch (_) {
       if (mounted) setState(() => _error = 'Could not get location.');
+    } finally {
+      if (mounted) setState(() => _sendingMedia = false);
+    }
+  }
+
+  Future<void> _pickAndSendSticker() async {
+    if (_sendingMedia) return;
+    setState(() {
+      _sendingMedia = true;
+      _error = null;
+    });
+    try {
+      if (!mounted) return;
+      final asset = await showModalBottomSheet<String>(
+        context: context,
+        showDragHandle: true,
+        builder: (ctx) => SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text(
+                  'Choose a sticker',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 16),
+                GridView.count(
+                  crossAxisCount: 4,
+                  shrinkWrap: true,
+                  crossAxisSpacing: 12,
+                  mainAxisSpacing: 12,
+                  children: const [
+                    _StickerTile(asset: 'heart', label: '❤️'),
+                    _StickerTile(asset: 'thumbs_up', label: '👍'),
+                    _StickerTile(asset: 'laugh', label: '😂'),
+                    _StickerTile(asset: 'wow', label: '😮'),
+                    _StickerTile(asset: 'cry', label: '😢'),
+                    _StickerTile(asset: 'pray', label: '🙏'),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+      if (asset == null || !mounted) return;
+      if (await _transmit(encodeStickerBody(asset))) {
+        unawaited(
+          NotifyService.poke(
+            widget.client,
+            kind: 'message',
+            peer: widget.peerId,
+          ),
+        );
+      }
     } finally {
       if (mounted) setState(() => _sendingMedia = false);
     }
@@ -1613,9 +2278,9 @@ class _SecureChatScreenState extends State<SecureChatScreen>
         ),
       ),
     );
-    
+
     if (duration == null || !mounted) return;
-    
+
     // Send initial live location message
     if (!await _transmit(
       encodeLocationBody(
@@ -1628,7 +2293,7 @@ class _SecureChatScreenState extends State<SecureChatScreen>
       if (mounted) setState(() => _error = 'Failed to start live location.');
       return;
     }
-    
+
     // Start periodic location updates
     Timer.periodic(const Duration(seconds: 30), (timer) async {
       if (!mounted || timer.tick * 30 >= duration.inSeconds) {
@@ -1637,7 +2302,7 @@ class _SecureChatScreenState extends State<SecureChatScreen>
         await _transmit(encodeTextBody('📍 Live location sharing ended.'));
         return;
       }
-      
+
       try {
         var permission = await Geolocator.checkPermission();
         if (permission == LocationPermission.denied ||
@@ -1650,7 +2315,7 @@ class _SecureChatScreenState extends State<SecureChatScreen>
             accuracy: LocationAccuracy.medium,
           ),
         ).timeout(const Duration(seconds: 10));
-        
+
         // Send location update as a new message (in a real implementation,
         // this would update the existing live location bubble)
         await _transmit(
@@ -1677,7 +2342,7 @@ class _SecureChatScreenState extends State<SecureChatScreen>
         }
         if (mounted) setState(() {});
       },
-      onRecorded: (file, duration, waveform) async {
+      onRecorded: (file, duration, waveform, transcript) async {
         if (!mounted) return;
         setState(() {
           _sendingMedia = true;
@@ -1692,6 +2357,7 @@ class _SecureChatScreenState extends State<SecureChatScreen>
               key: sealed.key,
               nonce: sealed.nonce,
               waveform: waveform,
+              transcript: transcript,
             ),
           );
           if (!sent) throw StateError('Voice note not sent');
@@ -1984,7 +2650,7 @@ class _SecureChatScreenState extends State<SecureChatScreen>
         }
       case 'react':
         await _fullEmojiKeyboard(msg);
-case 'edit':
+      case 'edit':
         if (!msg.canEdit(DateTime.now())) {
           if (mounted) {
             setState(() => _error = 'The 15-minute edit window has ended.');
@@ -2000,7 +2666,9 @@ case 'edit':
               content: TextField(
                 controller: controller,
                 maxLength: 4000,
-                decoration: const InputDecoration(hintText: 'Edit your message'),
+                decoration: const InputDecoration(
+                  hintText: 'Edit your message',
+                ),
                 autofocus: true,
               ),
               actions: [
@@ -2026,7 +2694,9 @@ case 'edit':
           );
         }
         break;
+      case 'forward':
         await _forwardPicker(body);
+        break;
       case 'star':
         await widget.store.toggleSecureStar(accountId, widget.peerId, msg.ref);
         final starred = (await widget.store.secureStars(
@@ -2063,11 +2733,7 @@ case 'edit':
       case 'deleteme':
         final original = msg.text;
         final ref = msg.ref;
-        await widget.store.removeSecureMessage(
-          accountId,
-          widget.peerId,
-          ref,
-        );
+        await widget.store.removeSecureMessage(accountId, widget.peerId, ref);
         if (mounted) setState(() {});
         _refreshPins();
         if (mounted) {
@@ -2117,9 +2783,7 @@ case 'edit':
         if (confirmed == true) {
           if (!msg.canDeleteForEveryone(DateTime.now())) {
             if (mounted) {
-              setState(
-                () => _error = 'The 60-hour deletion window has ended.',
-              );
+              setState(() => _error = 'The 60-hour deletion window has ended.');
             }
             break;
           }
@@ -2130,6 +2794,12 @@ case 'edit':
             forEveryone: true,
             channel: channel,
           );
+          if (mounted) {
+            _refreshPins();
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('Deleted for everyone.')),
+            );
+          }
         }
         break;
     }
@@ -2599,8 +3269,7 @@ case 'edit':
     final String? actionLabel;
     final Future<void> Function()? action;
     if (c == null) {
-      text =
-          'Not connected yet. Messages, calls, profile and status need an accepted contact.';
+      text = 'Not connected yet. Messages, calls, profile and status need an accepted contact.';
       actionLabel = widget.peerUsername.isEmpty ? null : 'Send invite';
       action = widget.peerUsername.isEmpty ? null : _invitePeer;
     } else if (c.status == 'blocked') {
@@ -2608,7 +3277,8 @@ case 'edit':
       actionLabel = null;
       action = null;
     } else if (c.status == 'pending' && c.incoming) {
-      text = '${widget.peerName} invited you. Accept to enable messages and calls.';
+      text =
+          '${widget.peerName} invited you. Accept to enable messages and calls.';
       actionLabel = 'Accept';
       action = _acceptPeerInvite;
     } else if (c.status == 'pending') {
@@ -2673,6 +3343,22 @@ case 'edit':
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Tone set to $picked for this chat.')),
       );
+    }
+  }
+
+  String _formatLastSeen(DateTime dt) {
+    final now = DateTime.now();
+    final diff = now.difference(dt);
+    if (diff.inDays >= 7) {
+      return '${dt.day}/${dt.month}/${dt.year}';
+    } else if (diff.inDays >= 1) {
+      return '${diff.inDays}d ago';
+    } else if (diff.inHours >= 1) {
+      return '${diff.inHours}h ago';
+    } else if (diff.inMinutes >= 1) {
+      return '${diff.inMinutes}m ago';
+    } else {
+      return 'just now';
     }
   }
 
@@ -2755,27 +3441,31 @@ case 'edit':
       await file.writeAsString(buf.toString());
       await OpenFilex.open(file.path);
     } catch (e) {
-      messenger.showSnackBar(
-        SnackBar(content: Text('Export failed: $e')),
-      );
+      messenger.showSnackBar(SnackBar(content: Text('Export failed: $e')));
     }
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    chatRouteObserver.unsubscribe(this);
     _documentControl?.cancelled = true;
     _hideReactBar();
     composer.removeListener(_saveDraft);
     scroll.removeListener(_onScroll);
+    if (_peerProfileSubscribed) {
+      ProfileWatcher.of(widget.client).removeListener(_onProfilesTick);
+    }
     // Persist the draft even if the listener missed the last keystroke.
     widget.store.setSecureDraft(accountId, widget.peerId, composer.text);
     NotifyService.instance.openChats.remove(widget.peerId);
     _realtime?.unsubscribe();
     _pollTimer?.cancel();
     _tickTimer?.cancel();
+    _expiryTimer?.cancel();
     _typingPresence?.dispose();
     composer.dispose();
+    _composerFocus.dispose();
     searchBox.dispose();
     scroll.dispose();
     super.dispose();
@@ -2814,14 +3504,14 @@ case 'edit':
                     radius: 18,
                     backgroundColor: const Color(0xFFE4EBFF),
                     foregroundImage:
-                        (widget.peerAvatarUrl != null &&
-                            widget.peerAvatarUrl!.isNotEmpty)
-                        ? NetworkImage(widget.peerAvatarUrl!)
+                        (_headerAvatarUrl != null &&
+                            _headerAvatarUrl!.isNotEmpty)
+                        ? NetworkImage(_headerAvatarUrl!)
                         : null,
                     child: Text(
-                      widget.peerName.isEmpty
+                      _headerPeerName.isEmpty
                           ? '?'
-                          : widget.peerName[0].toUpperCase(),
+                          : _headerPeerName[0].toUpperCase(),
                       style: const TextStyle(
                         color: Color(0xFF245CDB),
                         fontWeight: FontWeight.w800,
@@ -2835,14 +3525,41 @@ case 'edit':
                       crossAxisAlignment: CrossAxisAlignment.start,
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        Text(widget.peerName, overflow: TextOverflow.ellipsis),
-                        if (_typingPresence != null)
+                        Text(_headerPeerName, overflow: TextOverflow.ellipsis),
+                        if (_isSelfChat)
+                          Text(
+                            'You',
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.normal,
+                              color: Theme.of(context)
+                                  .textTheme
+                                  .bodySmall
+                                  ?.color,
+                            ),
+                          )
+                        else
                           Builder(
                             builder: (context) {
-                              final t = _typingPresence!.peerOnlineText ??
-                                  (_typingPresence!.statusText ?? '');
-                              if (t.isEmpty) return const SizedBox.shrink();
-                              final active = t.contains('typing') ||
+                              var t =
+                                  _typingPresence?.peerOnlineText ??
+                                  (_typingPresence?.statusText ?? '');
+                              // Realtime presence from the profiles watcher:
+                              // "online" wins unless the peer is typing.
+                              if (_peerOnline == true &&
+                                  !t.contains('typing') &&
+                                  !t.contains('recording')) {
+                                t = t.isEmpty ? 'online' : t;
+                              }
+                              // Show last seen when peer is offline and we have last_seen data
+                              final showLastSeen =
+                                  _peerLastSeen != null &&
+                                  (t.isEmpty || !t.contains('online'));
+                              if (t.isEmpty && _peerLastSeen == null) {
+                                return const SizedBox.shrink();
+                              }
+                              final active =
+                                  t.contains('typing') ||
                                   t.contains('recording');
                               return Row(
                                 mainAxisSize: MainAxisSize.min,
@@ -2852,7 +3569,9 @@ case 'edit':
                                   else
                                     Flexible(
                                       child: Text(
-                                        t,
+                                        showLastSeen
+                                            ? 'last seen ${_formatLastSeen(_peerLastSeen!)}'
+                                            : t,
                                         style: TextStyle(
                                           fontSize: 12,
                                           fontWeight: FontWeight.normal,
@@ -2943,12 +3662,19 @@ case 'edit':
                     );
                     if (mounted) setState(() {});
                   }
+                  return;
                 case 'starred':
                   await _showStarred();
+                  return;
                 case 'wallpaper':
                   await _chooseWallpaper();
+                  return;
+                case 'disappearing':
+                  await _chooseDisappearingTimer();
+                  return;
                 case 'verify':
                   _showVerification(context);
+                  return;
                 case 'refresh':
                   final messenger = ScaffoldMessenger.of(context);
                   try {
@@ -2966,6 +3692,7 @@ case 'edit':
                       SnackBar(content: Text('Error: $e')),
                     );
                   }
+                  return;
                 case 'link':
                   final link =
                       'https://open.chat/invite?account=$accountId&peer=${widget.peerId}';
@@ -2975,12 +3702,16 @@ case 'edit':
                       const SnackBar(content: Text('Link copied to clipboard')),
                     );
                   }
+                  return;
                 case 'export':
                   await _exportChat();
+                  return;
                 case 'storage':
                   await _showStorage();
+                  return;
                 case 'tone':
                   await _pickTone();
+                  return;
               }
             },
             itemBuilder: (context) => const [
@@ -3006,6 +3737,14 @@ case 'edit':
                   contentPadding: EdgeInsets.zero,
                   leading: Icon(Icons.wallpaper_outlined),
                   title: Text('Chat wallpaper & theme'),
+                ),
+              ),
+              PopupMenuItem(
+                value: 'disappearing',
+                child: ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: Icon(Icons.timer_outlined),
+                  title: Text('Disappearing messages'),
                 ),
               ),
               PopupMenuItem(
@@ -3062,6 +3801,21 @@ case 'edit':
       ),
       body: Column(
         children: [
+          if (_disappearingSeconds > 0)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+              child: Text(
+                'New messages disappear after ${switch (_disappearingSeconds) {
+                  86400 => '24 hours',
+                  7776000 => '90 days',
+                  _ => '7 days',
+                }}',
+                style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
+                textAlign: TextAlign.center,
+              ),
+            ),
           if (_searching)
             Padding(
               padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
@@ -3258,6 +4012,8 @@ case 'edit':
                                 deleted: true,
                                 mine: msg.mine,
                                 time: msg.at.toLocal(),
+                                onReply: () => _beginReply(msg),
+                                msgRef: msg.ref,
                               );
                             } else if (body.isReply &&
                                 body.refId != null &&
@@ -3270,6 +4026,8 @@ case 'edit':
                                 time: msg.at.toLocal(),
                                 status: msg.status,
                                 edited: msg.edited,
+                                onReply: () => _beginReply(msg),
+                                msgRef: msg.ref,
                               );
                             } else if (body.isPoll &&
                                 body.pollId != null &&
@@ -3340,6 +4098,7 @@ case 'edit':
                                 thumbKey: body.thumbKey,
                                 thumbNonce: body.thumbNonce,
                                 durationSec: body.durationSec,
+                                videoNote: body.isVideoNote,
                                 mine: msg.mine,
                                 time: msg.at.toLocal(),
                                 status: msg.status,
@@ -3355,6 +4114,15 @@ case 'edit':
                                 time: msg.at.toLocal(),
                                 status: msg.status,
                               );
+                            } else if (body.isSticker) {
+                              bubble = _SecureStickerBubble(
+                                asset: body.stickerAsset,
+                                mine: msg.mine,
+                                time: msg.at.toLocal(),
+                                status: msg.status,
+                                onReply: () => _beginReply(msg),
+                                msgRef: msg.ref,
+                              );
                             } else {
                               bubble = _SecureBubble(
                                 text: body.text,
@@ -3362,6 +4130,8 @@ case 'edit':
                                 time: msg.at.toLocal(),
                                 status: msg.status,
                                 edited: msg.edited,
+                                onReply: () => _beginReply(msg),
+                                msgRef: msg.ref,
                               );
                             }
                             if (body.forwarded && !body.isTombstone) {
@@ -3678,6 +4448,7 @@ case 'edit':
                     Expanded(
                       child: TextField(
                         controller: composer,
+                        focusNode: _composerFocus,
                         minLines: 1,
                         maxLines: 5,
                         maxLength: 4000,
@@ -3977,6 +4748,7 @@ class _SecureVideoBubble extends StatefulWidget {
     this.thumbKey,
     this.thumbNonce,
     this.durationSec = 0,
+    this.videoNote = false,
   });
   final SupabaseClient client;
   final String path;
@@ -3990,6 +4762,7 @@ class _SecureVideoBubble extends StatefulWidget {
   final String? thumbKey;
   final String? thumbNonce;
   final int durationSec;
+  final bool videoNote;
   @override
   State<_SecureVideoBubble> createState() => _SecureVideoBubbleState();
 }
@@ -4025,8 +4798,9 @@ class _SecureVideoBubbleState extends State<_SecureVideoBubble> {
     if (widget.imageKey == null || widget.imageNonce == null) return;
     final messenger = ScaffoldMessenger.of(context);
     try {
-      final bytes = await ChatMedia(widget.client)
-          .downloadSealed(widget.path, widget.imageKey!, widget.imageNonce!);
+      final bytes = await ChatMedia(
+        widget.client,
+      ).downloadSealedVideo(widget.path, widget.imageKey!, widget.imageNonce!);
       if (!mounted) return;
       await Navigator.push(
         context,
@@ -4045,121 +4819,361 @@ class _SecureVideoBubbleState extends State<_SecureVideoBubble> {
   }
 
   @override
-  Widget build(BuildContext context) => Align(
-    alignment: widget.mine ? Alignment.centerRight : Alignment.centerLeft,
-    child: Container(
-      constraints: BoxConstraints(
-        maxWidth: MediaQuery.of(context).size.width * 0.72,
-      ),
-      margin: const EdgeInsets.only(bottom: 12),
-      padding: const EdgeInsets.all(6),
-      decoration: BoxDecoration(
-        color: widget.mine ? const Color(0xFF245CDB) : const Color(0xFFE9EDF4),
-        borderRadius: const BorderRadius.all(Radius.circular(18)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.end,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          GestureDetector(
-            onTap: _play,
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(12),
-              child: SizedBox(
-                height: 170,
-                width: double.infinity,
-                child: Stack(
-                  fit: StackFit.expand,
-                  children: [
-                    FutureBuilder<Uint8List?>(
-                      future: _thumb,
-                      builder: (context, snapshot) => snapshot.hasData
-                          ? Image.memory(snapshot.data!, fit: BoxFit.cover)
-                          : Container(
-                              color: Colors.black38,
-                              child: const Center(
-                                child: Icon(
-                                  Icons.movie_outlined,
-                                  color: Colors.white54,
-                                  size: 48,
+  Widget build(BuildContext context) {
+    if (widget.videoNote) {
+      return _SecureVideoNoteBubble(
+        client: widget.client,
+        path: widget.path,
+        keyMaterial: widget.imageKey,
+        nonce: widget.imageNonce,
+        durationSec: widget.durationSec,
+        mine: widget.mine,
+        time: widget.time,
+        status: widget.status,
+      );
+    }
+    return Align(
+      alignment: widget.mine ? Alignment.centerRight : Alignment.centerLeft,
+      child: Container(
+        constraints: BoxConstraints(
+          maxWidth: MediaQuery.of(context).size.width * 0.72,
+        ),
+        margin: const EdgeInsets.only(bottom: 12),
+        padding: const EdgeInsets.all(6),
+        decoration: BoxDecoration(
+          color: widget.mine
+              ? const Color(0xFF245CDB)
+              : const Color(0xFFE9EDF4),
+          borderRadius: const BorderRadius.all(Radius.circular(18)),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.end,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            GestureDetector(
+              onTap: _play,
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(12),
+                child: SizedBox(
+                  height: 170,
+                  width: double.infinity,
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      FutureBuilder<Uint8List?>(
+                        future: _thumb,
+                        builder: (context, snapshot) => snapshot.hasData
+                            ? Image.memory(snapshot.data!, fit: BoxFit.cover)
+                            : Container(
+                                color: Colors.black38,
+                                child: const Center(
+                                  child: Icon(
+                                    Icons.movie_outlined,
+                                    color: Colors.white54,
+                                    size: 48,
+                                  ),
                                 ),
                               ),
-                            ),
-                    ),
-                    const Center(
-                      child: CircleAvatar(
-                        backgroundColor: Colors.black54,
-                        child: Icon(Icons.play_arrow, color: Colors.white),
                       ),
-                    ),
-                    Positioned(
-                      bottom: 8,
-                      left: 8,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 8,
-                          vertical: 4,
+                      const Center(
+                        child: CircleAvatar(
+                          backgroundColor: Colors.black54,
+                          child: Icon(Icons.play_arrow, color: Colors.white),
                         ),
-                        decoration: BoxDecoration(
-                          color: Colors.black.withValues(alpha: 0.6),
-                          borderRadius: BorderRadius.circular(8),
-                        ),
-                        child: Text(
-                          _durationLabel,
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 11,
+                      ),
+                      Positioned(
+                        bottom: 8,
+                        left: 8,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 4,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.black.withValues(alpha: 0.6),
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                          child: Text(
+                            _durationLabel,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 11,
+                            ),
                           ),
                         ),
                       ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            if (widget.caption.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(10, 6, 10, 2),
+                child: SelectableText(
+                  widget.caption,
+                  style: TextStyle(
+                    color: widget.mine ? Colors.white : const Color(0xFF22334E),
+                    fontSize: 14,
+                  ),
+                ),
+              ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(10, 2, 10, 6),
+              child: Text.rich(
+                TextSpan(
+                  children: [
+                    TextSpan(
+                      text:
+                          '${widget.time.hour.toString().padLeft(2, '0')}:${widget.time.minute.toString().padLeft(2, '0')}',
+                      style: TextStyle(
+                        fontSize: 10,
+                        color: widget.mine
+                            ? Colors.white70
+                            : const Color(0xFF66748A),
+                      ),
                     ),
+                    if (widget.mine)
+                      TextSpan(
+                        text: _Ticks.glyph(widget.status),
+                        style: TextStyle(
+                          fontSize: 10,
+                          color: _Ticks.color(widget.status, true),
+                        ),
+                      ),
                   ],
                 ),
               ),
             ),
-          ),
-          if (widget.caption.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(10, 6, 10, 2),
-              child: SelectableText(
-                widget.caption,
-                style: TextStyle(
-                  color: widget.mine ? Colors.white : const Color(0xFF22334E),
-                  fontSize: 14,
-                ),
-              ),
-            ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(10, 2, 10, 6),
-            child: Text.rich(
-              TextSpan(
-                children: [
-                  TextSpan(
-                    text:
-                        '${widget.time.hour.toString().padLeft(2, '0')}:${widget.time.minute.toString().padLeft(2, '0')}',
-                    style: TextStyle(
-                      fontSize: 10,
-                      color: widget.mine
-                          ? Colors.white70
-                          : const Color(0xFF66748A),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// A one-minute, camera-captured video note. The sealed video is staged in a
+/// temporary file only while it is played and cropped to a circle in chat.
+class _SecureVideoNoteBubble extends StatefulWidget {
+  const _SecureVideoNoteBubble({
+    required this.client,
+    required this.path,
+    required this.keyMaterial,
+    required this.nonce,
+    required this.durationSec,
+    required this.mine,
+    required this.time,
+    required this.status,
+  });
+
+  final SupabaseClient client;
+  final String path;
+  final String? keyMaterial;
+  final String? nonce;
+  final int durationSec;
+  final bool mine;
+  final DateTime time;
+  final String status;
+
+  @override
+  State<_SecureVideoNoteBubble> createState() => _SecureVideoNoteBubbleState();
+}
+
+class _SecureVideoNoteBubbleState extends State<_SecureVideoNoteBubble> {
+  VideoPlayerController? _controller;
+  File? _temporaryFile;
+  String? _error;
+  bool _loading = false;
+
+  Future<void> _togglePlayback() async {
+    final existing = _controller;
+    if (existing != null) {
+      if (existing.value.isPlaying) {
+        await existing.pause();
+      } else {
+        await existing.play();
+      }
+      if (mounted) setState(() {});
+      return;
+    }
+    if (_loading) return;
+
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    File? temporaryFile;
+    VideoPlayerController? controller;
+    try {
+      final media = ChatMedia(widget.client);
+      final bytes = widget.keyMaterial != null && widget.nonce != null
+          ? await media.downloadSealedVideo(
+              widget.path,
+              widget.keyMaterial!,
+              widget.nonce!,
+            )
+          : await media.downloadRaw(widget.path);
+      final directory = await getTemporaryDirectory();
+      temporaryFile = File(
+        '${directory.path}/oc-video-note-${DateTime.now().microsecondsSinceEpoch}.mp4',
+      );
+      await temporaryFile.writeAsBytes(bytes, flush: true);
+      controller = VideoPlayerController.file(temporaryFile);
+      await controller.initialize();
+      await controller.setLooping(true);
+      if (!mounted) {
+        await controller.dispose();
+        await temporaryFile.delete();
+        return;
+      }
+      _temporaryFile = temporaryFile;
+      _controller = controller;
+      await controller.play();
+      setState(() {});
+    } catch (_) {
+      await controller?.dispose();
+      if (temporaryFile != null && await temporaryFile.exists()) {
+        await temporaryFile.delete();
+      }
+      if (mounted) {
+        setState(() => _error = 'Could not load this video note.');
+      }
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller?.dispose();
+    _temporaryFile?.delete().ignore();
+    super.dispose();
+  }
+
+  String get _durationLabel {
+    final minutes = widget.durationSec ~/ 60;
+    final seconds = widget.durationSec % 60;
+    return '$minutes:${seconds.toString().padLeft(2, '0')}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final controller = _controller;
+    final playing = controller?.value.isPlaying ?? false;
+    return Align(
+      alignment: widget.mine ? Alignment.centerRight : Alignment.centerLeft,
+      child: Semantics(
+        button: true,
+        label:
+            'Video note, $_durationLabel. Tap to ${playing ? 'pause' : 'play'}',
+        child: Container(
+          margin: const EdgeInsets.only(bottom: 12),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              GestureDetector(
+                onTap: _togglePlayback,
+                child: SizedBox(
+                  width: 220,
+                  height: 220,
+                  child: ClipOval(
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        ColoredBox(
+                          color: widget.mine
+                              ? const Color(0xFF245CDB)
+                              : const Color(0xFFE9EDF4),
+                          child:
+                              controller != null &&
+                                  controller.value.isInitialized
+                              ? FittedBox(
+                                  fit: BoxFit.cover,
+                                  child: SizedBox(
+                                    width: controller.value.size.width,
+                                    height: controller.value.size.height,
+                                    child: VideoPlayer(controller),
+                                  ),
+                                )
+                              : Center(
+                                  child: _loading
+                                      ? const CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                        )
+                                      : Icon(
+                                          _error == null
+                                              ? Icons
+                                                    .video_camera_front_outlined
+                                              : Icons.error_outline,
+                                          size: 52,
+                                        ),
+                                ),
+                        ),
+                        if (controller == null || !playing)
+                          const Center(
+                            child: CircleAvatar(
+                              backgroundColor: Colors.black54,
+                              child: Icon(
+                                Icons.play_arrow,
+                                color: Colors.white,
+                              ),
+                            ),
+                          ),
+                        Positioned(
+                          bottom: 22,
+                          left: 72,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 4,
+                            ),
+                            decoration: BoxDecoration(
+                              color: Colors.black.withValues(alpha: 0.6),
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: Text(
+                              _durationLabel,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 11,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
                   ),
-                  if (widget.mine)
-                    TextSpan(
-                      text: _Ticks.glyph(widget.status),
-                      style: TextStyle(
-                        fontSize: 10,
-                        color: _Ticks.color(widget.status, true),
-                      ),
-                    ),
-                ],
+                ),
               ),
-            ),
+              Padding(
+                padding: const EdgeInsets.only(top: 2, right: 8),
+                child: Text.rich(
+                  TextSpan(
+                    children: [
+                      TextSpan(
+                        text:
+                            '${widget.time.hour.toString().padLeft(2, '0')}:${widget.time.minute.toString().padLeft(2, '0')}',
+                        style: const TextStyle(fontSize: 10),
+                      ),
+                      if (widget.mine)
+                        TextSpan(
+                          text: _Ticks.glyph(widget.status),
+                          style: TextStyle(
+                            fontSize: 10,
+                            color: _Ticks.color(widget.status, true),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
           ),
-        ],
+        ),
       ),
-    ),
-  );
+    );
+  }
 }
 
 /// WhatsApp-style attach grid tile: colored round icon over a label.
@@ -4401,6 +5415,8 @@ class _SecureBubble extends StatelessWidget {
     this.quoteText,
     this.deleted = false,
     this.edited = false,
+    this.onReply,
+    this.msgRef,
   });
   final String text;
   final bool mine;
@@ -4410,135 +5426,333 @@ class _SecureBubble extends StatelessWidget {
   final String? quoteText;
   final bool deleted;
   final bool edited;
+  final VoidCallback? onReply;
+  final String? msgRef;
 
   @override
-  Widget build(BuildContext context) => Align(
-    alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
-    child: Container(
-      constraints: BoxConstraints(
-        maxWidth: MediaQuery.of(context).size.width * 0.76,
-      ),
-      margin: const EdgeInsets.only(bottom: 12),
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 10),
-      decoration: BoxDecoration(
-        color: mine ? const Color(0xFF245CDB) : const Color(0xFFE9EDF4),
-        borderRadius: const BorderRadius.all(Radius.circular(18)),
-        boxShadow: mine
-            ? [
-                BoxShadow(
-                  color: Colors.black26,
-                  blurRadius: 2,
-                  offset: const Offset(0, 1),
-                ),
-              ]
-            : null,
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.end,
-        children: [
-          if (quoteText != null)
-            Container(
-              width: double.infinity,
-              margin: const EdgeInsets.only(bottom: 8),
-              padding: const EdgeInsets.all(8),
-              decoration: BoxDecoration(
-                color: mine ? Colors.white12 : Colors.black12,
-                border: Border(
-                  left: BorderSide(
-                    color: mine ? Colors.white70 : const Color(0xFF245CDB),
-                    width: 3,
+  Widget build(BuildContext context) {
+    final bubble = Align(
+      alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
+      child: Container(
+        constraints: BoxConstraints(
+          maxWidth: MediaQuery.of(context).size.width * 0.76,
+        ),
+        margin: const EdgeInsets.only(bottom: 12),
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 10),
+        decoration: BoxDecoration(
+          color: mine ? const Color(0xFF245CDB) : const Color(0xFFE9EDF4),
+          borderRadius: const BorderRadius.all(Radius.circular(18)),
+          boxShadow: mine
+              ? [
+                  BoxShadow(
+                    color: Colors.black26,
+                    blurRadius: 2,
+                    offset: const Offset(0, 1),
                   ),
-                ),
-                borderRadius: BorderRadius.circular(4),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    quoteName ?? '',
-                    style: TextStyle(
-                      fontWeight: FontWeight.bold,
-                      color: mine ? Colors.white : const Color(0xFF22334E),
+                ]
+              : null,
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.end,
+          children: [
+            if (quoteText != null)
+              Container(
+                width: double.infinity,
+                margin: const EdgeInsets.only(bottom: 8),
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: mine ? Colors.white12 : Colors.black12,
+                  border: Border(
+                    left: BorderSide(
+                      color: mine ? Colors.white70 : const Color(0xFF245CDB),
+                      width: 3,
                     ),
                   ),
-                  Text.rich(
-                    TextSpan(
-                      children: formatMessageSpans(
-                        quoteText!,
-                        TextStyle(
-                          color: mine
-                              ? Colors.white70
-                              : const Color(0xFF22334E),
-                        ),
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      quoteName ?? '',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        color: mine ? Colors.white : const Color(0xFF22334E),
                       ),
                     ),
-                    maxLines: 3,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ],
+                    Text.rich(
+                      TextSpan(
+                        children: formatMessageSpans(
+                          quoteText!,
+                          TextStyle(
+                            color: mine
+                                ? Colors.white70
+                                : const Color(0xFF22334E),
+                          ),
+                        ),
+                      ),
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ],
+                ),
               ),
-            ),
-          // Plain Text, not SelectableText: in-place selection registers
-          // competing long-press recognizers that swallow the message
-          // action sheet (on device and in tests). Copy lives in the
-          // long-press menu, WhatsApp-style.
-          if (deleted)
-            Text(
-              text,
-              style: TextStyle(
-                color: mine ? Colors.white : const Color(0xFF22334E),
-                fontStyle: FontStyle.italic,
-                fontSize: 15,
-                height: 1.45,
-              ),
-            )
-          else
-            Text.rich(
-              TextSpan(
-                children: formatMessageSpans(
-                  text,
-                  TextStyle(
-                    color: mine ? Colors.white : const Color(0xFF22334E),
-                    fontSize: 15,
-                    height: 1.45,
+            // Plain Text, not SelectableText: in-place selection registers
+            // competing long-press recognizers that swallow the message
+            // action sheet (on device and in tests). Copy lives in the
+            // long-press menu, WhatsApp-style.
+            if (deleted)
+              Text(
+                text,
+                style: TextStyle(
+                  color: mine ? Colors.white : const Color(0xFF22334E),
+                  fontStyle: FontStyle.italic,
+                  fontSize: 15,
+                  height: 1.45,
+                ),
+              )
+            else
+              Text.rich(
+                TextSpan(
+                  children: formatMessageSpans(
+                    text,
+                    TextStyle(
+                      color: mine ? Colors.white : const Color(0xFF22334E),
+                      fontSize: 15,
+                      height: 1.45,
+                    ),
                   ),
                 ),
               ),
-            ),
-          const SizedBox(height: 6),
-          Text.rich(
-            TextSpan(
-              children: [
-                if (edited && !deleted)
+            const SizedBox(height: 6),
+            Text.rich(
+              TextSpan(
+                children: [
+                  if (edited && !deleted)
+                    TextSpan(
+                      text: '(Edited) ',
+                      style: TextStyle(
+                        fontSize: 10,
+                        fontStyle: FontStyle.italic,
+                        color: mine ? Colors.white70 : const Color(0xFF66748A),
+                      ),
+                    ),
                   TextSpan(
-                    text: '(Edited) ',
+                    text:
+                        '${time.hour.toString().padLeft(2, "0")}:${time.minute.toString().padLeft(2, "0")}',
                     style: TextStyle(
                       fontSize: 10,
-                      fontStyle: FontStyle.italic,
                       color: mine ? Colors.white70 : const Color(0xFF66748A),
                     ),
                   ),
-                TextSpan(
-                  text:
-                      '${time.hour.toString().padLeft(2, "0")}:${time.minute.toString().padLeft(2, "0")}',
-                  style: TextStyle(
-                    fontSize: 10,
-                    color: mine ? Colors.white70 : const Color(0xFF66748A),
+                  if (mine && !deleted)
+                    TextSpan(
+                      text: _Ticks.glyph(status),
+                      style: TextStyle(
+                        fontSize: 10,
+                        color: _Ticks.color(status, true),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    if (onReply == null) return bubble;
+
+    return Dismissible(
+      key: ValueKey(msgRef ?? text),
+      direction: mine
+          ? DismissDirection.startToEnd
+          : DismissDirection.endToStart,
+      background: _ReplySwipeBackground(isMine: mine),
+      onDismissed: (_) => onReply?.call(),
+      child: bubble,
+    );
+  }
+}
+
+class _ReplySwipeBackground extends StatelessWidget {
+  const _ReplySwipeBackground({required this.isMine});
+  final bool isMine;
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.symmetric(horizontal: 24),
+      decoration: BoxDecoration(
+        color: isDark ? const Color(0xFF004D3A) : const Color(0xFFDCF8C6),
+        borderRadius: const BorderRadius.all(Radius.circular(18)),
+      ),
+      alignment: isMine ? Alignment.centerLeft : Alignment.centerRight,
+      child: Icon(
+        Icons.reply,
+        color: isDark ? const Color(0xFF25D366) : const Color(0xFF008069),
+        size: 28,
+      ),
+    );
+  }
+}
+
+/// Static sticker bubble for 1:1 encrypted chats.
+class _SecureStickerBubble extends StatelessWidget {
+  const _SecureStickerBubble({
+    required this.asset,
+    required this.mine,
+    required this.time,
+    this.status = 'sent',
+    this.onReply,
+    this.msgRef,
+  });
+  final String asset;
+  final bool mine;
+  final DateTime time;
+  final String status;
+  final VoidCallback? onReply;
+  final String? msgRef;
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final bubbleColor = mine
+        ? (isDark ? const Color(0xFF245CDB) : const Color(0xFFE9EDF4))
+        : (isDark ? const Color(0xFF1F2C34) : Colors.white);
+
+    final stickerSize = 180.0;
+    final assetPath = 'assets/stickers/$asset.png';
+
+    Widget sticker = Image.asset(
+      assetPath,
+      width: stickerSize,
+      height: stickerSize,
+      errorBuilder: (_, __, ___) => Container(
+        width: stickerSize,
+        height: stickerSize,
+        decoration: BoxDecoration(
+          color: isDark ? const Color(0xFF2A3942) : const Color(0xFFF0F2F5),
+          borderRadius: BorderRadius.circular(16),
+        ),
+        child: Icon(
+          Icons.emoji_emotions,
+          size: 48,
+          color: isDark ? Colors.white38 : Colors.black38,
+        ),
+      ),
+    );
+
+    Widget bubble = Align(
+      alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 12),
+        padding: const EdgeInsets.all(8),
+        decoration: BoxDecoration(
+          color: bubbleColor,
+          borderRadius: const BorderRadius.all(Radius.circular(18)),
+          boxShadow: mine
+              ? [
+                  BoxShadow(
+                    color: Colors.black26,
+                    blurRadius: 2,
+                    offset: const Offset(0, 1),
                   ),
-                ),
-                if (mine && !deleted)
+                ]
+              : null,
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.end,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            sticker,
+            const SizedBox(height: 6),
+            Text.rich(
+              TextSpan(
+                children: [
                   TextSpan(
-                    text: _Ticks.glyph(status),
+                    text:
+                        '${time.hour.toString().padLeft(2, "0")}:${time.minute.toString().padLeft(2, "0")}',
                     style: TextStyle(
                       fontSize: 10,
-                      color: _Ticks.color(status, true),
+                      color: mine ? Colors.white70 : const Color(0xFF66748A),
                     ),
                   ),
-              ],
+                  if (mine)
+                    TextSpan(
+                      text: '  ${_Ticks.glyph(status)}',
+                      style: TextStyle(
+                        fontSize: 10,
+                        color: _Ticks.color(status, true),
+                      ),
+                    ),
+                ],
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
-    ),
-  );
+    );
+
+    if (onReply == null) return bubble;
+
+    return Dismissible(
+      key: ValueKey(msgRef ?? asset),
+      direction: mine
+          ? DismissDirection.startToEnd
+          : DismissDirection.endToStart,
+      background: _ReplySwipeBackground(isMine: mine),
+      onDismissed: (_) => onReply?.call(),
+      child: bubble,
+    );
+  }
+}
+
+/// Sticker picker tile for the attachment menu.
+class _StickerTile extends StatelessWidget {
+  const _StickerTile({required this.asset, required this.label});
+  final String asset;
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    return InkWell(
+      borderRadius: BorderRadius.circular(12),
+      onTap: () => Navigator.pop(context, asset),
+      child: Container(
+        decoration: BoxDecoration(
+          color: isDark ? const Color(0xFF2A3942) : const Color(0xFFF0F2F5),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            color: isDark ? const Color(0xFF2A3942) : Colors.black12,
+          ),
+        ),
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Image.asset(
+                'assets/stickers/$asset.png',
+                width: 48,
+                height: 48,
+                errorBuilder: (_, __, ___) =>
+                    Text(label, style: const TextStyle(fontSize: 28)),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                asset,
+                style: TextStyle(
+                  fontSize: 11,
+                  color: isDark ? Colors.white70 : Colors.black54,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }

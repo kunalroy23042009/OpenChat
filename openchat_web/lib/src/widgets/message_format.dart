@@ -1,0 +1,77 @@
+import 'package:flutter/widgets.dart';
+
+String _formatLines(String text) {
+  final lines = text.split('\n');
+  return lines.map((line) {
+    final t = line.trimLeft();
+    if (t.startsWith('> ')) return '▎ ${t.substring(2)}';
+    if (t.startsWith('- ') || t.startsWith('* ')) {
+      return '• ${t.substring(2)}';
+    }
+    final num = RegExp(r'^(\d+)\.\s+(.*)$').firstMatch(t);
+    if (num != null) {
+      return '${num.group(1)}. ${num.group(2)}';
+    }
+    return line;
+  }).join('\n');
+}
+
+/// WhatsApp-style formatting: inline `*bold*`, `_italic_`, `~strike~`,
+/// triple-backtick mono, `code`, plus line-level `> quote`,
+/// `- / * bullet`, `1. numbered`. First match wins, no nesting.
+List<InlineSpan> formatMessageSpans(String text, TextStyle base) {
+  text = _formatLines(text);
+  final pattern = RegExp(
+    r'(```[\s\S]+?```)|(`[^`\n]+?`)|(\*[^*\n]+?\*)|(_[^_\n]+?_)|(~[^~\n]+?~)',
+  );
+  final spans = <InlineSpan>[];
+  var pos = 0;
+  for (final match in pattern.allMatches(text)) {
+    if (match.start > pos) {
+      spans.add(TextSpan(text: text.substring(pos, match.start), style: base));
+    }
+    final hit = match.group(0)!;
+    if (hit.startsWith('```') && hit.length >= 6) {
+      spans.add(
+        TextSpan(
+          text: hit.substring(3, hit.length - 3),
+          style: base.copyWith(fontFamily: 'monospace'),
+        ),
+      );
+    } else if (hit.startsWith('`')) {
+      spans.add(
+        TextSpan(
+          text: hit.substring(1, hit.length - 1),
+          style: base.copyWith(fontFamily: 'monospace'),
+        ),
+      );
+    } else if (hit.startsWith('*')) {
+      spans.add(
+        TextSpan(
+          text: hit.substring(1, hit.length - 1),
+          style: base.copyWith(fontWeight: FontWeight.w700),
+        ),
+      );
+    } else if (hit.startsWith('_')) {
+      spans.add(
+        TextSpan(
+          text: hit.substring(1, hit.length - 1),
+          style: base.copyWith(fontStyle: FontStyle.italic),
+        ),
+      );
+    } else {
+      spans.add(
+        TextSpan(
+          text: hit.substring(1, hit.length - 1),
+          style: base.copyWith(decoration: TextDecoration.lineThrough),
+        ),
+      );
+    }
+    pos = match.end;
+  }
+  if (pos < text.length) {
+    spans.add(TextSpan(text: text.substring(pos), style: base));
+  }
+  if (spans.isEmpty) spans.add(TextSpan(text: text, style: base));
+  return spans;
+}

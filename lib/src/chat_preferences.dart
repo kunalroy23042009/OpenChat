@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -38,12 +40,41 @@ extension ChatWallpaperPresetInfo on ChatWallpaperPreset {
 }
 
 class ChatPreferences {
-  ChatPreferences(this.preferences);
+  ChatPreferences(this.preferences) {
+    _migrateLegacyDisappearingDefault();
+  }
 
   final SharedPreferences preferences;
   static const _wallpaperPrefix = 'openchat.wallpaper.v2.';
   static const _qualityKey = 'openchat.media_quality.v1';
   static const _dataSaverKey = 'openchat.low_data_mode.v1';
+  static const _disappearingPrefix = 'openchat.disappearing.v1.';
+  static const _defaultDisappearingKey = 'openchat.privacy.disappearing';
+
+  /// One-shot marker so the legacy account default is wiped exactly once.
+  static const _disappearingMigratedKey =
+      'openchat.privacy.disappearing.migrated.v2';
+
+  /// Builds before 1.0.1 saved "7 days" (604800) as the account-wide
+  /// default even when the user never opened Privacy. Disappearing
+  /// messages are opt-in now, so the untouched legacy default is wiped
+  /// once; anything the user picks afterwards keeps working.
+  void _migrateLegacyDisappearingDefault() {
+    if (preferences.getBool(_disappearingMigratedKey) ?? false) return;
+    unawaited(_migrateLegacyDefault());
+  }
+
+  Future<void> _migrateLegacyDefault() async {
+    try {
+      if (preferences.getInt(_defaultDisappearingKey) == 604800) {
+        await preferences.remove(_defaultDisappearingKey);
+      }
+      await preferences.setBool(_disappearingMigratedKey, true);
+    } catch (_) {
+      // Best-effort: the next launch retries, and the effective default
+      // stays off either way.
+    }
+  }
 
   static const _defaultWallpaperKey = 'openchat.wallpaper.default.v1';
 
@@ -80,6 +111,22 @@ class ChatPreferences {
 
   Future<void> setLowDataMode(bool value) =>
       preferences.setBool(_dataSaverKey, value);
+
+  /// A per-chat override. Zero explicitly disables disappearing messages;
+  /// absent values inherit the account default from Privacy settings.
+  /// Default is off: messages live forever unless the user opts in,
+  /// WhatsApp-style.
+  int disappearingSecondsFor(String chatId) =>
+      preferences.getInt('$_disappearingPrefix$chatId') ??
+      preferences.getInt(_defaultDisappearingKey) ??
+      0;
+
+  Future<void> setDisappearingSeconds(String chatId, int seconds) async {
+    if (![0, 86400, 604800, 7776000].contains(seconds)) {
+      throw ArgumentError('Unsupported disappearing-message timer.');
+    }
+    await preferences.setInt('$_disappearingPrefix$chatId', seconds);
+  }
 }
 
 Future<ChatWallpaperPreset?> chooseChatWallpaper(

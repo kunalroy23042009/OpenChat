@@ -116,15 +116,16 @@ class MessageActionsSheet extends StatelessWidget {
           const Divider(height: 1),
 
           // Action items
-          _ActionTile(
-            icon: Icons.reply,
-            label: 'Reply',
-            color: textColor,
-            onTap: () {
-              Navigator.pop(context);
-              onReply?.call();
-            },
-          ),
+          if (onReply != null)
+            _ActionTile(
+              icon: Icons.reply,
+              label: 'Reply',
+              color: textColor,
+              onTap: () {
+                Navigator.pop(context);
+                onReply?.call();
+              },
+            ),
 
           if (isMine && isEditable)
             _ActionTile(
@@ -137,35 +138,38 @@ class MessageActionsSheet extends StatelessWidget {
               },
             ),
 
-          _ActionTile(
-            icon: Icons.forward,
-            label: 'Forward',
-            color: textColor,
-            onTap: () {
-              Navigator.pop(context);
-              onForward?.call();
-            },
-          ),
+          if (onForward != null)
+            _ActionTile(
+              icon: Icons.forward,
+              label: 'Forward',
+              color: textColor,
+              onTap: () {
+                Navigator.pop(context);
+                onForward?.call();
+              },
+            ),
 
-          _ActionTile(
-            icon: isStarred ? Icons.star : Icons.star_outline,
-            label: isStarred ? 'Unstar' : 'Star',
-            color: textColor,
-            onTap: () {
-              Navigator.pop(context);
-              onStar?.call();
-            },
-          ),
+          if (onStar != null)
+            _ActionTile(
+              icon: isStarred ? Icons.star : Icons.star_outline,
+              label: isStarred ? 'Unstar' : 'Star',
+              color: textColor,
+              onTap: () {
+                Navigator.pop(context);
+                onStar?.call();
+              },
+            ),
 
-          _ActionTile(
-            icon: isPinned ? Icons.push_pin : Icons.push_pin_outlined,
-            label: isPinned ? 'Unpin' : 'Pin',
-            color: textColor,
-            onTap: () {
-              Navigator.pop(context);
-              onPin?.call();
-            },
-          ),
+          if (onPin != null)
+            _ActionTile(
+              icon: isPinned ? Icons.push_pin : Icons.push_pin_outlined,
+              label: isPinned ? 'Unpin' : 'Pin',
+              color: textColor,
+              onTap: () {
+                Navigator.pop(context);
+                onPin?.call();
+              },
+            ),
 
           if (onConvertToTask != null)
             _ActionTile(
@@ -208,17 +212,18 @@ class MessageActionsSheet extends StatelessWidget {
 
           const Divider(height: 1),
 
-          _ActionTile(
-            icon: Icons.delete_outline,
-            label: 'Delete for me',
-            color: Colors.red,
-            onTap: () {
-              Navigator.pop(context);
-              onDeleteForMe?.call();
-            },
-          ),
+          if (onDeleteForMe != null)
+            _ActionTile(
+              icon: Icons.delete_outline,
+              label: 'Delete for me',
+              color: Colors.red,
+              onTap: () {
+                Navigator.pop(context);
+                onDeleteForMe?.call();
+              },
+            ),
 
-          if (isMine)
+          if (isMine && onDeleteForEveryone != null)
             _ActionTile(
               icon: Icons.delete_forever,
               label: 'Delete for everyone',

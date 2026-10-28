@@ -190,22 +190,27 @@ void main() {
     },
   );
 
-  testWidgets(
-    'failed send retains draft',
-    (tester) async {
-      rejectSend = true;
-      await open(tester);
-      await tester.enterText(find.byType(TextField).first, 'Draft message');
-      await tester.tap(find.byTooltip('Send'));
-      await tester.pumpAndSettle();
-      expect(
-        tester.widget<TextField>(find.byType(TextField).first).controller!.text,
-        'Draft message',
-      );
-      expect(tester.takeException(), isNull);
-      await disposeScreen(tester);
-    },
-  );
+  testWidgets('failed send retains draft', (tester) async {
+    rejectSend = true;
+    await open(tester);
+    await tester.enterText(find.byType(TextField).first, 'Draft message');
+    await tester.tap(find.byTooltip('Send'));
+    await tester.pumpAndSettle();
+    expect(
+      tester.widget<TextField>(find.byType(TextField).first).controller!.text,
+      'Draft message',
+    );
+    expect(store.getSecureConversation(me, peer), hasLength(1));
+    expect(find.textContaining('Message not sent.'), findsOneWidget);
+    await tester.pump(const Duration(seconds: 31));
+    expect(
+      encryptedPlaintexts,
+      hasLength(1),
+      reason: 'A contact/block rejection must not be retried automatically',
+    );
+    expect(tester.takeException(), isNull);
+    await disposeScreen(tester);
+  });
 
   testWidgets('tapping a bubble pops the quick reaction bar', (tester) async {
     await open(tester);
@@ -273,9 +278,7 @@ void main() {
     await disposeScreen(tester);
   });
 
-  testWidgets('editing is available in action sheet', (
-    tester,
-  ) async {
+  testWidgets('editing is available in action sheet', (tester) async {
     await open(tester);
     await tester.longPress(find.text('Original message'));
     await tester.pumpAndSettle();

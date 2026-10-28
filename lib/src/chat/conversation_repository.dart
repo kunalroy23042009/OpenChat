@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import '../ops/error_report.dart';
 import '../security/secure_history_database.dart';
 import '../security/signal_crypto.dart';
 
@@ -32,6 +33,7 @@ class GroupConversation {
     this.markedUnread = false,
     this.mutedUntilMs,
     this.unreadCount = 0,
+    this.memberCount = 0,
     this.lastActivity,
     this.lastMessage,
     this.isArchivedBackup = false,
@@ -56,6 +58,7 @@ class GroupConversation {
   final bool markedUnread;
   final int? mutedUntilMs;
   final int unreadCount;
+  final int memberCount;
   final DateTime? lastActivity;
   final String? lastMessage;
   final bool isArchivedBackup;
@@ -95,6 +98,7 @@ class GroupConversation {
                   ?.millisecondsSinceEpoch
             : null,
         unreadCount: json['unread_count'] as int? ?? 0,
+        memberCount: json['member_count'] as int? ?? 0,
         lastActivity: json['last_activity'] != null
             ? DateTime.tryParse(json['last_activity'] as String)
             : null,
@@ -271,6 +275,31 @@ class ConversationRepository extends ChangeNotifier {
   String? get error => _error;
 
   String get _userId => client.auth.currentUser!.id;
+
+  Future<String?> _profileAvatarUrl(String? path, [String? legacyUrl]) async {
+    if (path == null || path.isEmpty) return legacyUrl;
+    try {
+      return await client.storage
+          .from('profile-avatars')
+          .createSignedUrl(path, 60 * 60);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<Map<String, dynamic>> _withAvatarUrl(Map<String, dynamic> row) async {
+    final copy = Map<String, dynamic>.from(row);
+    final path = (copy['sender_avatar_path'] ?? copy['avatar_path']) as String?;
+    final legacy = (copy['sender_avatar'] ?? copy['avatar_url']) as String?;
+    final url = await _profileAvatarUrl(path, legacy);
+    if (copy.containsKey('sender_avatar_path') ||
+        copy.containsKey('sender_avatar')) {
+      copy['sender_avatar'] = url;
+    } else {
+      copy['avatar_url'] = url;
+    }
+    return copy;
+  }
 
   List<GroupMessage> messagesFor(String conversationId) =>
       _messages[conversationId] ?? [];
@@ -598,7 +627,9 @@ class ConversationRepository extends ChangeNotifier {
       'list_conversation_members',
       params: {'p_conversation_id': conversationId},
     ) as List;
-    return rows.map((row) => Map<String, dynamic>.from(row as Map)).toList();
+    return Future.wait(
+      rows.map((row) => _withAvatarUrl(Map<String, dynamic>.from(row as Map))),
+    );
   }
 
   /// Current votes for a group poll message.
@@ -624,15 +655,11 @@ class ConversationRepository extends ChangeNotifier {
   }
 
   /// Notifies server to send FCM nudges to other group members.
-  Future<void> notifyGroup(
-    String conversationId,
-    String messageId,
-  ) async {
-    await client.functions.invoke('notify-send', body: {
-      'kind': 'group',
-      'group': conversationId,
-      'event': messageId,
-    });
+  Future<void> notifyGroup(String conversationId, String messageId) async {
+    await client.functions.invoke(
+      'notify-send',
+      body: {'kind': 'group', 'group': conversationId, 'event': messageId},
+    );
   }
 
   /// Updates per-member conversation flags (mute/pin/archive/lock/favourite).
@@ -1089,7 +1116,9 @@ class ConversationRepository extends ChangeNotifier {
       ) as List<dynamic>;
 
       final uid = client.auth.currentUser?.id;
-      var messageRows = result.cast<Map<String, dynamic>>().toList();
+      var messageRows = await Future.wait(
+        result.cast<Map<String, dynamic>>().map((row) => _withAvatarUrl(row)),
+      );
       final isEncrypted = messageRows.any(
         (row) => (row['metadata'] as Map?)?['e2ee'] == true,
       );
@@ -1098,10 +1127,55 @@ class ConversationRepository extends ChangeNotifier {
           conversationId,
           await SharedPreferences.getInstance(),
         );
+        // Ensure our own sender key for the CURRENT epoch is distributed
+        // even if we never send. After a reinstall the server advanced the
+        // group's epoch; until each member re-distributes, their new rows
+        // render as "could not decrypt" placeholders on this device.
+        final security = await _ensureGroupSenderKeyReady(conversationId);
         final decryptedRows = <Map<String, dynamic>>[];
         // Signal sender-key chains are stateful; decrypt in server order.
+        var placeholderRows = 0;
         for (final row in messageRows) {
-          decryptedRows.add(await _decryptGroupRow(uid, row));
+          final decrypted = await _decryptGroupRow(uid, row);
+          if ((decrypted['content'] as String? ?? '').startsWith('Could')
+              && security != null) {
+            placeholderRows++;
+          }
+          decryptedRows.add(decrypted);
+        }
+        // Stale acknowledged distributions: if several current-epoch rows
+        // fail and some deliveries were already acknowledged from a lost
+        // session, re-issue them once and retry a single bounded pass.
+        if (placeholderRows >= 3 && security != null) {
+          final currentEpoch = (security['epoch'] as num).toInt();
+          final cannotDecryptAtCurrentEpoch = decryptedRows.any(
+            (row) =>
+                (row['content'] as String? ?? '').startsWith('Could') &&
+                _rowE2eeEpoch(row) == currentEpoch,
+          );
+          if (cannotDecryptAtCurrentEpoch) {
+            try {
+              final reissued = await client.rpc(
+                'reissue_group_sender_keys',
+                params: {'p_conversation_id': conversationId},
+              );
+              if (reissued is num && reissued.toInt() > 0) {
+                await _processSenderKeyQueue(
+                  conversationId,
+                  await SharedPreferences.getInstance(),
+                );
+                for (var i = 0; i < decryptedRows.length; i++) {
+                  final row = decryptedRows[i];
+                  if ((row['content'] as String? ?? '')
+                      .startsWith('Could')) {
+                    decryptedRows[i] = await _decryptGroupRow(uid, row);
+                  }
+                }
+              }
+            } catch (e) {
+              ErrorReport.reportError('group-keys', e, code: 'reissue');
+            }
+          }
         }
         messageRows = decryptedRows;
       }
@@ -1185,6 +1259,97 @@ class ConversationRepository extends ChangeNotifier {
         '${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}';
   }
 
+  /// Epoch stamped on a group row's metadata (null when unknown; older
+  /// rows may not carry it — the sender-key envelope queue resolves
+  /// history epochs independently).
+  static int? _rowE2eeEpoch(Map<String, dynamic> row) {
+    final metadata = row['metadata'];
+    if (metadata is Map) {
+      final value = metadata['epoch'];
+      if (value is num) return value.toInt();
+    }
+    return null;
+  }
+
+  /// Makes sure this device holds and has distributed a sender key for the
+  /// conversation's CURRENT epoch. Called both from the send path and from
+  /// message loading — after a reinstall, the server advanced the epoch but
+  /// members only re-distribute keys when they next send; until then every
+  /// row decrypts to "could not decrypt" placeholders. Never throws on the
+  /// (optional) load path: returns the fetched security state, or null when
+  /// the group is not encrypted or the broker is unreachable.
+  Future<Map<String, dynamic>?> _ensureGroupSenderKeyReady(
+    String conversationId, {
+    Map<String, dynamic>? preloadedState,
+  }) async {
+    Map<String, dynamic> securityState;
+    try {
+      securityState = preloadedState ??
+          await _groupSecurityState(conversationId);
+    } catch (e) {
+      ErrorReport.reportError('group-keys', e, code: 'security_state');
+      return null;
+    }
+    if (securityState['e2ee_enabled'] != true) return null;
+    final uid = _userId;
+    final epoch = (securityState['epoch'] as num).toInt();
+    final memberIds = (securityState['member_ids'] as List)
+        .map((value) => value.toString())
+        .toList();
+    if (!memberIds.contains(uid)) return null;
+
+    try {
+      final sender = await _signalChannel.invokeMapMethod<String, dynamic>(
+        'signalGroupCreate',
+        {'accountId': uid, 'groupId': conversationId, 'epoch': epoch},
+      );
+      if (sender == null) return null;
+      if (sender['created'] == true) {
+        final distribution = sender['distribution'] as String;
+        final crypto = SignalCrypto(
+          client: client,
+          accountId: uid,
+          preferences: await SharedPreferences.getInstance(),
+        );
+        final envelopes = <String, String>{};
+        for (final peerId in memberIds.where((id) => id != uid)) {
+          try {
+            envelopes[peerId] = await crypto.encryptText(peerId, distribution);
+          } catch (e) {
+            // One unreachable/corrupt peer must not starve the rest of the
+            // group: skip them; they heal via key re-issue on their side.
+            ErrorReport.report(
+              area: 'group-keys',
+              code: 'distribute_peer_skipped',
+              details: {'peer_sha': peerId.hashCode.toRadixString(36)},
+            );
+          }
+        }
+        if (envelopes.isEmpty) {
+          throw StateError('No member could receive the sender key.');
+        }
+        await client.rpc(
+          'publish_group_sender_key',
+          params: {
+            'p_conversation_id': conversationId,
+            'p_epoch': epoch,
+            'p_distribution_id': sender['distributionId'],
+            'p_envelopes': envelopes,
+          },
+        );
+        await _signalChannel.invokeMethod('signalGroupMarkPublished', {
+          'accountId': uid,
+          'groupId': conversationId,
+          'epoch': epoch,
+        });
+      }
+      return securityState;
+    } catch (e) {
+      ErrorReport.reportError('group-keys', e, code: 'distribute');
+      return null;
+    }
+  }
+
   Future<String> _sendEncryptedGroupMessage(
     String conversationId,
     String content,
@@ -1204,38 +1369,19 @@ class ConversationRepository extends ChangeNotifier {
         .toList();
     if (!memberIds.contains(uid)) throw StateError('Group membership changed.');
 
-    final sender = await _signalChannel.invokeMapMethod<String, dynamic>(
-      'signalGroupCreate',
-      {'accountId': uid, 'groupId': conversationId, 'epoch': epoch},
+    // Create and publish (or reuse) this device's sender key for the epoch.
+    final readyState = await _ensureGroupSenderKeyReady(
+      conversationId,
+      preloadedState: securityState,
     );
-    if (sender == null) {
-      throw StateError('Could not create group encryption key.');
-    }
-    if (sender['created'] == true) {
-      final distribution = sender['distribution'] as String;
-      final crypto = SignalCrypto(
-        client: client,
-        accountId: uid,
-        preferences: await SharedPreferences.getInstance(),
+    if (readyState == null) {
+      // Recipients need the distribution before they can decrypt a message.
+      ErrorReport.report(
+        area: 'group-keys',
+        code: 'send_distribution_pending',
+        details: {'epoch': '$epoch'},
       );
-      final envelopes = <String, String>{};
-      for (final peerId in memberIds.where((id) => id != uid)) {
-        envelopes[peerId] = await crypto.encryptText(peerId, distribution);
-      }
-      await client.rpc(
-        'publish_group_sender_key',
-        params: {
-          'p_conversation_id': conversationId,
-          'p_epoch': epoch,
-          'p_distribution_id': sender['distributionId'],
-          'p_envelopes': envelopes,
-        },
-      );
-      await _signalChannel.invokeMethod('signalGroupMarkPublished', {
-        'accountId': uid,
-        'groupId': conversationId,
-        'epoch': epoch,
-      });
+      throw StateError('Group encryption keys could not be shared. Try again.');
     }
 
     final messageId = _newMessageId();
@@ -1625,6 +1771,7 @@ class ConversationRepository extends ChangeNotifier {
   }
 
   RealtimeChannel? _membershipSub;
+  RealtimeChannel? _conversationActivitySub;
 
   /// Subscribes to conversation_members changes for the current user so the
   /// home group list unread badges stay in sync.
@@ -1649,17 +1796,33 @@ class ConversationRepository extends ChangeNotifier {
               },
             )
           ..subscribe();
+    // A new message changes list ordering and unread counts but does not
+    // mutate membership rows. Watch visible group messages as well so Home
+    // updates immediately instead of requiring a manual refresh.
+    _conversationActivitySub =
+        client
+            .channel('group-activity:$uid')
+            .onPostgresChanges(
+              event: PostgresChangeEvent.all,
+              schema: 'public',
+              table: 'group_messages',
+              callback: (_) => unawaited(loadConversations()),
+            )
+          ..subscribe();
   }
 
   void unsubscribeFromMembership() {
     _membershipSub?.unsubscribe();
     _membershipSub = null;
+    _conversationActivitySub?.unsubscribe();
+    _conversationActivitySub = null;
   }
 
   @override
   void dispose() {
     _realtimeSub?.cancel();
     _membershipSub?.unsubscribe();
+    _conversationActivitySub?.unsubscribe();
     super.dispose();
   }
 }

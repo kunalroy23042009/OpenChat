@@ -1,0 +1,186 @@
+// Call invite retry cron: re-notifies pending call invites that haven't been delivered.
+// Deploy as a scheduled Edge Function (e.g., every 30 seconds via pg_cron or external cron).
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.0";
+
+const json = (body: unknown, status = 200) =>
+  new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+
+async function googleAccessToken(sa: {
+  client_email: string;
+  private_key: string;
+  token_uri: string;
+}): Promise<string> {
+  const now = Math.floor(Date.now() / 1000);
+  const header = btoa(JSON.stringify({ alg: "RS256", typ: "JWT" }))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+  const claims = btoa(JSON.stringify({
+    iss: sa.client_email,
+    scope: "https://www.googleapis.com/auth/firebase.messaging",
+    aud: sa.token_uri,
+    iat: now,
+    exp: now + 3600,
+  }))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+  const key = await crypto.subtle.importKey(
+    "pkcs8",
+    new Uint8Array(sa.private_key.replace(/-----BEGIN [^-]+-----/, "").replace(/-----END [^-]+-----/, "").replace(/\s+/g, "").split("").map(c => c.charCodeAt(0))).buffer,
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const sig = await crypto.subtle.sign(
+    "RSASSA-PKCS1-v1_5",
+    key,
+    new TextEncoder().encode(`${header}.${claims}`),
+  );
+  const assertion = `${header}.${claims}.${btoa(String.fromCharCode(...new Uint8Array(sig))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")}`;
+  const res = await fetch(sa.token_uri, {
+    signal: AbortSignal.timeout(10000),
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      assertion,
+    }),
+  });
+  if (!res.ok) throw new Error("Google token exchange failed.");
+  const data = await res.json();
+  return data.access_token as string;
+}
+
+async function sendFcm(
+  admin: any,
+  sa: any,
+  access: string,
+  token: string,
+  data: Record<string, string>,
+  eventId: string,
+  recipient: string,
+  kind: string,
+  deviceHash: string,
+): Promise<boolean> {
+  try {
+    const res = await fetch(
+      `https://fcm.googleapis.com/v1/projects/${sa.project_id}/messages:send`,
+      {
+        method: "POST",
+        signal: AbortSignal.timeout(10000),
+        headers: {
+          Authorization: `Bearer ${access}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          message: { token, data: { ...data, event: eventId, recipient }, android: { priority: "high", ttl: kind === 'call' ? '60s' : '3600s' } },
+        }),
+      },
+    );
+    if (res.ok) {
+      await admin.from('device_notification_dispatches').update({ sent: true })
+        .eq('actor_id', data['peer'] as string).eq('recipient_id', recipient).eq('kind', kind).eq('event_id', eventId)
+        .eq('device_hash', deviceHash);
+      return true;
+    } else {
+      const failure = await res.json().catch(() => null);
+      if (failure?.error?.details?.some((d: { errorCode?: string }) => d.errorCode === 'UNREGISTERED')) {
+        await admin.from('push_tokens').delete().eq('token', token).eq('user_id', recipient);
+      }
+      return false;
+    }
+  } catch {
+    return false;
+  }
+}
+
+serve(async (req) => {
+  if (req.method !== "POST") return json({ error: "Method not allowed." }, 405);
+
+  const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
+  const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+  const saRaw = Deno.env.get("FCM_SERVICE_ACCOUNT") ?? "";
+  if (!supabaseUrl || !serviceKey || !saRaw) {
+    return json({ error: "Not configured." }, 503);
+  }
+  let sa: { client_email: string; private_key: string; token_uri: string; project_id: string };
+  try {
+    sa = JSON.parse(saRaw);
+    if (!sa.client_email || !sa.private_key || !sa.project_id) throw new Error();
+  } catch {
+    return json({ error: "FCM sender misconfigured." }, 503);
+  }
+
+  const admin = createClient(supabaseUrl, serviceKey);
+
+  // Reset stale pending invites so notify-send will pick them up again
+  const { data: retried, error: retryError } = await admin.rpc(
+    "retry_pending_call_invites",
+    { p_max_age_seconds: 30 }
+  );
+  if (retryError) return json({ error: retryError.message }, 500);
+  const retriedCount = retried ?? 0;
+
+  if (retriedCount === 0) return json({ retried: 0, renotified: 0 });
+
+  // Get the retried invites to re-send FCM for each
+  const { data: invites, error: inviteError } = await admin.from('call_invites')
+    .select('id, caller_id, callee_id, call_type')
+    .eq('status', 'ringing')
+    .eq('delivery_status', 'pending')
+    .gt('created_at', new Date(Date.now() - 60000).toISOString())
+    .gt('expires_at', new Date().toISOString());
+  if (inviteError || !invites?.length) return json({ retried: retriedCount, renotified: 0 });
+
+  // Get caller names
+  const callerIds = [...new Set(invites.map((i: any) => i.caller_id))];
+  const { data: profiles } = await admin.from('profiles')
+    .select('id, display_name').in('id', callerIds);
+  const nameMap = new Map((profiles ?? []).map((p: any) => [p.id, p.display_name ?? 'New contact']));
+
+  // Get FCM tokens for callees
+  const calleeIds = [...new Set(invites.map((i: any) => i.callee_id))];
+  const { data: tokens } = await admin.from('push_tokens')
+    .select('token, user_id').in('user_id', calleeIds);
+  if (!tokens?.length) return json({ retried: retriedCount, renotified: 0 });
+
+  let access: string;
+  try {
+    access = await googleAccessToken({
+      client_email: sa.client_email,
+      private_key: sa.private_key,
+      token_uri: sa.token_uri ?? "https://oauth2.googleapis.com/token",
+    });
+  } catch {
+    return json({ error: "FCM auth failed" }, 502);
+  }
+
+  let renotified = 0;
+  for (const invite of invites) {
+    const callerName = nameMap.get(invite.caller_id) ?? 'New contact';
+    const video = invite.call_type === 'video';
+    const eventId = invite.id;
+    const kind = 'call';
+    const data = { kind, peer: invite.caller_id, invite: eventId, video: video ? "true" : "false", name: callerName };
+
+    for (const { token, user_id: recipient } of tokens.filter((t: any) => t.user_id === invite.callee_id)) {
+      const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token));
+      const deviceHash = btoa(String.fromCharCode(...new Uint8Array(hash)))
+        .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+      const { data: claimed } = await admin.rpc('claim_device_notification',
+        { p_actor: invite.caller_id, p_recipient: recipient, p_kind: kind, p_event: eventId, p_device_hash: deviceHash });
+      if (!claimed) continue;
+      if (await sendFcm(admin, sa, access, token, data, eventId, recipient, kind, deviceHash)) {
+        renotified++;
+      }
+    }
+  }
+
+  return json({ retried: retriedCount, renotified });
+});

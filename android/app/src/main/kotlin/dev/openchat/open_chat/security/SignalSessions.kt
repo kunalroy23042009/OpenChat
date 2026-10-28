@@ -70,9 +70,17 @@ object SignalSessions {
 
     fun processBundle(store: PersistentSignalStore, local: SignalProtocolAddress, remote: SignalProtocolAddress, parts: BundleParts) {
         if (store.containsSession(remote)) return
+        // PQXDH needs the peer's Kyber prekey, and the server guarantees
+        // one: claim_key_bundle falls back to the peer's long-lived signed
+        // Kyber prekey when their one-time pool drains. Only a peer who
+        // never published a modern bundle lacks one; their app republishes
+        // on its next launch.
         val kyberBytes = parts.kyber ?: throw IllegalArgumentException("Contact must reopen the app to refresh one-time keys")
         val kyberSignature = parts.kyberSignature ?: throw IllegalArgumentException("Contact must reopen the app to refresh one-time keys")
         val kyberId = parts.kyberId ?: throw IllegalArgumentException("Contact must reopen the app to refresh one-time keys")
+        // The one-time EC prekey IS optional: id -1 / null builds the
+        // session from the signed prekey alone, so a drained EC pool never
+        // blocks a send. The peer tops their pool up on their next launch.
         val bundle = PreKeyBundle(
             parts.registrationId, remote.deviceId,
             parts.prekeyId ?: -1, parts.prekey?.let { org.signal.libsignal.protocol.ecc.ECPublicKey(it) },

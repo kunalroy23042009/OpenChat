@@ -1,5 +1,6 @@
 package dev.openchat.open_chat
 
+import dev.openchat.open_chat.calling.OpenChatConnectionService
 import dev.openchat.open_chat.security.IdentityVault
 import dev.openchat.open_chat.security.SignalBridge
 import dev.openchat.open_chat.security.SignalDiagnostics
@@ -17,6 +18,8 @@ class MainActivity : FlutterFragmentActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        // System call UI: route Telecom ConnectionService events to Dart.
+        OpenChatConnectionService.setFlutterEngine(flutterEngine, applicationContext)
         privacyChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "dev.openchat/privacy")
         privacyChannel!!.setMethodCallHandler { call, result ->
             if (call.method == "setSecure") {

@@ -1,3 +1,6 @@
+import 'dart:io';
+
+import 'package:path/path.dart' as p;
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 class CloudStatus {
@@ -13,6 +16,8 @@ class CloudStatus {
 
   final String id;
   final String authorId;
+
+  /// 'text', 'image', or 'video'.
   final String type;
   final String content;
   final String? mediaUrl;
@@ -61,6 +66,82 @@ class StatusRepository {
       'p_audience_user_ids': audienceUserIds,
     },
   ) as String;
+
+  /// Uploads a gallery photo/video to the private `status-media` bucket and
+  /// publishes a cloud status for it. The bucket's RLS lets only the author
+  /// and the status audience read the object; the visible row mirrors that.
+  ///
+  /// Path contract: `<author-uid>/<unique-name><ext>`, media_url stored as
+  /// `status-media/` + path. Returns the created status id.
+  Future<String> publishMedia(
+    File media, {
+    required bool isVideo,
+    String? caption,
+    int? backgroundColor,
+    String audience = 'contacts',
+    List<String> audienceUserIds = const [],
+  }) async {
+    final user = client.auth.currentUser;
+    if (user == null) {
+      throw StateError('Sign in to share a status with your contacts.');
+    }
+    final extension = p.extension(media.path).toLowerCase();
+    final contentType = isVideo
+        ? switch (extension) {
+            '.mov' => 'video/quicktime',
+            '.webm' => 'video/webm',
+            _ => 'video/mp4',
+          }
+        : switch (extension) {
+            '.png' => 'image/png',
+            '.webp' => 'image/webp',
+            _ => 'image/jpeg',
+          };
+    final name =
+        '${user.id}/status_${DateTime.now().microsecondsSinceEpoch}$extension';
+    await client.storage.from('status-media').upload(
+      name,
+      media,
+      fileOptions: FileOptions(contentType: contentType, upsert: false),
+    );
+    try {
+      return await client.rpc(
+        'publish_status',
+        params: {
+          'p_type': isVideo ? 'video' : 'image',
+          'p_content': caption ?? (isVideo ? 'Video status' : 'Photo status'),
+          'p_media_url': 'status-media/$name',
+          'p_background_color': backgroundColor,
+          'p_audience': audience,
+          'p_audience_user_ids': audienceUserIds,
+        },
+      ) as String;
+    } catch (e) {
+      // Keep storage consistent: a status row that never landed should not
+      // leave an orphaned object behind.
+      try {
+        await client.storage.from('status-media').remove([name]);
+      } catch (_) {}
+      rethrow;
+    }
+  }
+
+  /// Turns a stored `media_url` value into a temporary signed URL for
+  /// image/network viewers. Values that are not bucket paths (legacy plain
+  /// URLs) are returned untouched; signing failures return null (offline).
+  Future<String?> signedMediaUrl(String? mediaUrl) async {
+    if (mediaUrl == null || mediaUrl.isEmpty) return null;
+    const prefix = 'status-media/';
+    if (!mediaUrl.startsWith(prefix)) return mediaUrl;
+    final path = mediaUrl.substring(prefix.length);
+    try {
+      return await client.storage
+          .from('status-media')
+          .createSignedUrl(path, 60 * 60);
+    } catch (_) {
+      return null;
+    }
+  }
 
   Future<void> markViewed(String id) =>
       client.rpc('mark_status_viewed', params: {'p_status_id': id});

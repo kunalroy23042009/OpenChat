@@ -15,6 +15,12 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <!-- Full-screen incoming-call notifications (Android 14+ install-time). -->
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <!-- Telecom/ConnectionService for system call UI. -->
+    <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+    <uses-permission android:name="android.permission.CALL_PHONE" />
     <application
         android:allowBackup="false"
         android:label="OpenChat"
@@ -49,6 +55,13 @@
                 <category android:name="android.intent.category.BROWSABLE"/>
                 <data android:scheme="dev.openchat.openchat" android:host="auth-callback"/>
             </intent-filter>
+            <!-- Group invite deep link: dev.openchat.openchat://group-invite/<code> -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <category android:name="android.intent.category.BROWSABLE"/>
+                <data android:scheme="dev.openchat.openchat" android:host="group-invite"/>
+            </intent-filter>
             <!-- app_links/Supabase owns authentication URLs, not Flutter routes. -->
             <meta-data android:name="flutter_deeplinking_enabled" android:value="false" />
         </activity>
@@ -57,6 +70,15 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
+        <!-- ConnectionService for system call UI -->
+        <service
+            android:name=".calling.OpenChatConnectionService"
+            android:permission="android.permission.BIND_TELECOM_CONNECTION_SERVICE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.telecom.ConnectionService" />
+            </intent-filter>
+        </service>
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and

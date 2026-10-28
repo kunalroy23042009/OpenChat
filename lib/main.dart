@@ -1,8 +1,16 @@
+import 'dart:async';
+
+import 'package:app_links/app_links.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'src/avatar_sync.dart';
+import 'src/chat/app_presence.dart';
+import 'src/chat/chat_routes.dart';
+import 'src/chat/group_invite_preview_screen.dart';
+import 'src/chat/profile_watcher.dart';
 import 'src/chat_store.dart';
 import 'src/auth/password_page.dart';
 import 'src/auth/recovery_controller.dart';
@@ -10,16 +18,22 @@ import 'src/home.dart';
 import 'src/local_profile.dart';
 import 'src/onboarding.dart';
 import 'src/ops/error_report.dart';
+import 'src/backup/backup_scheduler.dart';
 import 'src/push/push_service.dart';
 import 'src/theme/app_theme.dart';
 import 'src/security/app_lock.dart';
 import 'src/security/secure_history_database.dart';
+import 'src/sqflite_init.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  initSqflite();
   // Content-free crash breadcrumbs for pilot ops. No message bodies,
   // ciphertext, or key material ever leaves the device through this path.
   ErrorReport.install();
+  // Register FCM background handler before runApp so terminated-app pushes
+  // are handled even if the app hasn't fully started yet.
+  FirebaseMessaging.onBackgroundMessage(pushBackgroundHandler);
   const url = String.fromEnvironment('SUPABASE_URL');
   const key = String.fromEnvironment('SUPABASE_ANON_KEY');
   String? startupError;
@@ -63,6 +77,16 @@ Future<void> main() async {
   );
   // Push registration must never block or break startup.
   push.initialize(client);
+  // Initialize backup scheduler for automated backups
+  if (client != null) {
+    unawaited(
+      BackupScheduler.initialize(
+        client: client,
+        store: store,
+        prefs: preferences,
+      ),
+    );
+  }
 }
 
 class OpenChatApp extends StatefulWidget {
@@ -97,9 +121,17 @@ class _OpenChatAppState extends State<OpenChatApp> {
   final navigator = GlobalKey<NavigatorState>();
   RecoveryController? recovery;
   bool recoveryOpen = false;
+  final _appLinks = AppLinks();
+  AppPresence? _presence;
+  StreamSubscription<AuthState>? _authSubscription;
+  StreamSubscription<Uri>? _linkSubscription;
+
   @override
   void initState() {
     super.initState();
+    if (widget.client != null) {
+      _presence = AppPresence(widget.client!)..start();
+    }
     theme = widget.theme ?? AppThemeController(widget.preferences);
     recovery =
         widget.recovery ??
@@ -108,15 +140,34 @@ class _OpenChatAppState extends State<OpenChatApp> {
             : RecoveryController(widget.client!.auth.onAuthStateChange));
     recovery?.addListener(openRecovery);
     openRecovery();
-    
+
+    // Restored sessions do not emit signedIn, so retry a queued profile-photo
+    // upload here as well as after an interactive sign-in.
+    if (widget.client?.auth.currentUser != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        AvatarSyncService(
+          client: widget.client!,
+          preferences: widget.preferences,
+        ).onSignIn(widget.profile);
+      });
+      // Observability: allowlisted client events flow to the cloud table.
+      ErrorReport.attachClient(widget.client);
+      // Real-time profile watcher (avatar/name/last seen).
+      ProfileWatcher.of(widget.client!).start();
+    }
+
     // Listen for auth changes to sync avatar
-    widget.client?.auth.onAuthStateChange.listen((data) async {
+    _authSubscription = widget.client?.auth.onAuthStateChange.listen((
+      data,
+    ) async {
       if (data.event == AuthChangeEvent.signedIn && data.session != null) {
         final avatarSync = AvatarSyncService(
           client: widget.client!,
           preferences: widget.preferences,
         );
         avatarSync.onSignIn(widget.profile);
+        ErrorReport.attachClient(widget.client);
+        ProfileWatcher.of(widget.client!).start();
         // Register/refresh the FCM token the moment we have a session, so
         // background notifications work without waiting for Settings.
         if (widget.push.state != PushState.ready) {
@@ -125,7 +176,53 @@ class _OpenChatAppState extends State<OpenChatApp> {
           await widget.push.syncAccount(widget.client!);
         }
       }
+      if (data.event == AuthChangeEvent.signedOut) {
+        ErrorReport.attachClient(null);
+        ProfileWatcher.of(widget.client!).stop();
+      }
     });
+
+    // Deep-link handling for group invites: dev.openchat.openchat://group-invite/<code>
+    _initDeepLinks();
+  }
+
+  Future<void> _initDeepLinks() async {
+    // Handle cold start (app launched via URI)
+    final initialUri = await _appLinks.getInitialLink();
+    if (initialUri != null && mounted) {
+      _handleDeepLink(initialUri);
+    }
+
+    // Handle warm start (app already running, URI received)
+    if (!mounted) return;
+    _linkSubscription = _appLinks.uriLinkStream.listen((uri) {
+      if (mounted) _handleDeepLink(uri);
+    });
+  }
+
+  void _handleDeepLink(Uri uri) {
+    if (uri.scheme != 'dev.openchat.openchat') return;
+    if (uri.host != 'group-invite') return;
+    final code = uri.pathSegments.isNotEmpty ? uri.pathSegments.first : '';
+    if (code.isEmpty || code.length < 16) return; // Basic format guard
+
+    final client = widget.client;
+    final store = widget.store;
+    final profile = widget.profile;
+    final push = widget.push;
+    if (client == null) return; // Not configured
+
+    navigator.currentState?.push(
+      MaterialPageRoute<void>(
+        builder: (_) => GroupInvitePreviewScreen(
+          client: client,
+          store: store,
+          profile: profile,
+          push: push,
+          inviteCode: code,
+        ),
+      ),
+    );
   }
 
   void openRecovery() {
@@ -152,6 +249,9 @@ class _OpenChatAppState extends State<OpenChatApp> {
 
   @override
   void dispose() {
+    _presence?.dispose();
+    _authSubscription?.cancel();
+    _linkSubscription?.cancel();
     recovery?.removeListener(openRecovery);
     recovery?.dispose();
     super.dispose();
@@ -162,6 +262,7 @@ class _OpenChatAppState extends State<OpenChatApp> {
     valueListenable: theme,
     builder: (context, mode, _) => MaterialApp(
       navigatorKey: navigator,
+      navigatorObservers: [chatRouteObserver],
       title: 'OpenChat',
       debugShowCheckedModeBanner: false,
       theme: theme.lightTheme,

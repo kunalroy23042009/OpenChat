@@ -11,9 +11,11 @@ import '../widgets/formatted_text.dart';
 import '../widgets/message_actions.dart';
 import '../widgets/status_ticks.dart';
 import '../widgets/whatsapp_wallpaper.dart';
+import '../calling/group_voice_chat.dart';
 import '../chat_preferences.dart';
-import '../calling/call_screen.dart';
 import '../contacts_repository.dart';
+import '../push/notify_service.dart';
+import 'chat_routes.dart';
 import 'conversation_repository.dart';
 import 'typing_presence.dart';
 import 'team_tools_page.dart';
@@ -55,13 +57,16 @@ class GroupChatScreen extends StatefulWidget {
   State<GroupChatScreen> createState() => _GroupChatScreenState();
 }
 
-class _GroupChatScreenState extends State<GroupChatScreen> {
+class _GroupChatScreenState extends State<GroupChatScreen>
+    with WidgetsBindingObserver, RouteAware {
   late final ConversationRepository _repo;
   final TextEditingController _textController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
   final FocusNode _focusNode = FocusNode();
 
   bool _isLoading = true;
+  bool _markingRead = false;
+  DateTime? _lastRead;
   bool _loadingOlder = false;
   bool _hasMoreHistory = true;
   String? _error;
@@ -99,6 +104,14 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   /// Sender profile photos by user id, resolved from group member roster
   /// (server now returns avatar_url) and contacts as fallback.
   final Map<String, String> _senderAvatars = {};
+
+  /// Group voice chat (drop-in audio rooms) shared app-wide; this screen
+  /// only renders its state and forwards join/leave taps.
+  final GroupVoiceChatService _voiceChat = GroupVoiceChatService.instance;
+
+  /// Dismissing the banner hides it for this screen session only; it comes
+  /// back on reopen or when the room updates.
+  String? _dismissedVoiceRoom;
 
   String? _senderAvatarFor(GroupMessage msg) {
     final server = msg.senderAvatar;
@@ -219,6 +232,29 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     }
   }
 
+  /// Start or join the drop-in voice room for this group. Starting is
+  /// joining: the first member's RPC call creates the presence row every
+  /// other member sees as a banner.
+  Future<void> _startVoiceChat() => _joinVoiceChat();
+
+  Future<void> _joinVoiceChat() async {
+    if (widget.readOnlyArchive) return;
+    await GroupVoiceChatService.instance.join(
+      context: context,
+      client: Supabase.instance.client,
+      conversationId: widget.conversationId,
+      conversationTitle: _title,
+    );
+    if (mounted && _dismissedVoiceRoom == widget.conversationId) {
+      setState(() => _dismissedVoiceRoom = null);
+    }
+  }
+
+  Future<void> _leaveVoiceChat() async {
+    await GroupVoiceChatService.instance.leave();
+    if (mounted) setState(() {});
+  }
+
   Future<void> _pickGroupPhoto() async {
     final picked = await ImagePicker().pickImage(
       source: ImageSource.gallery,
@@ -258,6 +294,8 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _setVisible(true);
     _repo = ConversationRepository(
       Supabase.instance.client,
       secureHistory: widget.secureHistory,
@@ -273,6 +311,74 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     _scrollController.addListener(_onHistoryScroll);
     _textController.addListener(_onTextChanged);
     _initChat();
+  }
+
+  void _setVisible(bool visible) {
+    final notifications = NotifyService.instance;
+    if (visible && !widget.readOnlyArchive) {
+      notifications.openGroups.add(widget.conversationId);
+      unawaited(notifications.cancelGroup(widget.conversationId));
+    } else {
+      notifications.openGroups.remove(widget.conversationId);
+    }
+    _typingPresence?.setActive(visible);
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final route = ModalRoute.of(context);
+    if (route != null) chatRouteObserver.subscribe(this, route);
+  }
+
+  @override
+  void didPushNext() => _setVisible(false);
+
+  @override
+  void didPopNext() {
+    _setVisible(true);
+    unawaited(_markVisibleRead());
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final visible =
+        state == AppLifecycleState.resumed &&
+        ModalRoute.of(context)?.isCurrent == true;
+    _setVisible(visible);
+    if (visible) unawaited(_markVisibleRead());
+  }
+
+  Future<void> _markVisibleRead() async {
+    if (!mounted ||
+        widget.readOnlyArchive ||
+        _isLoading ||
+        _markingRead ||
+        ModalRoute.of(context)?.isCurrent != true ||
+        WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed ||
+        !_scrollController.hasClients ||
+        _scrollController.offset > 80) {
+      return;
+    }
+    final messages = _repo
+        .messagesFor(widget.conversationId)
+        .where((message) => !message.isPending)
+        .toList();
+    if (messages.isEmpty) return;
+    final newest = messages.first.createdAt;
+    if (_lastRead != null && !newest.isAfter(_lastRead!)) return;
+    _markingRead = true;
+    try {
+      await _repo.markGroupRead(widget.conversationId, newest);
+      _lastRead = newest;
+      if (mounted) {
+        unawaited(NotifyService.instance.cancelGroup(widget.conversationId));
+      }
+    } catch (_) {
+      // Retry after the next incoming message, scroll, or resume.
+    } finally {
+      _markingRead = false;
+    }
   }
 
   void _onTextChanged() {
@@ -421,6 +527,9 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    chatRouteObserver.unsubscribe(this);
+    _setVisible(false);
     _mentionOverlay?.remove();
     _textController.removeListener(_onTextChanged);
     _repo.removeListener(_onRepoChanged);
@@ -433,6 +542,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   }
 
   void _onHistoryScroll() {
+    unawaited(_markVisibleRead());
     if (!_scrollController.hasClients ||
         _loadingOlder ||
         !_hasMoreHistory ||
@@ -471,11 +581,14 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   }
 
   void _onRepoChanged() {
-    if (mounted) setState(() {});
+    if (!mounted) return;
+    setState(() {});
+    WidgetsBinding.instance.addPostFrameCallback((_) => _markVisibleRead());
   }
 
   Future<void> _initChat() async {
     final preferences = await SharedPreferences.getInstance();
+    if (!mounted) return;
     final clearedRaw = preferences.getString(_clearedAtKey());
     if (mounted) {
       setState(() {
@@ -507,31 +620,30 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
         },
       );
       _typingPresence?.join();
+      _typingPresence?.setActive(
+        NotifyService.instance.openGroups.contains(widget.conversationId),
+      );
     }
 
     try {
       unawaited(_loadSenderAvatars());
       unawaited(_syncGroupMeta());
-      if (!widget.readOnlyArchive) {
-        unawaited(_repo.updatePresence(isOnline: true));
-      }
       final count = await _repo.loadMessages(widget.conversationId);
-      // Mark messages as read up to the newest loaded message
-      if (!widget.readOnlyArchive &&
-          _repo.messagesFor(widget.conversationId).isNotEmpty) {
-        final newest = _repo.messagesFor(widget.conversationId).first;
-        unawaited(_repo.markGroupRead(widget.conversationId, newest.createdAt));
-      }
+      if (!mounted) return;
       _hasMoreHistory = count == ConversationRepository.messagePageSize;
       if (widget.e2eeEnabled && !widget.readOnlyArchive) {
         await _repo.retryPendingGroupMessages(widget.conversationId);
       }
+      if (!mounted) return;
       if (!widget.readOnlyArchive) {
         _repo.subscribeToConversation(widget.conversationId);
       } else {
         _hasMoreHistory = false;
       }
-      if (mounted) setState(() => _isLoading = false);
+      if (mounted) {
+        setState(() => _isLoading = false);
+        WidgetsBinding.instance.addPostFrameCallback((_) => _markVisibleRead());
+      }
     } catch (e) {
       if (mounted) {
         setState(() {
@@ -644,9 +756,24 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     setState(() => _wallpaperPreset = picked);
   }
 
-  void _showInvite() {
-    final link =
-        'openchat://join?group=${widget.conversationId}&title=${Uri.encodeComponent(widget.conversationTitle)}';
+  void _showInvite() async {
+    final conv = _repo.conversations
+        .where((c) => c.id == widget.conversationId)
+        .firstOrNull;
+    if (conv == null || !conv.isAdmin) {
+      _showToast('Only admins can invite members.');
+      return;
+    }
+    final repo = ConversationRepository(Supabase.instance.client);
+    String code;
+    try {
+      code = await repo.getGroupInviteCode(widget.conversationId);
+    } catch (_) {
+      _showToast('Could not generate invite link.');
+      return;
+    }
+    final link = 'dev.openchat.openchat://group-invite/$code';
+    if (!mounted) return;
     showDialog<void>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -659,8 +786,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
             SelectableText(link, style: const TextStyle(fontSize: 12)),
             const SizedBox(height: 8),
             const Text(
-              'New members in legacy groups can load recent history. '
-              'E2EE groups start fresh by design.',
+              'Share this link to invite members. Only admins can reset it.',
               style: TextStyle(fontSize: 12),
             ),
           ],
@@ -675,6 +801,41 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
             child: const Text('Copy link'),
           ),
           TextButton(
+            onPressed: () async {
+              Navigator.pop(ctx);
+              final confirm = await showDialog<bool>(
+                context: context,
+                builder: (c) => AlertDialog(
+                  title: const Text('Reset invite link?'),
+                  content: const Text(
+                    'This will invalidate the current link and generate a new one. '
+                    'Anyone with the old link will no longer be able to join.',
+                  ),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(c, false),
+                      child: const Text('Cancel'),
+                    ),
+                    FilledButton(
+                      onPressed: () => Navigator.pop(c, true),
+                      child: const Text('Reset'),
+                    ),
+                  ],
+                ),
+              );
+              if (confirm != true) return;
+              try {
+                await repo.resetGroupInviteCode(widget.conversationId);
+                if (!mounted) return;
+                _showToast('Invite link reset');
+              } catch (_) {
+                if (!mounted) return;
+                _showToast('Failed to reset invite link');
+              }
+            },
+            child: const Text('Reset link'),
+          ),
+          TextButton(
             onPressed: () => Navigator.pop(ctx),
             child: const Text('Close'),
           ),
@@ -683,11 +844,40 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     );
   }
 
-  void _startGroupCall(CallType type) {
-    // No group-call media path exists (1:1 LiveKit calls only). Opening the
-    // call screen here would land on a dead-end placeholder, so fail loudly.
-    _showToast('Group calls aren\'t available yet. Use 1:1 encrypted chats.');
-  }
+  // Group Voice Chat methods - DISABLED: incomplete implementation
+  // /// Start a group voice chat (drop-in audio).
+  // Future<void> _startVoiceChat() async {
+  //   final roomName = await _voiceChat.startVoiceChat(
+  //     context: context,
+  //     client: Supabase.instance.client,
+  //     conversationId: widget.conversationId,
+  //     conversationTitle: _title,
+  //   );
+  //   if (roomName != null && mounted) {
+  //     _showToast('Voice chat started');
+  //   }
+  // }
+  //
+  // /// Join an existing group voice chat.
+  // Future<void> _joinVoiceChat() async {
+  //   final joined = await _voiceChat.joinVoiceChat(
+  //     context: context,
+  //     client: Supabase.instance.client,
+  //     conversationId: widget.conversationId,
+  //     conversationTitle: _title,
+  //   );
+  //   if (joined && mounted) {
+  //     _showToast('Joined voice chat');
+  //   }
+  // }
+  //
+  // /// Leave the group voice chat.
+  // Future<void> _leaveVoiceChat() async {
+  //   await _voiceChat.leaveVoiceChat();
+  //   if (mounted) {
+  //     _showToast('Left voice chat');
+  //   }
+  // }
 
   String _clearedAtKey() =>
       'openchat.groupClearedAt.v1.$_currentUserId.${widget.conversationId}';
@@ -900,7 +1090,12 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
         isEditable: msg.isEditable,
         isPinned: msg.isPinned,
         isStarred: msg.isStarred,
-        onReact: (emoji) => _repo.reactToMessage(msg.id, emoji),
+        onReact: (emoji) => unawaited(
+          _runMessageAction(
+            () => _repo.reactToMessage(msg.id, emoji),
+            success: 'Reaction updated.',
+          ),
+        ),
         onMoreReactions: () => _showReactionPicker(msg),
         onReply: () {
           Navigator.pop(ctx);
@@ -912,13 +1107,33 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                 _startEdit(msg);
               }
             : null,
-        onStar: () => _repo.toggleStar(msg.id),
-        onPin: () => _repo.togglePin(widget.conversationId, msg.id),
+        onStar: () => unawaited(
+          _runMessageAction(
+            () => _repo.toggleStar(msg.id),
+            success: msg.isStarred ? 'Message unstarred.' : 'Message starred.',
+          ),
+        ),
+        onPin: () => unawaited(
+          _runMessageAction(
+            () => _repo.togglePin(widget.conversationId, msg.id),
+            success: msg.isPinned ? 'Message unpinned.' : 'Message pinned.',
+          ),
+        ),
         onDeleteForMe: widget.e2eeEnabled
             ? null
-            : () => _repo.deleteMessage(msg.id, forEveryone: false),
+            : () => unawaited(
+                _runMessageAction(
+                  () => _repo.deleteMessage(msg.id, forEveryone: false),
+                  success: 'Message deleted for you.',
+                ),
+              ),
         onDeleteForEveryone: isMine
-            ? () => _repo.deleteMessage(msg.id, forEveryone: true)
+            ? () => unawaited(
+                _runMessageAction(
+                  () => _repo.deleteMessage(msg.id, forEveryone: true),
+                  success: 'Message deleted for everyone.',
+                ),
+              )
             : null,
         onInfo: isMine
             ? () {
@@ -939,6 +1154,21 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
             : () => _showTaskDialog(source: msg),
       ),
     );
+  }
+
+  Future<void> _runMessageAction(
+    Future<void> Function() action, {
+    required String success,
+  }) async {
+    try {
+      await action();
+      if (mounted) _showToast(success);
+    } catch (_) {
+      if (mounted)
+        _showToast(
+          'Message action failed. Check your connection and try again.',
+        );
+    }
   }
 
   Future<void> _showReactionPicker(GroupMessage message) async {
@@ -1667,16 +1897,32 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
           ],
         ),
         actions: [
-          IconButton(
-            icon: const Icon(Icons.videocam_outlined),
-            tooltip: 'Group Video Call',
-            onPressed: () => _startGroupCall(CallType.video),
-          ),
-          IconButton(
-            icon: const Icon(Icons.call_outlined),
-            tooltip: 'Group Audio Call',
-            onPressed: () => _startGroupCall(CallType.voice),
-          ),
+          if (!widget.readOnlyArchive)
+            AnimatedBuilder(
+              animation: _voiceChat,
+              builder: (context, _) {
+                final inRoom =
+                    _voiceChat.isInRoom &&
+                    _voiceChat.currentConversationId == widget.conversationId;
+                final joining = _voiceChat.joining;
+                return IconButton(
+                  icon: joining
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : Icon(
+                          inRoom ? Icons.mic : Icons.mic_none,
+                          color: inRoom ? const Color(0xFF25D366) : null,
+                        ),
+                  tooltip: inRoom ? 'Leave voice chat' : 'Start voice chat',
+                  onPressed: joining
+                      ? null
+                      : (inRoom ? _leaveVoiceChat : _startVoiceChat),
+                );
+              },
+            ),
           PopupMenuButton<String>(
             onSelected: (val) async {
               if (val == 'info') {
@@ -1765,6 +2011,32 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                   ),
                 ],
               ),
+            ),
+            // Group voice chat banner: shown while a drop-in audio room is
+            // ongoing for this conversation.
+            AnimatedBuilder(
+              animation: _voiceChat,
+              builder: (context, _) {
+                final room = _voiceChat.getRoom(widget.conversationId);
+                if (room == null ||
+                    !room.isActive ||
+                    _dismissedVoiceRoom == widget.conversationId) {
+                  return const SizedBox.shrink();
+                }
+                final inRoom =
+                    _voiceChat.isInRoom &&
+                    _voiceChat.currentConversationId == widget.conversationId;
+                return GroupVoiceChatBanner(
+                  conversationId: widget.conversationId,
+                  conversationTitle: _title,
+                  participantCount: room.participantCount,
+                  isCurrentUserIn: inRoom,
+                  onJoin: _joinVoiceChat,
+                  onLeave: _leaveVoiceChat,
+                  onDismiss: () =>
+                      setState(() => _dismissedVoiceRoom = widget.conversationId),
+                );
+              },
             ),
             // Pinned message banner (if any)
             if (pinnedMessages.isNotEmpty)
@@ -2012,7 +2284,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
 
     final textColor = isDark ? Colors.white : const Color(0xFF111B21);
 
-    return Align(
+    Widget bubble = Align(
       alignment: isMine ? Alignment.centerRight : Alignment.centerLeft,
       child: Container(
         margin: const EdgeInsets.symmetric(vertical: 3),
@@ -2168,6 +2440,32 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
               ),
           ],
         ),
+      ),
+    );
+
+    // Wrap with Dismissible for swipe-to-reply
+    return Dismissible(
+      key: ValueKey(msg.id),
+      direction: isMine ? DismissDirection.startToEnd : DismissDirection.endToStart,
+      background: _groupReplySwipeBackground(isMine: isMine, isDark: isDark),
+      onDismissed: (_) => _startReply(msg),
+      child: bubble,
+    );
+  }
+
+  Widget _groupReplySwipeBackground({required bool isMine, required bool isDark}) {
+    return Container(
+      margin: const EdgeInsets.symmetric(vertical: 3),
+      padding: const EdgeInsets.symmetric(horizontal: 24),
+      decoration: BoxDecoration(
+        color: isDark ? const Color(0xFF004D3A) : const Color(0xFFDCF8C6),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      alignment: isMine ? Alignment.centerLeft : Alignment.centerRight,
+      child: Icon(
+        Icons.reply,
+        color: isDark ? const Color(0xFF25D366) : const Color(0xFF008069),
+        size: 28,
       ),
     );
   }

@@ -40,6 +40,8 @@ class CallService extends ChangeNotifier {
   bool remoteJoined = false;
   String? error;
 
+  Room? get room => _room;
+
   VideoTrack? get localVideo {
     final pubs = _room?.localParticipant?.videoTrackPublications;
     if (pubs == null || pubs.isEmpty) return null;
@@ -75,27 +77,35 @@ class CallService extends ChangeNotifier {
     return true;
   }
 
+  /// [mediaKey] enables the app-layer E2EE (1:1 calls). Group voice rooms
+  /// pass null: media is still protected in transit by DTLS-SRTP between
+  /// participants and the LiveKit SFU.
   Future<bool> join({
     required String url,
     required String token,
     required bool video,
-    required String mediaKey,
+    String? mediaKey,
   }) async {
     error = null;
     state = LiveCallState.joining;
     notifyListeners();
     try {
-      final rawKey = Uint8List.fromList(
-        base64Url.decode(base64Url.normalize(mediaKey)),
-      );
-      if (rawKey.length != 32) {
-        throw StateError('End-to-end call encryption key is invalid.');
+      final Room room;
+      if (mediaKey == null || mediaKey.isEmpty) {
+        room = Room();
+      } else {
+        final rawKey = Uint8List.fromList(
+          base64Url.decode(base64Url.normalize(mediaKey)),
+        );
+        if (rawKey.length != 32) {
+          throw StateError('End-to-end call encryption key is invalid.');
+        }
+        final keyProvider = await BaseKeyProvider.create();
+        await keyProvider.setRawKey(rawKey);
+        rawKey.fillRange(0, rawKey.length, 0);
+        final e2eeOptions = E2EEOptions(keyProvider: keyProvider);
+        room = Room(roomOptions: RoomOptions(encryption: e2eeOptions));
       }
-      final keyProvider = await BaseKeyProvider.create();
-      await keyProvider.setRawKey(rawKey);
-      rawKey.fillRange(0, rawKey.length, 0);
-      final e2eeOptions = E2EEOptions(keyProvider: keyProvider);
-      final room = Room(roomOptions: RoomOptions(encryption: e2eeOptions));
       _room = room;
       _cancelEvents = room.events.listen(_onEvent);
       await room.connect(url, token);
@@ -175,6 +185,15 @@ class CallService extends ChangeNotifier {
       await AudioManager.instance.setSpeakerOutputPreferred(speakerOn);
     } catch (_) {}
     notifyListeners();
+  }
+
+  /// Group voice rooms want the loudspeaker by default, unlike 1:1 voice
+  /// calls which join on the earpiece.
+  Future<void> setSpeakerPreferred(bool on) async {
+    speakerOn = on;
+    try {
+      await AudioManager.instance.setSpeakerOutputPreferred(on);
+    } catch (_) {}
   }
 
   Future<void> _leave() async {

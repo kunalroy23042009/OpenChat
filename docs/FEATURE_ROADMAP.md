@@ -105,7 +105,7 @@ channels registered with correct importance.
 | 58 | Draw on media | Queued | — |
 | 59 | Stickers on media | Queued | — |
 | 60 | Blur tool | Queued | — |
-| 61 | GIF search | Queued | — |
+| 61 | GIF search | Partial | Giphy picker; requires a public `GIPHY_API_KEY` build define |
 | 62 | Sticker maker | Queued | — |
 | 63 | Animated stickers | Queued | — |
 | 64 | Avatar stickers | Queued | — |
@@ -115,7 +115,9 @@ channels registered with correct importance.
 
 ## Voice notes & audio (68–76)
 
-Partial: in-chat recording, preview, pause/resume, discard, playback speeds, waveforms done. Queued: transcripts, voice status, out-of-chat playback.
+Partial: in-chat recording, preview, pause/resume, discard, playback speeds,
+waveforms, and optional user-entered encrypted transcripts done. Automatic
+speech-to-text, voice status, and out-of-chat playback remain queued.
 
 ## Privacy & core security (77–95)
 

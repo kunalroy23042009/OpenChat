@@ -1,11 +1,15 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
 /// Content-free error reporting for pilot operations.
 ///
 /// Reports carry stable codes, the failing area, and small allowlisted
 /// context — never message bodies, ciphertext, keys, fingerprints, or raw
 /// native exception strings (which may describe key material handling).
-/// Today the sink is the local log; a network sink lands with device testing.
+/// The sink is the local log plus, when a backend is signed in, the
+/// allowlist-capped `client_events` table for pilot forensics.
 class ErrorReport {
   /// Short user-safe messages the app itself throws. Anything else collapses
   /// to a stable code so server internals never leave the device.
@@ -124,6 +128,98 @@ class ErrorReport {
   static String _truncateStack(StackTrace stack) {
     final lines = stack.toString().split('\n').take(12).join('\n');
     return lines.length > 1200 ? lines.substring(0, 1200) : lines;
+  }
+
+  // ---- Structured area reporting + cloud observability sink -------------
+
+  /// Client for the `client_events` cloud table, set once the backend is
+  /// signed in (cleared on sign-out). Null => local-log only.
+  static SupabaseClient? _client;
+
+  /// Call after Supabase is initialized / when auth state changes.
+  static void attachClient(SupabaseClient? client) => _client = client;
+
+  /// Per-area session caps so a failing loop cannot flood the log or the
+  /// backend table.
+  static final Map<String, int> _areaQuota = {};
+  static const _areaQuotaLimit = 12;
+
+  /// Queue of pending cloud reports; flushed opportunistically.
+  static final List<Map<String, dynamic>> _pendingEvents = [];
+  static Completer<void>? _flushInFlight;
+
+  /// Reports a failure within a named area. The optional [code] is a
+  /// stable discriminator (e.g. `pool_low`, `claim_empty`); [details]
+  /// accept only short scrubbed strings/ints/bools — never content.
+  static void report({
+    required String area,
+    String code = 'failure',
+    Object? error,
+    Map<String, String>? details,
+  }) {
+    final used = (_areaQuota[area] ?? 0) + 1;
+    _areaQuota[area] = used;
+    final capped = used > _areaQuotaLimit;
+    final event = <String, dynamic>{
+      'area': area,
+      'code': capped ? 'quota_capped' : code,
+      'details': <String, dynamic>{
+        for (final e in details?.entries ?? const <MapEntry<String, String>>[])
+          if (_scrubValue(e.value) != null) e.key: _scrubValue(e.value),
+      },
+    };
+    if (error != null) {
+      final built = build(area: area, error: error);
+      final kind = built['code']?.toString() ?? 'unexpected';
+      event['details']['kind'] =
+          kind.length > 32 ? kind.substring(0, 32) : kind;
+    }
+    debugPrint('error-report $event');
+    if (!capped) {
+      _pendingEvents.add(event);
+      _scheduleFlush();
+    }
+  }
+
+  /// Convenience wrapper matching call sites that already hold an error.
+  static void reportError(
+    String area,
+    Object error, {
+    String code = 'failure',
+    Map<String, String>? details,
+  }) =>
+      report(area: area, code: code, error: error, details: details);
+
+  static void _scheduleFlush() {
+    if (_flushInFlight != null) return;
+    final client = _client;
+    if (client == null || client.auth.currentUser?.id == null) {
+      // Keep at most one tick of events; drop the rest.
+      if (_pendingEvents.length > 40) _pendingEvents.removeRange(0, 20);
+      return;
+    }
+    final completer = Completer<void>();
+    _flushInFlight = completer;
+    unawaited(
+      Future<void>(() async {
+        try {
+          // Small settle window so one action can batch its follow-ups.
+          await Future<void>.delayed(const Duration(milliseconds: 250));
+          final batch = List.of(_pendingEvents);
+          _pendingEvents.clear();
+          if (batch.isEmpty) return;
+          await client.rpc(
+            'report_client_event',
+            params: {'p_events': batch.take(20).toList()},
+          );
+        } catch (_) {
+          // Observability must never throw into app flows.
+        } finally {
+          _flushInFlight = null;
+          if (_pendingEvents.isNotEmpty) _scheduleFlush();
+        }
+      }),
+    );
   }
 
   /// Installs global hooks. [sink] receives sanitized reports; defaults to
