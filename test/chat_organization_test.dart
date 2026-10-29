@@ -10,6 +10,22 @@ Future<ChatStore> freshStore() async {
 }
 
 void main() {
+  test('manual unread stays synchronized across both chat lists and reopening', () async {
+    final store = await freshStore();
+    final chat = Conversation(id: '_secure_account-peer', name: 'Peer', color: 1, messages: []);
+    store.conversations.add(chat);
+    await store.setMarkedUnread(chat.id, true);
+    expect(store.secureUnread('account', 'peer'), isTrue);
+    await store.setSecureUnread('account', 'peer', false);
+    expect(chat.markedUnread, isFalse);
+    await store.setSecureUnread('account', 'peer', true);
+    expect(chat.markedUnread, isTrue);
+    await store.markRead(chat);
+    expect(store.secureUnread('account', 'peer'), isFalse);
+    final reloaded = ChatStore(await SharedPreferences.getInstance());
+    expect(reloaded.conversations.firstWhere((c) => c.id == chat.id).markedUnread, isFalse);
+  });
+
   test('organization flags default false on legacy rows', () {
     final chat = Conversation.fromJson({
       'id': 'x',

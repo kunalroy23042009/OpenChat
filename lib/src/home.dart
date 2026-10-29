@@ -2371,10 +2371,6 @@ class _SecureSectionState extends State<_SecureSection> {
   }
 
   void _open(CloudContact contact) {
-    final me = widget.client.auth.currentUser?.id;
-    if (me != null) {
-      widget.store.setSecureUnread(me, contact.userId, false);
-    }
     Navigator.push(
       context,
       MaterialPageRoute<void>(

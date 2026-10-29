@@ -453,13 +453,23 @@ class ChatStore extends ChangeNotifier {
   Future<void> markRead(Conversation chat) async {
     chat.unread = 0;
     chat.markedUnread = false;
+    final secure = parseSecureConversationId(chat.id);
+    if (secure != null) {
+      await setSecureUnread(secure.accountId, secure.peerId, false);
+    }
     await _save();
   }
 
   /// WhatsApp-style flag: keeps a dot (no count) on the chat list until
   /// the chat is opened or the flag is cleared.
-  Future<void> setMarkedUnread(String id, bool value) =>
-      _setFlag(id, (c) => c.markedUnread = value);
+  Future<void> setMarkedUnread(String id, bool value) async {
+    final secure = parseSecureConversationId(id);
+    if (secure != null) {
+      await setSecureUnread(secure.accountId, secure.peerId, value);
+    } else {
+      await _setFlag(id, (c) => c.markedUnread = value);
+    }
+  }
 
   Future<void> toggleMute(Conversation chat) async {
     if (chat.isMutedNow) {
@@ -1511,14 +1521,23 @@ class ChatStore extends ChangeNotifier {
   ) async {
     final list = preferences.getStringList(_unreadKey(accountId)) ?? [];
     final has = list.contains(peerId);
-    if (has == value) return;
-    if (value) {
+    var changed = false;
+    for (final chat in conversations) {
+      if (chat.id == _secureId(accountId, peerId)) {
+        changed = chat.markedUnread != value || (!value && chat.unread != 0);
+        chat.markedUnread = value;
+        if (!value) chat.unread = 0;
+        break;
+      }
+    }
+    if (has == value && !changed) return;
+    if (value && !has) {
       list.add(peerId);
-    } else {
+    } else if (!value) {
       list.remove(peerId);
     }
     await preferences.setStringList(_unreadKey(accountId), list);
-    notifyListeners();
+    await _save();
   }
 
   /// Personal notes thread. Local-only: the server forbids sender ==
