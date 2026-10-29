@@ -1555,16 +1555,23 @@ class _SecureChatScreenState extends State<SecureChatScreen>
       await _pickAndSendVideo(choice == 'video_camera');
       return;
     }
-    XFile? picked;
+    List<String> pickedPaths;
     try {
-      picked = choice == 'photo_gallery' || choice == 'once_photo'
-          ? await media.pickGalleryImage()
-          : await media.pickCameraImage();
+      if (choice == 'photo_gallery') {
+        final batch = await media.pickGalleryImages();
+        pickedPaths = batch.map((f) => f.path).toList();
+      } else if (choice == 'once_photo') {
+        final single = await media.pickGalleryImage();
+        pickedPaths = single == null ? const [] : [single.path];
+      } else {
+        final single = await media.pickCameraImage();
+        pickedPaths = single == null ? const [] : [single.path];
+      }
     } on Exception {
       if (mounted) setState(() => _error = 'Could not open your gallery.');
       return;
     }
-    if (picked == null || !mounted) return;
+    if (pickedPaths.isEmpty || !mounted) return;
     final caption = TextEditingController();
     final send = await showDialog<bool>(
       context: context,
@@ -1576,20 +1583,49 @@ class _SecureChatScreenState extends State<SecureChatScreen>
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              ClipRRect(
-                borderRadius: BorderRadius.circular(12),
-                child: Image.file(
-                  File(picked!.path),
-                  height: 220,
-                  fit: BoxFit.cover,
-                ),
+              Stack(
+                children: [
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(12),
+                    child: Image.file(
+                      File(pickedPaths.first),
+                      height: 220,
+                      fit: BoxFit.cover,
+                    ),
+                  ),
+                  if (pickedPaths.length > 1)
+                    Positioned(
+                      right: 8,
+                      top: 8,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 4,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: 0.6),
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                        child: Text(
+                          '1/${pickedPaths.length}',
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
               ),
               const SizedBox(height: 12),
               TextField(
                 controller: caption,
                 maxLength: 200,
-                decoration: const InputDecoration(
-                  hintText: 'Add a caption…',
+                decoration: InputDecoration(
+                  hintText: pickedPaths.length > 1
+                      ? 'Add a caption… (applied to the first)'
+                      : 'Add a caption…',
                   counterText: '',
                 ),
               ),
@@ -1603,7 +1639,9 @@ class _SecureChatScreenState extends State<SecureChatScreen>
           ),
           FilledButton(
             onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Send'),
+            child: Text(
+              pickedPaths.length > 1 ? 'Send ${pickedPaths.length}' : 'Send',
+            ),
           ),
         ],
       ),
@@ -1614,24 +1652,28 @@ class _SecureChatScreenState extends State<SecureChatScreen>
       _error = null;
     });
     try {
-      final sealed = await media.uploadSealed(File(picked.path), widget.peerId);
-      final sent = await _transmit(
-        encodeImageBody(
-          sealed.path,
-          caption.text.trim(),
-          key: sealed.key,
-          nonce: sealed.nonce,
-          viewOnce: choice == 'once_photo',
-        ),
-      );
-      if (sent && mounted) {
-        unawaited(
-          NotifyService.poke(
-            widget.client,
-            kind: 'message',
-            peer: widget.peerId,
+      var first = true;
+      for (final path in pickedPaths) {
+        final sealed = await media.uploadSealed(File(path), widget.peerId);
+        final sent = await _transmit(
+          encodeImageBody(
+            sealed.path,
+            first ? caption.text.trim() : '',
+            key: sealed.key,
+            nonce: sealed.nonce,
+            viewOnce: choice == 'once_photo',
           ),
         );
+        first = false;
+        if (sent && mounted) {
+          unawaited(
+            NotifyService.poke(
+              widget.client,
+              kind: 'message',
+              peer: widget.peerId,
+            ),
+          );
+        }
       }
     } catch (e) {
       if (mounted) {

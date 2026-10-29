@@ -2,6 +2,11 @@ import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+
+import '../chat_store.dart';
+import '../contacts_repository.dart';
+import '../secure_send_service.dart';
 
 /// A broadcast list: a saved list of contacts to send one-to-many messages to.
 /// Replies come back as individual 1:1 chats.
@@ -52,7 +57,12 @@ class BroadcastListService extends ChangeNotifier {
     if (raw != null && raw.isNotEmpty) {
       try {
         final data = jsonDecode(raw) as List;
-        _lists = data.map((e) => BroadcastList.fromJson(Map<String, dynamic>.from(e as Map))).toList();
+        _lists = data
+            .map(
+              (e) =>
+                  BroadcastList.fromJson(Map<String, dynamic>.from(e as Map)),
+            )
+            .toList();
       } catch (_) {
         _lists = [];
       }
@@ -61,13 +71,19 @@ class BroadcastListService extends ChangeNotifier {
   }
 
   Future<void> _save() async {
-    await _prefs.setString(_storageKey, jsonEncode(_lists.map((e) => e.toJson()).toList()));
+    await _prefs.setString(
+      _storageKey,
+      jsonEncode(_lists.map((e) => e.toJson()).toList()),
+    );
     notifyListeners();
   }
 
   /// Saves lists to storage.
   Future<void> save() async {
-    await _prefs.setString(_storageKey, jsonEncode(_lists.map((e) => e.toJson()).toList()));
+    await _prefs.setString(
+      _storageKey,
+      jsonEncode(_lists.map((e) => e.toJson()).toList()),
+    );
     notifyListeners();
   }
 
@@ -203,14 +219,18 @@ class _BroadcastListsPageState extends State<BroadcastListsPage> {
               return Card(
                 child: ListTile(
                   leading: CircleAvatar(
-                    backgroundColor: Theme.of(context).colorScheme.primaryContainer,
+                    backgroundColor: Theme.of(context)
+                        .colorScheme
+                        .primaryContainer,
                     child: Icon(
                       Icons.campaign,
                       color: Theme.of(context).colorScheme.onPrimaryContainer,
                     ),
                   ),
                   title: Text(list.name),
-                  subtitle: Text('${list.contactIds.length} recipient${list.contactIds.length == 1 ? '' : 's'}'),
+                  subtitle: Text(
+                    '${list.contactIds.length} recipient${list.contactIds.length == 1 ? '' : 's'}',
+                  ),
                   trailing: PopupMenuButton<String>(
                     onSelected: (value) async {
                       if (value == 'edit') {
@@ -222,11 +242,20 @@ class _BroadcastListsPageState extends State<BroadcastListsPage> {
                       }
                     },
                     itemBuilder: (context) => [
-                      const PopupMenuItem(value: 'send', child: Text('Send message')),
-                      const PopupMenuItem(value: 'edit', child: Text('Edit list')),
+                      const PopupMenuItem(
+                        value: 'send',
+                        child: Text('Send message'),
+                      ),
+                      const PopupMenuItem(
+                        value: 'edit',
+                        child: Text('Edit list'),
+                      ),
                       const PopupMenuItem(
                         value: 'delete',
-                        child: Text('Delete', style: TextStyle(color: Colors.red)),
+                        child: Text(
+                          'Delete',
+                          style: TextStyle(color: Colors.red),
+                        ),
                       ),
                     ],
                   ),
@@ -275,11 +304,18 @@ class _BroadcastListsPageState extends State<BroadcastListsPage> {
       context: context,
       builder: (context) => AlertDialog(
         title: Text('Delete "${list.name}"?'),
-        content: const Text('This will delete the broadcast list. Messages already sent are not affected.'),
+        content: const Text(
+          'This will delete the broadcast list. Messages already sent are not affected.',
+        ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
           FilledButton(
-            style: FilledButton.styleFrom(backgroundColor: Theme.of(context).colorScheme.error),
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(context).colorScheme.error,
+            ),
             onPressed: () => Navigator.pop(context, true),
             child: const Text('Delete'),
           ),
@@ -302,7 +338,9 @@ class _BroadcastListsPageState extends State<BroadcastListsPage> {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('${list.contactIds.length} recipient(s) will receive this as individual messages.'),
+            Text(
+              '${list.contactIds.length} recipient(s) will receive this as individual messages.',
+            ),
             const SizedBox(height: 16),
             TextField(
               controller: messageController,
@@ -316,7 +354,10 @@ class _BroadcastListsPageState extends State<BroadcastListsPage> {
           ],
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
           FilledButton(
             onPressed: () {
               final text = messageController.text.trim();
@@ -329,10 +370,44 @@ class _BroadcastListsPageState extends State<BroadcastListsPage> {
     );
 
     if (result != null && result.isNotEmpty && mounted) {
-      // Send the message to each contact in the broadcast list
-      // In a real implementation, this would use the messaging infrastructure
+      // Real encrypted broadcast: each contact receives an individually
+      // encrypted 1:1 message; replies arrive as individual chats.
+      final client = widget.client;
+      final store = widget.store;
+      if (client is! SupabaseClient || store is! ChatStore) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Broadcast is unavailable until you sign in.'),
+          ),
+        );
+        return;
+      }
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Broadcast sent to ${list.contactIds.length} contacts')),
+        SnackBar(
+          content: Text(
+            'Sending broadcast to ${list.contactIds.length} contact(s)…',
+          ),
+          duration: const Duration(seconds: 8),
+        ),
+      );
+      final sender = SecureSendService(client, store);
+      final results = await sender.broadcast(list.contactIds, result);
+      if (!mounted) return;
+      final ok = results.values.where((r) => r.ok).length;
+      final failed = results.values
+          .where((r) => !r.ok)
+          .map((r) => '${r.peerId.substring(0, 8)}…: ${r.error}')
+          .take(3);
+      ScaffoldMessenger.of(context).hideCurrentSnackBar();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            failed.isEmpty
+                ? 'Broadcast sent to $ok contact(s).'
+                : 'Sent to $ok. Failed: ${failed.join('; ')}',
+          ),
+          duration: const Duration(seconds: 6),
+        ),
       );
     }
   }
@@ -360,7 +435,8 @@ class _BroadcastListEditor extends StatefulWidget {
 class _BroadcastListEditorState extends State<_BroadcastListEditor> {
   final nameController = TextEditingController();
   final Set<String> selectedContacts = {};
-  List<dynamic> availableContacts = [];
+  List<CloudContact> availableContacts = [];
+  String? contactsError;
   bool loading = true;
 
   @override
@@ -374,13 +450,40 @@ class _BroadcastListEditorState extends State<_BroadcastListEditor> {
   }
 
   Future<void> _loadContacts() async {
-    // In a real implementation, load from contacts repository
-    // For now, use empty list
-    if (!mounted) return;
     setState(() {
-      availableContacts = [];
-      loading = false;
+      loading = true;
+      contactsError = null;
     });
+    try {
+      final client = widget.client;
+      if (client is! SupabaseClient || client.auth.currentUser == null) {
+        throw StateError('Sign in required');
+      }
+      final contacts = await SupabaseContactsRepository(client).contacts();
+      if (!mounted) return;
+      setState(() {
+        availableContacts = contacts
+            .where((c) => c.status == 'accepted')
+            .toList();
+        selectedContacts.removeWhere(
+          (id) => !availableContacts.any((c) => c.userId == id),
+        );
+      });
+    } catch (_) {
+      if (mounted)
+        setState(
+          () => contactsError =
+              'Could not load contacts. Check your connection and retry.',
+        );
+    } finally {
+      if (mounted) setState(() => loading = false);
+    }
+  }
+
+  @override
+  void dispose() {
+    nameController.dispose();
+    super.dispose();
   }
 
   @override
@@ -392,7 +495,11 @@ class _BroadcastListEditorState extends State<_BroadcastListEditor> {
     }
 
     return AlertDialog(
-      title: Text(widget.existingList != null ? 'Edit broadcast list' : 'New broadcast list'),
+      title: Text(
+        widget.existingList != null
+            ? 'Edit broadcast list'
+            : 'New broadcast list',
+      ),
       content: SizedBox(
         width: 400,
         child: Column(
@@ -404,11 +511,24 @@ class _BroadcastListEditorState extends State<_BroadcastListEditor> {
               autofocus: true,
             ),
             const SizedBox(height: 16),
-            const Text('Select recipients:', style: TextStyle(fontWeight: FontWeight.w500)),
+            const Text(
+              'Select recipients:',
+              style: TextStyle(fontWeight: FontWeight.w500),
+            ),
             const SizedBox(height: 8),
             SizedBox(
               height: 200,
-              child: availableContacts.isEmpty
+              child: contactsError != null
+                  ? Column(
+                      children: [
+                        Text(contactsError!),
+                        TextButton(
+                          onPressed: _loadContacts,
+                          child: const Text('Retry'),
+                        ),
+                      ],
+                    )
+                  : availableContacts.isEmpty
                   ? const Center(
                       child: Text('No contacts available. Add contacts first.'),
                     )
@@ -416,8 +536,8 @@ class _BroadcastListEditorState extends State<_BroadcastListEditor> {
                       itemCount: availableContacts.length,
                       itemBuilder: (context, index) {
                         final contact = availableContacts[index];
-                        final id = contact['userId'] as String? ?? '';
-                        final name = contact['name'] as String? ?? 'Unknown';
+                        final id = contact.userId;
+                        final name = contact.name;
                         final selected = selectedContacts.contains(id);
                         return CheckboxListTile(
                           title: Text(name),
@@ -439,21 +559,29 @@ class _BroadcastListEditorState extends State<_BroadcastListEditor> {
         ),
       ),
       actions: [
-        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
         FilledButton(
           onPressed: () {
             final name = nameController.text.trim();
             if (name.isNotEmpty && selectedContacts.isNotEmpty) {
               if (widget.existingList != null) {
-                widget.service.update(BroadcastList(
-                  id: widget.existingList!.id,
+                widget.service.update(
+                  BroadcastList(
+                    id: widget.existingList!.id,
+                    name: name,
+                    contactIds: selectedContacts.toList(),
+                    createdAt: widget.existingList!.createdAt,
+                    updatedAt: DateTime.now(),
+                  ),
+                );
+              } else {
+                widget.service.createList(
                   name: name,
                   contactIds: selectedContacts.toList(),
-                  createdAt: widget.existingList!.createdAt,
-                  updatedAt: DateTime.now(),
-                ));
-              } else {
-                widget.service.createList(name: name, contactIds: selectedContacts.toList());
+                );
               }
               Navigator.pop(context);
             }

@@ -99,11 +99,13 @@ class StatusRepository {
           };
     final name =
         '${user.id}/status_${DateTime.now().microsecondsSinceEpoch}$extension';
-    await client.storage.from('status-media').upload(
-      name,
-      media,
-      fileOptions: FileOptions(contentType: contentType, upsert: false),
-    );
+    await client.storage
+        .from('status-media')
+        .upload(
+          name,
+          media,
+          fileOptions: FileOptions(contentType: contentType, upsert: false),
+        );
     try {
       return await client.rpc(
         'publish_status',
@@ -145,6 +147,19 @@ class StatusRepository {
 
   Future<void> markViewed(String id) =>
       client.rpc('mark_status_viewed', params: {'p_status_id': id});
+
+  /// The "Viewed by" list for one of the user's own statuses. Server RPC
+  /// enforces authorship; profile fields ride along so RLS-on-profiles
+  /// (self-select only) never blocks the names.
+  Future<List<Map<String, dynamic>>> viewers(String id) async {
+    final rows = await client.rpc(
+      'status_viewers',
+      params: {'p_status_id': id},
+    );
+    return (rows as List)
+        .map((r) => Map<String, dynamic>.from(r as Map))
+        .toList();
+  }
 
   Future<void> deleteStatus(String id) =>
       client.from('status_updates').delete().eq('id', id);

@@ -157,8 +157,8 @@ class _StatusPageState extends State<StatusPage> {
       final name = isMe
           ? 'My Status'
           : (contact != null && contact.name.isNotEmpty
-              ? contact.name
-              : 'Contact');
+                ? contact.name
+                : 'Contact');
       final media = await _resolveMedia(repo, status);
       if (!mounted) return;
       setState(() {
@@ -265,7 +265,8 @@ class _StatusPageState extends State<StatusPage> {
     List<String> audienceIds = const [];
     try {
       final prefs = await SharedPreferences.getInstance();
-      audience = prefs.getString('openchat.privacy.statusPrivacy') ?? 'contacts';
+      audience =
+          prefs.getString('openchat.privacy.statusPrivacy') ?? 'contacts';
     } catch (_) {}
     if (audience == 'only' || audience == 'except') {
       if (!mounted) return;
@@ -294,9 +295,9 @@ class _StatusPageState extends State<StatusPage> {
     if (client == null) return const [];
     List<CloudContact> contacts = const [];
     try {
-      contacts = await SupabaseContactsRepository(
-        client,
-      ).contacts().then((all) => all.where((c) => c.status == 'accepted').toList());
+      contacts = await SupabaseContactsRepository(client)
+          .contacts()
+          .then((all) => all.where((c) => c.status == 'accepted').toList());
     } catch (_) {}
     if (!mounted) return null;
     final selected = <String>{};
@@ -559,7 +560,8 @@ class _StatusPageState extends State<StatusPage> {
     List<String> audienceIds = const [];
     try {
       final prefs = await SharedPreferences.getInstance();
-      audience = prefs.getString('openchat.privacy.statusPrivacy') ?? 'contacts';
+      audience =
+          prefs.getString('openchat.privacy.statusPrivacy') ?? 'contacts';
     } catch (_) {}
     if (audience == 'only' || audience == 'except') {
       if (!mounted) return;
@@ -643,6 +645,95 @@ class _StatusPageState extends State<StatusPage> {
     if (ctx.mounted) Navigator.pop(ctx);
   }
 
+  /// "Viewed by" sheet listing viewers of one of the user's own statuses,
+  /// WhatsApp-style. Loaded live from the status_viewers RPC.
+  Future<void> _showViewedBy(BuildContext ctx, StatusItem status) async {
+    final client = widget.client;
+    if (client == null) return;
+    showModalBottomSheet<void>(
+      context: ctx,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (sheetCtx) => FutureBuilder<List<Map<String, dynamic>>>(
+        future: StatusRepository(client).viewers(status.id),
+        builder: (sheetCtx, snap) {
+          final viewers = snap.data ?? const [];
+          return SafeArea(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
+                  child: Text(
+                    'Viewed by ${viewers.length}',
+                    style: const TextStyle(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 16,
+                    ),
+                  ),
+                ),
+                if (snap.connectionState == ConnectionState.waiting &&
+                    viewers.isEmpty)
+                  const Padding(
+                    padding: EdgeInsets.all(24),
+                    child: CircularProgressIndicator(),
+                  )
+                else if (snap.hasError)
+                  const Padding(
+                    padding: EdgeInsets.all(24),
+                    child: Text(
+                      'Could not load viewers. Check your connection and reopen this list.',
+                    ),
+                  )
+                else if (viewers.isEmpty)
+                  const Padding(
+                    padding: EdgeInsets.fromLTRB(20, 4, 20, 24),
+                    child: Text(
+                      'No viewers yet. People who see this status will appear here.',
+                    ),
+                  )
+                else
+                  Flexible(
+                    child: ListView.separated(
+                      shrinkWrap: true,
+                      itemCount: viewers.length,
+                      separatorBuilder: (_, __) =>
+                          const Divider(height: 1, indent: 68),
+                      itemBuilder: (_, i) {
+                        final v = viewers[i];
+                        final name =
+                            (v['display_name'] as String?)?.trim() ?? '';
+                        final viewedAt = DateTime.tryParse(
+                          v['viewed_at'] as String? ?? '',
+                        );
+                        return ListTile(
+                          leading: CircleAvatar(
+                            child: name.isEmpty
+                                ? const Icon(Icons.person)
+                                : Text(name[0].toUpperCase()),
+                          ),
+                          title: Text(
+                            name.isEmpty ? 'Contact' : name,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          subtitle: viewedAt == null
+                              ? null
+                              : Text(statusTimeAgo(viewedAt)),
+                        );
+                      },
+                    ),
+                  ),
+                const SizedBox(height: 8),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
   void _viewStatus(StatusItem status) {
     if (!status.isMe && widget.client?.auth.currentUser != null) {
       StatusRepository(widget.client!).markViewed(status.id).catchError((_) {});
@@ -697,7 +788,15 @@ class _StatusPageState extends State<StatusPage> {
                       ],
                     ),
                     const Spacer(),
-                    if (status.isMe)
+                    if (status.isMe) ...[
+                      IconButton(
+                        tooltip: 'Viewed by',
+                        icon: const Icon(
+                          Icons.visibility_outlined,
+                          color: Colors.white,
+                        ),
+                        onPressed: () => _showViewedBy(ctx, status),
+                      ),
                       IconButton(
                         tooltip: 'Delete status',
                         icon: const Icon(
@@ -706,6 +805,7 @@ class _StatusPageState extends State<StatusPage> {
                         ),
                         onPressed: () => _deleteStatus(ctx, status),
                       ),
+                    ],
                     IconButton(
                       icon: const Icon(Icons.close, color: Colors.white),
                       onPressed: () => Navigator.pop(ctx),
@@ -713,9 +813,7 @@ class _StatusPageState extends State<StatusPage> {
                   ],
                 ),
               ),
-              Center(
-                child: _statusMediaBody(status),
-              ),
+              Center(child: _statusMediaBody(status)),
             ],
           ),
         ),
@@ -755,10 +853,7 @@ class _StatusPageState extends State<StatusPage> {
         mainAxisSize: MainAxisSize.min,
         children: [
           Flexible(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: media,
-            ),
+            child: Padding(padding: const EdgeInsets.all(16), child: media),
           ),
           if (!placeholderLabel && status.content.isNotEmpty)
             Padding(

@@ -458,6 +458,15 @@ class ChatMedia {
     );
   }
 
+  /// Image-only multi-selection with the same HD/low-data sizing.
+  Future<List<XFile>> pickGalleryImages() async {
+    AppLock.suppressRelockOnce = true;
+    return ImagePicker().pickMultiImage(
+      imageQuality: _imageQuality,
+      maxWidth: _imageWidth,
+    );
+  }
+
   Future<XFile?> pickCameraImage() {
     AppLock.suppressRelockOnce = true;
     return ImagePicker().pickImage(
