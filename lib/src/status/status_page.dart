@@ -650,6 +650,14 @@ class _StatusPageState extends State<StatusPage> {
   Future<void> _showViewedBy(BuildContext ctx, StatusItem status) async {
     final client = widget.client;
     if (client == null) return;
+    final prefs = await SharedPreferences.getInstance();
+    if (!ctx.mounted) return;
+    if (prefs.getBool('openchat.privacy.readReceipts') == false) {
+      ScaffoldMessenger.of(ctx).showSnackBar(const SnackBar(
+        content: Text('Turn on read receipts in Privacy to see status viewers.'),
+      ));
+      return;
+    }
     showModalBottomSheet<void>(
       context: ctx,
       shape: const RoundedRectangleBorder(
@@ -734,8 +742,11 @@ class _StatusPageState extends State<StatusPage> {
     );
   }
 
-  void _viewStatus(StatusItem status) {
-    if (!status.isMe && widget.client?.auth.currentUser != null) {
+  Future<void> _viewStatus(StatusItem status) async {
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    if (!status.isMe && widget.client?.auth.currentUser != null &&
+        prefs.getBool('openchat.privacy.readReceipts') != false) {
       StatusRepository(widget.client!).markViewed(status.id).catchError((_) {});
     }
     showDialog<void>(

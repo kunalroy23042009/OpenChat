@@ -26,6 +26,15 @@ class DirectUnread extends ChangeNotifier {
       ..onPostgresChanges(
         event: PostgresChangeEvent.all,
         schema: 'public',
+        table: 'message_envelopes',
+        callback: (_) {
+          _debounce?.cancel();
+          _debounce = Timer(const Duration(milliseconds: 250), refresh);
+        },
+      )
+      ..onPostgresChanges(
+        event: PostgresChangeEvent.all,
+        schema: 'public',
         table: 'envelope_receipts',
         callback: (_) {
           _debounce?.cancel();
